@@ -257,6 +257,7 @@ struct RecvFailure {
 pub struct Worker {
     running: Option<Running>,
     local_stream: bool,
+    completion_timeout: Duration,
     request: Vec<u8>,
     path: PathBuf,
     shutdown: Arc<AtomicBool>,
@@ -323,6 +324,17 @@ pub fn local_readiness(path: &Path, cfg: &ProviderConfig) -> Result<(), String> 
     Ok(())
 }
 
+fn completion_timeout(cfg: &ProviderConfig) -> Duration {
+    // Batch Q8 starts inference only after capture stops. Allow its full 120s
+    // helper watchdog / 125s reader deadline plus model validation and cleanup.
+    // Streaming has already loaded the model; preserve its existing deadline.
+    Duration::from_secs(if cfg.local_model_path.is_some() && !cfg.streaming {
+        150
+    } else {
+        45
+    })
+}
+
 impl Worker {
     pub fn start(
         path: &Path,
@@ -338,6 +350,7 @@ impl Worker {
             return Ok(Self {
                 running: None,
                 local_stream,
+                completion_timeout: completion_timeout(cfg),
                 request,
                 path: path.to_owned(),
                 shutdown,
@@ -389,6 +402,7 @@ impl Worker {
             return Ok(Self {
                 running: None,
                 local_stream,
+                completion_timeout: completion_timeout(cfg),
                 request,
                 path: path.to_owned(),
                 shutdown,
@@ -397,10 +411,16 @@ impl Worker {
         Ok(Self {
             running: Some(running),
             local_stream,
+            completion_timeout: completion_timeout(cfg),
             request,
             path: path.to_owned(),
             shutdown,
         })
+    }
+
+    pub fn finish_session(self) -> Result<Outcome, String> {
+        let timeout = self.completion_timeout;
+        self.finish(timeout)
     }
 
     pub fn finish(mut self, timeout: Duration) -> Result<Outcome, String> {
@@ -1014,6 +1034,19 @@ mod tests {
         }
     }
 
+    #[test]
+    fn completion_budget_preserves_the_full_local_batch_watchdog() {
+        for streaming in [false, true] {
+            let mut cfg = config(streaming);
+            assert_eq!(completion_timeout(&cfg), Duration::from_secs(45));
+            cfg.local_model_path = Some(PathBuf::from("/models/q8.gguf"));
+            assert_eq!(
+                completion_timeout(&cfg),
+                Duration::from_secs(if streaming { 45 } else { 150 })
+            );
+        }
+    }
+
     fn shutdown() -> Arc<AtomicBool> {
         Arc::new(AtomicBool::new(false))
     }
@@ -1074,8 +1107,9 @@ printf '%s' '{{"version":4,"status":"success","text":"local result","processing_
         )
         .unwrap();
         assert!(worker.running.is_none());
+        assert_eq!(worker.completion_timeout, Duration::from_secs(150));
         assert_eq!(
-            worker.finish(Duration::from_secs(2)).unwrap(),
+            worker.finish_session().unwrap(),
             Outcome::Transcript {
                 text: "local result".into(),
                 processing_profile: ProcessingProfile::Clean,

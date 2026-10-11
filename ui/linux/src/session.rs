@@ -792,7 +792,7 @@ where
             show_timer,
         );
         Ok(deliver_outcome(
-            worker.finish(Duration::from_secs(45))?,
+            worker.finish_session()?,
             delivery,
             &output,
             || {

@@ -189,8 +189,10 @@ pub fn run(
 fn defaultLocalModel(gpa: std.mem.Allocator, env: *const std.process.Environ.Map) ![]const u8 {
     const filename = @import("stt/local.zig").model_filename;
     if (env.get("XDG_DATA_HOME")) |root| {
-        if (!std.fs.path.isAbsolute(root)) return error.InvalidDataDirectory;
-        return std.fs.path.join(gpa, &.{ root, "sayall", "models", filename });
+        if (root.len != 0) {
+            if (!std.fs.path.isAbsolute(root)) return error.InvalidDataDirectory;
+            return std.fs.path.join(gpa, &.{ root, "sayall", "models", filename });
+        }
     }
     const home = env.get("HOME") orelse return error.MissingHome;
     if (!std.fs.path.isAbsolute(home)) return error.InvalidDataDirectory;
@@ -307,6 +309,33 @@ test "local CLI selects Q8 without loading cloud configuration" {
     const path = try defaultLocalModel(std.testing.allocator, &env);
     defer std.testing.allocator.free(path);
     try std.testing.expectEqualStrings("/home/test/.local/share/sayall/models/parakeet-unified-en-0.6b-Q8_0.gguf", path);
+}
+
+test "local model directory treats empty XDG data home as unset" {
+    const gpa = std.testing.allocator;
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    try env.put("HOME", "/home/test");
+    for ([_]?[]const u8{ null, "", "/data", "relative" }) |root| {
+        if (root) |value| try env.put("XDG_DATA_HOME", value);
+        if (root != null and std.mem.eql(u8, root.?, "relative")) {
+            try std.testing.expectError(error.InvalidDataDirectory, defaultLocalModel(gpa, &env));
+            continue;
+        }
+        const path = try defaultLocalModel(gpa, &env);
+        defer gpa.free(path);
+        const expected = if (root != null and root.?.len != 0)
+            "/data/sayall/models/parakeet-unified-en-0.6b-Q8_0.gguf"
+        else
+            "/home/test/.local/share/sayall/models/parakeet-unified-en-0.6b-Q8_0.gguf";
+        try std.testing.expectEqualStrings(expected, path);
+    }
+    var missing_home = std.process.Environ.Map.init(gpa);
+    defer missing_home.deinit();
+    try missing_home.put("XDG_DATA_HOME", "");
+    try std.testing.expectError(error.MissingHome, defaultLocalModel(gpa, &missing_home));
+    try missing_home.put("HOME", "relative");
+    try std.testing.expectError(error.InvalidDataDirectory, defaultLocalModel(gpa, &missing_home));
 }
 
 test "standalone transcribe grammar is exact" {
