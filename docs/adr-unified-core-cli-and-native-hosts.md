@@ -197,8 +197,12 @@ worker's stdin protocol. Human output is transcript-only; `--json` emits the
 canonical worker result for automation, and `--raw` selects Verbatim.
 The development `--local` path uses only pinned Parakeet Unified Q8, defaults
 to deterministic Clean, and does not load cloud configuration or credentials.
-It has no cloud fallback; native live local dictation is a later milestone. Status diagnostics go to stderr and never include credentials or
-transcript text. The native UI does not invoke this command.
+It has no cloud fallback. Linux native live dictation separately supports opt-in
+local Q8 with explicitly provisioned model/runtime artifacts: incremental
+processing is the default, and `stt.streaming: false` selects batch processing.
+macOS native recording explicitly rejects local mode; its live-local support
+remains a later milestone. Status diagnostics go to stderr and never include
+credentials or transcript text. The native UI does not invoke this command.
 
 `doctor` performs read-only configuration, packaged-worker/protocol,
 executable, native-host status, and platform checks. Its bounded JSON output
