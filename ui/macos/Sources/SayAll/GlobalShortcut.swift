@@ -219,13 +219,16 @@ final class GlobalShortcut {
             status = .disabled(chord)
             return .success(HostShortcutState(enabled: false, shortcut: chord.canonical))
         }
+        // Re-checked even for the chord already held: a macOS shortcut enabled later swallows it.
+        if systemReservation(chord) {
+            let failure = Failure(code: "shortcut_conflict",
+                message: "\(chord.symbols) is reserved by a macOS keyboard shortcut; change it in System Settings › Keyboard › Keyboard Shortcuts or choose another")
+            if registered == chord { status = .unavailable(chord, reason: failure.message) }
+            return fail(chord, failure)
+        }
         if registered == chord {
             status = .registered(chord)
             return .success(HostShortcutState(enabled: true, shortcut: chord.canonical))
-        }
-        if systemReservation(chord) {
-            return fail(chord, Failure(code: "shortcut_conflict",
-                message: "\(chord.symbols) is reserved by a macOS keyboard shortcut; change it in System Settings › Keyboard › Keyboard Shortcuts or choose another"))
         }
         guard installHandlerIfNeeded() else {
             return fail(chord, Failure(code: "shortcut_unavailable",

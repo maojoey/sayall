@@ -101,7 +101,9 @@ pub const Host = struct {
 };
 
 pub const Outcome = union(enum) {
-    applied: struct { state: State, changed: bool, active: bool },
+    /// `shell_only_path` is set when a stopped app may not see the XDG_CONFIG_HOME
+    /// that chose the saved file, because Finder and Dock launches read ~/.config.
+    applied: struct { state: State, changed: bool, active: bool, shell_only_path: ?[]const u8 = null },
     rejected: struct { shortcut: []const u8, message: []const u8, restored: bool },
     mismatch: struct { expected: State, actual_enabled: bool, actual: []const u8, restored: bool },
     outdated: struct { restored: bool },
@@ -111,19 +113,18 @@ pub const Outcome = union(enum) {
     rollback_unconfirmed: struct { diagnostic: []const u8, attempted: State },
 };
 
-const Paths = struct { state: []const u8, lock: []const u8 };
+const Paths = struct { state: []const u8, lock: []const u8, xdg_override: bool };
 
 /// Matches the app's ConfigurationLoader: a non-empty XDG_CONFIG_HOME wins.
 fn resolvePaths(gpa: Allocator, env: *const std.process.Environ.Map) !Paths {
     const xdg = env.get("XDG_CONFIG_HOME") orelse "";
-    const config_home = if (xdg.len != 0) xdg else if (env.get("HOME")) |home|
-        try std.fmt.allocPrint(gpa, "{s}/.config", .{home})
-    else
-        return error.ConfigHomeUnavailable;
+    const home_config: ?[]const u8 = if (env.get("HOME")) |home| try std.fmt.allocPrint(gpa, "{s}/.config", .{home}) else null;
+    const config_home = if (xdg.len != 0) xdg else home_config orelse return error.ConfigHomeUnavailable;
     if (!std.fs.path.isAbsolute(config_home)) return error.InvalidConfigHome;
     return .{
         .state = try std.fmt.allocPrint(gpa, "{s}/sayall/shortcut.json", .{config_home}),
         .lock = try std.fmt.allocPrint(gpa, "{s}/sayall/shortcut.lock", .{config_home}),
+        .xdg_override = xdg.len != 0 and !(home_config != null and std.mem.eql(u8, std.mem.trimEnd(u8, xdg, "/"), home_config.?)),
     };
 }
 
@@ -165,7 +166,12 @@ pub fn apply(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, reques
             return .{ .applied = .{ .state = state, .changed = changed, .active = true } }
         else
             .{ .mismatch = .{ .expected = state, .actual_enabled = active.enabled, .actual = active.shortcut, .restored = changed } },
-        .not_running => return .{ .applied = .{ .state = state, .changed = changed, .active = false } },
+        .not_running => return .{ .applied = .{
+            .state = state,
+            .changed = changed,
+            .active = false,
+            .shell_only_path = if (paths.xdg_override) paths.state else null,
+        } },
         .rejected => |rejected| .{ .rejected = .{ .shortcut = state.shortcut, .message = rejected.message, .restored = changed } },
         .outdated => .{ .outdated = .{ .restored = changed } },
         .failed => |diagnostic| .{ .host_failed = .{ .diagnostic = diagnostic, .restored = changed } },
@@ -238,7 +244,12 @@ fn present(gpa: Allocator, outcome: Outcome) !cli.Presentation {
             return .{
                 .exit_code = 0,
                 .stdout = stdout,
-                .stderr = if (applied.active) "" else "sayall: SayAll is not running; the saved shortcut will be registered when SayAll starts.\n",
+                .stderr = if (applied.active)
+                    ""
+                else if (applied.shell_only_path) |path|
+                    try std.fmt.allocPrint(gpa, "sayall: SayAll is not running; the shortcut was saved to {s} because XDG_CONFIG_HOME is set. SayAll opened from Finder or the Dock reads ~/.config/sayall/shortcut.json instead, so launch it with the same XDG_CONFIG_HOME for this shortcut to apply.\n", .{path})
+                else
+                    "sayall: SayAll is not running; the saved shortcut will be registered when SayAll starts.\n",
             };
         },
         .rejected => |rejected| return failure(gpa, "sayall: SayAll could not register {s}: {s}\nChoose another with 'sayall shortcut set <MODIFIERS+KEY>' or run 'sayall shortcut disable'. {s}\n", .{
@@ -420,6 +431,25 @@ test "shortcut CLI shows defaults and persists confirmed changes in the Linux fo
     var reset_host = FakeHost{ .replies = &.{.{ .applied = .{ .enabled = true, .shortcut = "CTRL+SLASH" } }} };
     try std.testing.expectEqualStrings("SayAll shortcut configured: CTRL+SLASH.\n", (try home.invoke(&.{"reset"}, &reset_host)).stdout);
     try std.testing.expectEqualStrings("SayAll shortcut: CTRL+SLASH\n", (try home.invoke(&.{"show"}, &stopped)).stdout);
+}
+
+test "a stopped app warns when XDG_CONFIG_HOME chose a shell-only preference path" {
+    var home: TestHome = undefined;
+    try home.init();
+    defer home.deinit();
+    const home_dir = home.env.get("HOME").?;
+    var stopped = FakeHost{ .replies = &.{ .not_running, .not_running } };
+
+    try home.env.put("XDG_CONFIG_HOME", try std.fmt.allocPrint(home.gpa(), "{s}/.config/", .{home_dir}));
+    const same = try home.invoke(&.{ "set", "CTRL+F9" }, &stopped);
+    try std.testing.expect(std.mem.indexOf(u8, same.stderr, "registered when SayAll starts") != null);
+
+    const custom = try std.fmt.allocPrint(home.gpa(), "{s}/xdg", .{home_dir});
+    try home.env.put("XDG_CONFIG_HOME", custom);
+    const result = try home.invoke(&.{ "set", "CTRL+F9" }, &stopped);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, result.stderr, "because XDG_CONFIG_HOME is set") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stderr, custom) != null);
 }
 
 test "shortcut CLI rejects invalid chords and arguments without contacting the app" {
