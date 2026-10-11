@@ -62,8 +62,11 @@ The app registers a new Carbon hotkey before releasing the old one, so a failed
 change never leaves SayAll without a working shortcut. Enabled system-wide
 symbolic hotkeys (for example Spotlight or input-source switching) are
 treated as conflicts because they would swallow the chord. Valid keys are a
-fixed table of xkb names mapped to `kVK_*` codes; a chord outside F1–F20 needs
-Control, Option, or Command. The Zig and Swift implementations are pinned by
+fixed table of xkb names mapped to `kVK_*` codes. A chord needs Control or
+Command, or is F1–F20 alone; Option/Shift-only chords are refused because
+macOS 15.0 and 15.1 reject them. Registration is exclusive
+(`kEventHotKeyExclusive`), so a chord another app holds is reported instead of
+firing both apps. The Zig and Swift implementations are pinned by
 the shared `macos-shortcut-*` contract fixtures.
 
 ## Consequences

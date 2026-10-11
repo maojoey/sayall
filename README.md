@@ -80,8 +80,9 @@ sayall shortcut disable
 Shortcuts use the same `MODIFIERS+KEY` syntax and
 `~/.config/sayall/shortcut.json` preference as Linux. `SUPER`/`CMD`/`COMMAND`
 mean Command and `ALT`/`OPTION`/`OPT` mean Option; keys use xkb names such as
-`SLASH`, `SPACE`, `K`, `1`, `F9`, `RETURN`, `PAGE_UP`, or `LEFT`. Outside F1–F20,
-a chord must include Control, Option, or Command. A running app registers the
+`SLASH`, `SPACE`, `K`, `1`, `F9`, `RETURN`, `PAGE_UP`, or `LEFT`. A chord must
+include Control or Command; F1–F20 may also be used alone. Option/Shift-only
+chords are refused because macOS 15.0 and 15.1 cannot register them. A running app registers the
 change immediately; if macOS or another app already owns the chord, SayAll
 keeps the previous shortcut, restores the saved preference, and reports the
 conflict. When the app is not running, the preference is saved and registered at

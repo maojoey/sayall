@@ -51,13 +51,15 @@ pub fn keyCode(name: []const u8) ?u16 {
 }
 
 /// Returns the canonical chord, or `error.InvalidShortcut` when macOS cannot
-/// register it. Outside F1-F20, a chord needs Control, Option, or Command so it
-/// never captures ordinary typing.
+/// register it. A chord needs Control or Command so it never captures typing;
+/// F1-F20 may also stand alone. macOS 15.0-15.1 reject Option/Shift-only hotkeys,
+/// so those are refused everywhere rather than saved and failing at launch.
 pub fn normalize(gpa: Allocator, value: []const u8) ![]const u8 {
     const chord = try shortcut_chord.parse(gpa, value);
     _ = keyCode(chord.key) orelse return error.InvalidShortcut;
     const modifiers = chord.modifiers;
-    if (!isFunctionKey(chord.key) and !(modifiers.super or modifiers.ctrl or modifiers.alt)) return error.InvalidShortcut;
+    const bare_function_key = isFunctionKey(chord.key) and !modifiers.any();
+    if (!bare_function_key and !(modifiers.super or modifiers.ctrl)) return error.InvalidShortcut;
     return chord.display;
 }
 
@@ -192,7 +194,7 @@ pub fn run(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, args: []
         const requested = if (args.len == 2) args[1] else try std.fmt.allocPrint(gpa, "{s}+{s}", .{ args[1], args[2] });
         const normalized = normalize(gpa, requested) catch return .{
             .exit_code = 2,
-            .stderr = try std.fmt.allocPrint(gpa, "sayall: invalid shortcut '{s}'; use a chord such as CTRL+SLASH, CMD+SHIFT+SPACE, or F9 (CMD/SUPER is Command, OPTION/ALT is Option)\n", .{requested}),
+            .stderr = try std.fmt.allocPrint(gpa, "sayall: invalid shortcut '{s}'; use a chord such as CTRL+SLASH, CMD+SHIFT+SPACE, or F9; include CTRL or CMD unless using F1-F20 alone (CMD/SUPER is Command, OPTION/ALT is Option)\n", .{requested}),
         };
         break :blk .{ .set = normalized };
     } else return cli.invalid_presentation;
@@ -412,8 +414,8 @@ test "shortcut CLI restores the previous preference when the app rejects a chang
     var home: TestHome = undefined;
     try home.init();
     defer home.deinit();
-    var first = FakeHost{ .replies = &.{.{ .applied = .{ .enabled = true, .shortcut = "ALT+F10" } }} };
-    _ = try home.invoke(&.{ "set", "ALT+F10" }, &first);
+    var first = FakeHost{ .replies = &.{.{ .applied = .{ .enabled = true, .shortcut = "CTRL+F10" } }} };
+    _ = try home.invoke(&.{ "set", "CTRL+F10" }, &first);
     const before = (try home.saved()).?;
 
     const cases = [_]struct { reply: HostReply, text: []const u8 }{
@@ -423,7 +425,7 @@ test "shortcut CLI restores the previous preference when the app rejects a chang
         .{ .reply = .{ .applied = .{ .enabled = true, .shortcut = "CTRL+SLASH" } }, .text = "different configuration directory" },
     };
     for (cases) |case| {
-        var fake = FakeHost{ .replies = &.{ case.reply, .{ .applied = .{ .enabled = true, .shortcut = "ALT+F10" } } } };
+        var fake = FakeHost{ .replies = &.{ case.reply, .{ .applied = .{ .enabled = true, .shortcut = "CTRL+F10" } } } };
         const result = try home.invoke(&.{ "set", "SUPER+SPACE" }, &fake);
         try std.testing.expectEqual(@as(u8, 1), result.exit_code);
         try std.testing.expect(std.mem.indexOf(u8, result.stderr, case.text) != null);

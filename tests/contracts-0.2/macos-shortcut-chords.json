@@ -47,24 +47,26 @@
       ]
     },
     {
-      "input": "opt+1",
-      "shortcut": "ALT+1",
-      "key_code": 18,
-      "modifiers": [
-        "ALT"
-      ]
-    },
-    {
       "input": "f9",
       "shortcut": "F9",
       "key_code": 101,
       "modifiers": []
     },
     {
-      "input": "SHIFT+F20",
-      "shortcut": "SHIFT+F20",
+      "input": "ctrl+opt+1",
+      "shortcut": "CTRL+ALT+1",
+      "key_code": 18,
+      "modifiers": [
+        "CTRL",
+        "ALT"
+      ]
+    },
+    {
+      "input": "cmd+shift+F20",
+      "shortcut": "SUPER+SHIFT+F20",
       "key_code": 90,
       "modifiers": [
+        "SUPER",
         "SHIFT"
       ]
     }
@@ -88,6 +90,11 @@
     "CTRL+F21",
     "CTRL+XF86AUDIOMUTE",
     "CTRL+ENTER",
-    "CTRL+/"
+    "CTRL+/",
+    "opt+1",
+    "ALT+SHIFT+K",
+    "OPTION+SPACE",
+    "SHIFT+F20",
+    "ALT+F10"
   ]
 }

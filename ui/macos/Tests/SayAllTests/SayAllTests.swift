@@ -1943,8 +1943,8 @@ final class GlobalShortcutTests: XCTestCase {
         XCTAssertFalse(disabled.enabled)
         XCTAssertEqual(disabled.chord.canonical, "SUPER+H")
 
-        XCTAssertEqual(try ShortcutPreference.decode(Data(#"{"version":1,"shortcut":"opt+f12","future":true}"#.utf8)).chord.canonical,
-            "ALT+F12")
+        XCTAssertEqual(try ShortcutPreference.decode(Data(#"{"version":1,"shortcut":"ctrl+opt+f12","future":true}"#.utf8)).chord.canonical,
+            "CTRL+ALT+F12")
         XCTAssertThrowsError(try ShortcutPreference.decode(Data(#"{"version":2}"#.utf8))) {
             XCTAssertEqual($0 as? ShortcutPreferenceError, .unsupportedVersion)
         }

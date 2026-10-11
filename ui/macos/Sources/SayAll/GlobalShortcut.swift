@@ -71,8 +71,9 @@ struct ShortcutChord: Equatable {
             }
         }
         guard let key, let keyCode = Self.keyCodes[key] else { return nil }
-        // Outside F1-F20 a chord needs Control, Option, or Command so it never captures typing.
-        guard Self.isFunctionKey(key) || !modifiers.isDisjoint(with: [.command, .control, .option]) else { return nil }
+        // Control or Command keeps the chord from capturing typing; F1-F20 may stand alone.
+        // macOS 15.0-15.1 reject Option/Shift-only hotkeys, so they are refused everywhere.
+        guard (Self.isFunctionKey(key) && modifiers.isEmpty) || !modifiers.isDisjoint(with: [.command, .control]) else { return nil }
         self.modifiers = modifiers
         self.key = key
         self.keyCode = keyCode
@@ -218,12 +219,17 @@ final class GlobalShortcut {
             return fail(chord, Failure(code: "shortcut_conflict",
                 message: "\(chord.symbols) is reserved by a macOS keyboard shortcut; change it in System Settings › Keyboard › Keyboard Shortcuts or choose another"))
         }
-        installHandlerIfNeeded()
+        guard installHandlerIfNeeded() else {
+            return fail(chord, Failure(code: "shortcut_unavailable",
+                message: "macOS could not install the SayAll shortcut handler"))
+        }
         var reference: EventHotKeyRef?
         let identifier = EventHotKeyID(signature: OSType(0x53415941), id: nextIdentifier)
         nextIdentifier &+= 1
+        // Exclusive registration makes a chord another app already holds fail with
+        // eventHotKeyExistsErr instead of silently firing both apps.
         let result = RegisterEventHotKey(chord.keyCode, chord.carbonModifiers, identifier,
-                                         GetApplicationEventTarget(), 0, &reference)
+                                         GetApplicationEventTarget(), OptionBits(kEventHotKeyExclusive), &reference)
         guard result == noErr, let reference else {
             let message = result == OSStatus(eventHotKeyExistsErr)
                 ? "\(chord.symbols) is already used by another app"
@@ -249,8 +255,8 @@ final class GlobalShortcut {
         registered = nil
     }
 
-    private func installHandlerIfNeeded() {
-        guard !handlerInstalled else { return }
+    private func installHandlerIfNeeded() -> Bool {
+        guard !handlerInstalled else { return true }
         var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
         // The shortcut object lives for the app's lifetime, so the unretained context stays valid.
         handlerInstalled = InstallEventHandler(GetApplicationEventTarget(), { _, _, context in
@@ -259,6 +265,7 @@ final class GlobalShortcut {
             MainActor.assumeIsolated { shortcut.action() }
             return noErr
         }, 1, &spec, Unmanaged.passUnretained(self).toOpaque(), nil) == noErr
+        return handlerInstalled
     }
 
     /// Enabled system-wide shortcuts (Spotlight, input sources, Mission Control, ...)
