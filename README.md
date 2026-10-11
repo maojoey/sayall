@@ -83,9 +83,13 @@ mean Command and `ALT`/`OPTION`/`OPT` mean Option; keys use xkb names such as
 `SLASH`, `SPACE`, `K`, `1`, `F9`, `RETURN`, `PAGE_UP`, or `LEFT`. A chord must
 include Control or Command; F1–F20 may also be used alone. Option/Shift-only
 chords are refused because macOS 15.0 and 15.1 cannot register them. A running app registers the
-change immediately; if macOS or another app already owns the chord, SayAll
-keeps the previous shortcut, restores the saved preference, and reports the
-conflict. When the app is not running, the preference is saved and registered at
+change immediately; if the chord is reserved by a macOS keyboard shortcut or
+macOS reports it as already registered by another app, SayAll keeps the
+previous shortcut, restores the saved preference, and reports the conflict.
+SayAll registers its shortcut exclusively, so a press never triggers both
+SayAll and another app; macOS cannot list every app's shortcuts, so an app that
+registered the same chord non-exclusively may instead stop receiving it while
+SayAll holds it. When the app is not running, the preference is saved and registered at
 the next launch. The menu shows the active shortcut, or why it is unavailable.
 
 `config init` creates its parent with mode `0700` and leaves the Deepgram key

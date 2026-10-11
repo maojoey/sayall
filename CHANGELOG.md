@@ -12,7 +12,7 @@ follows [Semantic Versioning](https://semver.org/).
   `CMD`/`COMMAND` and `OPTION`/`OPT` as aliases for `SUPER` and `ALT`, requires
   Control or Command (or a bare F1–F20 key) so chords never capture typing, applies changes to the running app
   immediately, and keeps the previous shortcut when the new one is reserved by
-  macOS or another app. The menu shows the active shortcut and any conflict.
+  a macOS keyboard shortcut or macOS reports it as registered by another app. The menu shows the active shortcut and any conflict.
 
 ## [0.3.3] - 2026-10-06
 

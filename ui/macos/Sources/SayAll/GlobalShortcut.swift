@@ -234,8 +234,10 @@ final class GlobalShortcut {
         var reference: EventHotKeyRef?
         let identifier = EventHotKeyID(signature: OSType(0x53415941), id: nextIdentifier)
         nextIdentifier &+= 1
-        // Exclusive registration makes a chord another app already holds fail with
-        // eventHotKeyExistsErr instead of silently firing both apps.
+        // Exclusive registration means only SayAll receives the chord while it is held.
+        // Carbon reports eventHotKeyExistsErr for some existing registrations (always
+        // for other exclusive ones), but there is no API to enumerate non-exclusive
+        // owners, so those can be shadowed rather than reported.
         let result = RegisterEventHotKey(chord.keyCode, chord.carbonModifiers, identifier,
                                          GetApplicationEventTarget(), OptionBits(kEventHotKeyExclusive), &reference)
         guard result == noErr, let reference else {

@@ -77,8 +77,9 @@ At minimum, qualify:
 - [ ] Microphone denied then granted, Accessibility denied then granted, focus
   changes during processing, Control+/ conflict, and menu-only operation.
 - [ ] `sayall shortcut set` to a free chord (works immediately and after
-  relaunch), to a chord reserved by macOS such as `CMD+SPACE` and one held by
-  another app (both rejected, previous shortcut still works), then `disable`,
+  relaunch), to a chord reserved by macOS such as `CMD+SPACE` (rejected, previous
+  shortcut still works), to a chord another app registered (record whether it
+  is rejected or shadowed; never fires both apps), then `disable`,
   `reset`, and a change saved while SayAll is not running.
 - [ ] Deepgram success and network/auth/server failures; Cerebras disabled, success,
   and failure with raw-transcript warning/delivery.

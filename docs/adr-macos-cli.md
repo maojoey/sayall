@@ -65,8 +65,11 @@ treated as conflicts because they would swallow the chord. Valid keys are a
 fixed table of xkb names mapped to `kVK_*` codes. A chord needs Control or
 Command, or is F1–F20 alone; Option/Shift-only chords are refused because
 macOS 15.0 and 15.1 reject them. Registration is exclusive
-(`kEventHotKeyExclusive`), so a chord another app holds is reported instead of
-firing both apps. The Zig and Swift implementations are pinned by
+(`kEventHotKeyExclusive`), so a press never reaches both SayAll and another app.
+Carbon returns `eventHotKeyExistsErr` for some existing registrations (always for
+other exclusive ones) and SayAll reports those as conflicts, but no public API
+enumerates non-exclusive registrations, so such an owner can be shadowed while
+SayAll holds the chord instead of being reported. The Zig and Swift implementations are pinned by
 the shared `macos-shortcut-*` contract fixtures.
 
 ## Consequences
