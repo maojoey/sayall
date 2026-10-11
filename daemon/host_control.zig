@@ -10,11 +10,16 @@ const fixtures = @import("protocol_fixtures");
 pub const version: u16 = 2;
 /// The trailing newline is part of this bound.
 pub const max_frame_len = 64 * 1024;
-pub const Method = enum { status, toggle, reload };
+/// `shortcut` asks a native host to re-read and register its saved global
+/// shortcut. Hosts without shortcut ownership reject it as `invalid_request`.
+pub const Method = enum { status, toggle, reload, shortcut };
 pub const State = enum { idle, starting, recording, stopping, processing, delivering, success, @"error", cancelled };
 pub const Request = struct { version: u16, method: Method };
 pub const Failure = struct { code: []const u8, message: []const u8 };
-pub const Response = struct { version: u16, ok: bool, state: State, @"error": ?Failure = null };
+/// The shortcut a host actually registered, echoed so clients can detect a host
+/// that read a different configuration directory.
+pub const ShortcutReport = struct { enabled: bool, shortcut: []const u8 };
+pub const Response = struct { version: u16, ok: bool, state: State, @"error": ?Failure = null, shortcut: ?ShortcutReport = null };
 
 pub fn parseRequest(gpa: Allocator, frame: []const u8) !std.json.Parsed(Request) {
     try validateFrame(frame);
@@ -147,6 +152,18 @@ test "v2 codec fixtures additions closed values semantics and frame bound" {
     const busy = try parseResponse(std.testing.allocator, fixtures.host_busy_response);
     defer busy.deinit();
     try std.testing.expectEqualStrings("busy", busy.value.@"error".?.code);
+    const shortcut = try parseRequest(std.testing.allocator, fixtures.host_shortcut_request);
+    defer shortcut.deinit();
+    try std.testing.expectEqual(Method.shortcut, shortcut.value.method);
+    const registered = try parseResponse(std.testing.allocator, fixtures.host_shortcut_response);
+    defer registered.deinit();
+    try std.testing.expect(registered.value.shortcut.?.enabled);
+    try std.testing.expectEqualStrings("SUPER+SHIFT+SPACE", registered.value.shortcut.?.shortcut);
+    const conflict = try parseResponse(std.testing.allocator, fixtures.host_shortcut_conflict_response);
+    defer conflict.deinit();
+    try std.testing.expectEqualStrings("shortcut_conflict", conflict.value.@"error".?.code);
+    try std.testing.expect(conflict.value.shortcut == null);
+    try std.testing.expect(idle.value.shortcut == null);
     const additive = try parseResponse(std.testing.allocator, "{\"version\":2,\"ok\":true,\"state\":\"cancelled\",\"future\":true}");
     defer additive.deinit();
     try std.testing.expectEqual(State.cancelled, additive.value.state);

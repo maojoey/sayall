@@ -1,6 +1,8 @@
 const std = @import("std");
 const cli = @import("cli.zig");
 const protocol = @import("host_control.zig");
+const darwin_shortcut = @import("darwin_shortcut.zig");
+const fixtures = @import("protocol_fixtures");
 const c = @cImport({
     @cInclude("errno.h");
     @cInclude("darwin_host_control.h");
@@ -53,6 +55,25 @@ pub const Darwin = struct {
     fn reload(ctx: *anyopaque) cli.HostOutcome {
         return send(@ptrCast(@alignCast(ctx)), .reload);
     }
+    pub fn shortcutHost(self: *Darwin) darwin_shortcut.Host {
+        return .{ .context = self, .applyFn = applyShortcut };
+    }
+    /// Never launches the app: a stopped app registers the saved shortcut at startup.
+    fn applyShortcut(ctx: *anyopaque) darwin_shortcut.HostReply {
+        const self: *Darwin = @ptrCast(@alignCast(ctx));
+        const readiness = result(self.ops.probe(self.ops.now() +| 250 * std.time.ns_per_ms));
+        if (readiness == .absent_launchable) return .not_running;
+        if (readiness != .success) return .{ .failed = classifyText(readiness) };
+        var bytes: ?[*]u8 = null;
+        var len: usize = 0;
+        const code = result(self.ops.exchange("shortcut", self.ops.now() +| 2 * std.time.ns_per_s, &bytes, &len));
+        if (code != .success) return .{ .failed = classifyText(code) };
+        defer self.ops.free(bytes);
+        if (bytes == null) return .{ .failed = "sayall: malformed host response\n" };
+        const parsed = protocol.parseResponse(self.arena, bytes.?[0..len]) catch return .{ .failed = "sayall: malformed host response\n" };
+        defer parsed.deinit();
+        return shortcutReply(self.arena, parsed.value) catch .{ .failed = "sayall: out of memory\n" };
+    }
     fn send(self: *Darwin, method: protocol.Method) cli.HostOutcome {
         var bytes: ?[*]u8 = null;
         var len: usize = 0;
@@ -60,6 +81,7 @@ pub const Darwin = struct {
             .status => "status",
             .toggle => "toggle",
             .reload => "reload",
+            .shortcut => "shortcut",
         };
         const code = result(self.ops.exchange(name.ptr, self.ops.now() +| std.time.ns_per_s, &bytes, &len));
         if (code != .success) return classify(code, method == .status);
@@ -70,6 +92,23 @@ pub const Darwin = struct {
         return protocol.mapResponsePublic(self.arena, parsed.value);
     }
 };
+
+fn classifyText(code: Result) []const u8 {
+    return switch (classify(code, false)) {
+        .transport_error, .incompatible => |text| text,
+        else => "sayall: cannot reach macOS host\n",
+    };
+}
+
+fn shortcutReply(arena: std.mem.Allocator, response: protocol.Response) !darwin_shortcut.HostReply {
+    if (response.@"error") |failure| {
+        // Hosts released before the shortcut method reject it as a malformed request.
+        if (std.mem.eql(u8, failure.code, "invalid_request") or std.mem.eql(u8, failure.code, "incompatible_version")) return .outdated;
+        return .{ .rejected = .{ .code = try arena.dupe(u8, failure.code), .message = try arena.dupe(u8, failure.message) } };
+    }
+    const report = response.shortcut orelse return .outdated;
+    return .{ .applied = .{ .enabled = report.enabled, .shortcut = try arena.dupe(u8, report.shortcut) } };
+}
 
 fn result(code: c_int) Result {
     return switch (code) {
@@ -187,6 +226,63 @@ test "Darwin operation policy covers every launch and no-retry branch" {
         _ = d.adapter().toggle();
         try std.testing.expectEqual(@as(usize, 1), Fake.exchanges);
     }
+}
+
+test "shortcut apply never launches and maps every host reply" {
+    const Fake = struct {
+        var probe_result: c_int = 0;
+        var exchanges: usize = 0;
+        var launches: usize = 0;
+        var text: []const u8 = "";
+        var last_method: []const u8 = "";
+        fn probe(_: u64) callconv(.c) c_int {
+            return probe_result;
+        }
+        fn launch() callconv(.c) c_int {
+            launches += 1;
+            return 0;
+        }
+        fn exchange(method: [*:0]const u8, _: u64, out: *?[*]u8, len: *usize) callconv(.c) c_int {
+            exchanges += 1;
+            last_method = std.mem.span(method);
+            out.* = @constCast(text.ptr);
+            len.* = text.len;
+            return 0;
+        }
+        fn free(_: ?*anyopaque) callconv(.c) void {}
+        fn now() callconv(.c) u64 {
+            return 0;
+        }
+        fn sleep(_: u64) callconv(.c) void {}
+    };
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    var d = Darwin{ .arena = arena_state.allocator(), .ops = .{ .probe = Fake.probe, .launch = Fake.launch, .exchange = Fake.exchange, .free = Fake.free, .now = Fake.now, .sleep = Fake.sleep } };
+    const host = d.shortcutHost();
+
+    Fake.probe_result = @intFromEnum(Result.absent_launchable);
+    try std.testing.expect(host.apply() == .not_running);
+    try std.testing.expectEqual(@as(usize, 0), Fake.exchanges);
+
+    Fake.probe_result = @intFromEnum(Result.unsafe);
+    try std.testing.expect(host.apply() == .failed);
+    try std.testing.expectEqual(@as(usize, 0), Fake.exchanges);
+
+    Fake.probe_result = @intFromEnum(Result.success);
+    Fake.text = std.mem.trimEnd(u8, fixtures.host_shortcut_response, "\n");
+    const applied = host.apply();
+    try std.testing.expectEqualStrings("shortcut", Fake.last_method);
+    try std.testing.expectEqualStrings("SUPER+SHIFT+SPACE", applied.applied.shortcut);
+
+    Fake.text = std.mem.trimEnd(u8, fixtures.host_shortcut_conflict_response, "\n");
+    try std.testing.expectEqualStrings("shortcut_conflict", host.apply().rejected.code);
+    Fake.text = "{\"version\":2,\"ok\":false,\"state\":\"idle\",\"error\":{\"code\":\"invalid_request\",\"message\":\"Malformed request\"}}";
+    try std.testing.expect(host.apply() == .outdated);
+    Fake.text = "{\"version\":2,\"ok\":true,\"state\":\"idle\"}";
+    try std.testing.expect(host.apply() == .outdated);
+    Fake.text = "{";
+    try std.testing.expect(host.apply() == .failed);
+    try std.testing.expectEqual(@as(usize, 0), Fake.launches);
 }
 
 test "bridge normalizes errno and validates inclusive frames" {

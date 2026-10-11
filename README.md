@@ -71,7 +71,26 @@ sayall --version       # also: sayall version
 sayall status          # does not launch the app
 sayall toggle          # launches this CLI's containing SayAll.app if needed
 sayall config init     # creates ~/.config/sayall/config.json once, mode 0600
+sayall shortcut        # show the global shortcut (default CTRL+SLASH, ⌃/)
+sayall shortcut set CMD+SHIFT+SPACE
+sayall shortcut reset  # restore CTRL+SLASH
+sayall shortcut disable
 ```
+
+Shortcuts use the same `MODIFIERS+KEY` syntax and
+`~/.config/sayall/shortcut.json` preference as Linux. `SUPER`/`CMD`/`COMMAND`
+mean Command and `ALT`/`OPTION`/`OPT` mean Option; keys use xkb names such as
+`SLASH`, `SPACE`, `K`, `1`, `F9`, `RETURN`, `PAGE_UP`, or `LEFT`. A chord must
+include Control or Command; F1–F20 may also be used alone. Option/Shift-only
+chords are refused because macOS 15.0 and 15.1 cannot register them. A running app registers the
+change immediately; if the chord is reserved by a macOS keyboard shortcut or
+macOS reports it as already registered by another app, SayAll keeps the
+previous shortcut, restores the saved preference, and reports the conflict.
+SayAll registers its shortcut exclusively, so a press never triggers both
+SayAll and another app; macOS cannot list every app's shortcuts, so an app that
+registered the same chord non-exclusively may instead stop receiving it while
+SayAll holds it. When the app is not running, the preference is saved and registered at
+the next launch. The menu shows the active shortcut, or why it is unavailable.
 
 `config init` creates its parent with mode `0700` and leaves the Deepgram key
 empty for the user to fill. App status, toggle, and configuration reload use a
@@ -365,14 +384,15 @@ provider settings.
 
 The stable bundle identifier is `pro.leets.sayall`. Swift/AppKit owns the menu
 bar UI, lifecycle, config loading, native microphone/TCC,
-Control+/ Carbon hotkey and menu fallback, Accessibility-authorized typing and
+configurable Carbon hotkey (default Control+/) and menu fallback, Accessibility-authorized typing and
 pasting with clipboard fallback, temporary audio, and packaging. It invokes the
 bundled `sayall-process` helper once per recording. The Zig helper streams private raw
 PCM to Deepgram during capture, validates the completed PCM S16LE mono 16 kHz
 WAV, falls back to REST when streaming fails, and optionally runs Cerebras cleanup.
 The signed `sayall` helper uses a separate bounded JSON request/response socket
-under a mode-0700 per-user directory for same-UID `status`, `toggle`, and `reload` calls.
-The app's `Coordinator` handles all three methods on the main actor; a nonblocking
+under a mode-0700 per-user directory for same-UID `status`, `toggle`, `reload`, and
+`shortcut` calls. The app's `Coordinator` handles the first three on the main actor,
+and the app delegate re-registers the saved global shortcut for `shortcut`; a nonblocking
 process lock prevents another app instance from replacing its live endpoint.
 
 The app and helper exchange bounded, versioned JSON over inherited stdin and

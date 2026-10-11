@@ -1,0 +1,100 @@
+{
+  "version": 1,
+  "valid": [
+    {
+      "input": "CTRL+SLASH",
+      "shortcut": "CTRL+SLASH",
+      "key_code": 44,
+      "modifiers": [
+        "CTRL"
+      ]
+    },
+    {
+      "input": " control + slash ",
+      "shortcut": "CTRL+SLASH",
+      "key_code": 44,
+      "modifiers": [
+        "CTRL"
+      ]
+    },
+    {
+      "input": "shift+cmd+space",
+      "shortcut": "SUPER+SHIFT+SPACE",
+      "key_code": 49,
+      "modifiers": [
+        "SUPER",
+        "SHIFT"
+      ]
+    },
+    {
+      "input": "Option+Command+k",
+      "shortcut": "SUPER+ALT+K",
+      "key_code": 40,
+      "modifiers": [
+        "SUPER",
+        "ALT"
+      ]
+    },
+    {
+      "input": "win+shift+ctrl+alt+page_down",
+      "shortcut": "SUPER+CTRL+ALT+SHIFT+PAGE_DOWN",
+      "key_code": 121,
+      "modifiers": [
+        "SUPER",
+        "CTRL",
+        "ALT",
+        "SHIFT"
+      ]
+    },
+    {
+      "input": "f9",
+      "shortcut": "F9",
+      "key_code": 101,
+      "modifiers": []
+    },
+    {
+      "input": "ctrl+opt+1",
+      "shortcut": "CTRL+ALT+1",
+      "key_code": 18,
+      "modifiers": [
+        "CTRL",
+        "ALT"
+      ]
+    },
+    {
+      "input": "cmd+shift+F20",
+      "shortcut": "SUPER+SHIFT+F20",
+      "key_code": 90,
+      "modifiers": [
+        "SUPER",
+        "SHIFT"
+      ]
+    }
+  ],
+  "invalid": [
+    "",
+    "   ",
+    "CTRL",
+    "CTRL+",
+    "+SLASH",
+    "CTRL++K",
+    "CTRL+K+ALT",
+    "CTRL+CTRL+K",
+    "CMD+SUPER+K",
+    "CTRL+SLASH,exec",
+    "CTRL+A+B",
+    "K",
+    "SHIFT+K",
+    "SHIFT+SPACE",
+    "SPACE",
+    "CTRL+F21",
+    "CTRL+XF86AUDIOMUTE",
+    "CTRL+ENTER",
+    "CTRL+/",
+    "opt+1",
+    "ALT+SHIFT+K",
+    "OPTION+SPACE",
+    "SHIFT+F20",
+    "ALT+F10"
+  ]
+}

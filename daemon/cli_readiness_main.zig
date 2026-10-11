@@ -6,6 +6,7 @@ const cli_transcribe = @import("cli_transcribe.zig");
 const config = @import("config.zig");
 const host = @import("host_control.zig");
 const darwin_host = @import("darwin_host_control.zig");
+const darwin_shortcut = @import("darwin_shortcut.zig");
 const build_options = @import("build_options");
 extern fn sayall_darwin_effective_home() ?[*:0]u8;
 extern fn sayall_darwin_free(?*anyopaque) void;
@@ -27,6 +28,14 @@ fn run(init: std.process.Init) !u8 {
         const options = cli_transcribe.parse(values[0 .. argv.len - 2]) catch
             return writePresentation(init.io, cli.invalid_presentation);
         return cli_transcribe.run(init.gpa, init.arena.allocator(), init.io, init.environ_map, options);
+    }
+    if (argv.len >= 2 and std.mem.eql(u8, std.mem.span(argv[1]), "shortcut")) {
+        try ensureConfigHome(init.environ_map);
+        var values: [3][]const u8 = undefined;
+        if (argv.len > 5) return writePresentation(init.io, cli.invalid_presentation);
+        for (argv[2..], 0..) |arg, i| values[i] = std.mem.span(arg);
+        var darwin = darwin_host.Darwin{ .arena = init.arena.allocator() };
+        return writePresentation(init.io, try darwin_shortcut.run(init.arena.allocator(), init.io, init.environ_map, values[0 .. argv.len - 2], darwin.shortcutHost()));
     }
     var args: [3][]const u8 = undefined;
     if (argv.len < 2) return writePresentation(init.io, cli.usage_presentation);
@@ -92,7 +101,8 @@ fn isExecutable(io: std.Io, path: []const u8) bool {
 }
 
 fn ensureConfigHome(env: *const std.process.Environ.Map) !void {
-    if (env.get("XDG_CONFIG_HOME") != null) return;
+    // An empty XDG_CONFIG_HOME is unset for the app, so pin HOME to the account home as well.
+    if (env.get("XDG_CONFIG_HOME")) |xdg| if (xdg.len != 0) return;
     const home = sayall_darwin_effective_home() orelse return error.ConfigHomeUnavailable;
     defer sayall_darwin_free(home);
     try @constCast(env).put("HOME", std.mem.span(home));
