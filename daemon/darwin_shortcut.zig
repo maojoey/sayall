@@ -178,8 +178,9 @@ pub fn apply(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, reques
     };
     if (changed) {
         restoreIfCurrentMatches(gpa, io, paths.state, new_bytes, old_bytes) catch return .{ .rollback_failed = paths.state };
-        // Rejections, mismatches, and outdated apps leave the registration unchanged, so
-        // this only resynchronizes the menu. After a lost reply the app may already use
+        // Rejections and outdated apps leave the registration unchanged, so this only
+        // resynchronizes the menu. A mismatched app follows its own preference, which
+        // this CLI cannot restore; that outcome reports the live chord instead. After a lost reply the app may already use
         // the new chord, so it must confirm reloading the restored preference.
         const resync = host.apply();
         if (unconfirmed == .host_failed and !confirmsRestored(gpa, resync, old_bytes))
@@ -257,10 +258,11 @@ fn present(gpa: Allocator, outcome: Outcome) !cli.Presentation {
             rejected.message,
             if (rejected.restored) restored_note else unchanged_note,
         }),
-        .mismatch => |mismatch| return failure(gpa, "sayall: the running SayAll app registered {s} instead of {s}; it reads a different configuration directory (check XDG_CONFIG_HOME). {s}\n", .{
+        .mismatch => |mismatch| return failure(gpa, "sayall: the running SayAll app registered {s} instead of {s}; it reads a different configuration directory (check XDG_CONFIG_HOME). {s} SayAll stays on {s} from its own configuration until that file changes; quit and reopen SayAll from this shell, or unset XDG_CONFIG_HOME, to manage the same file.\n", .{
             if (mismatch.actual_enabled) mismatch.actual else "no shortcut",
             if (mismatch.expected.enabled) mismatch.expected.shortcut else "no shortcut",
-            if (mismatch.restored) restored_note else unchanged_note,
+            if (mismatch.restored) "This command's saved preference was restored, but the running app's shortcut was not." else unchanged_note,
+            if (mismatch.actual_enabled) mismatch.actual else "no shortcut",
         }),
         .outdated => |outdated| return failure(gpa, "sayall: the running SayAll app cannot change its shortcut; quit and reopen SayAll, then retry. {s}\n", .{
             if (outdated.restored) restored_note else unchanged_note,
@@ -479,7 +481,6 @@ test "shortcut CLI restores the previous preference when the app rejects a chang
         .{ .reply = .{ .rejected = .{ .code = "shortcut_conflict", .message = "SUPER+SPACE is reserved by a macOS keyboard shortcut" } }, .text = "could not register SUPER+SPACE: SUPER+SPACE is reserved" },
         .{ .reply = .outdated, .text = "quit and reopen SayAll" },
         .{ .reply = .{ .failed = "sayall: cannot reach macOS host\n" }, .text = "not confirmed" },
-        .{ .reply = .{ .applied = .{ .enabled = true, .shortcut = "CTRL+SLASH" } }, .text = "different configuration directory" },
     };
     for (cases) |case| {
         var fake = FakeHost{ .replies = &.{ case.reply, .{ .applied = .{ .enabled = true, .shortcut = "CTRL+F10" } } } };
@@ -490,6 +491,16 @@ test "shortcut CLI restores the previous preference when the app rejects a chang
         try std.testing.expectEqual(@as(usize, 2), fake.calls);
         try std.testing.expectEqualStrings(before, (try home.saved()).?);
     }
+
+    // An app reading another directory follows its own preference; the CLI must not claim a live restore.
+    var mismatched = FakeHost{ .replies = &.{ .{ .applied = .{ .enabled = true, .shortcut = "CTRL+SLASH" } }, .{ .applied = .{ .enabled = true, .shortcut = "CTRL+SLASH" } } } };
+    const mismatch = try home.invoke(&.{ "set", "SUPER+SPACE" }, &mismatched);
+    try std.testing.expectEqual(@as(u8, 1), mismatch.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, mismatch.stderr, "different configuration directory") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mismatch.stderr, "running app's shortcut was not") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mismatch.stderr, "SayAll stays on CTRL+SLASH") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mismatch.stderr, "previous shortcut was restored") == null);
+    try std.testing.expectEqualStrings(before, (try home.saved()).?);
 
     var fresh: TestHome = undefined;
     try fresh.init();
