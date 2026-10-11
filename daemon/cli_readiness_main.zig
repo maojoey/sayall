@@ -101,7 +101,8 @@ fn isExecutable(io: std.Io, path: []const u8) bool {
 }
 
 fn ensureConfigHome(env: *const std.process.Environ.Map) !void {
-    if (env.get("XDG_CONFIG_HOME") != null) return;
+    // An empty XDG_CONFIG_HOME is unset for the app, so pin HOME to the account home as well.
+    if (env.get("XDG_CONFIG_HOME")) |xdg| if (xdg.len != 0) return;
     const home = sayall_darwin_effective_home() orelse return error.ConfigHomeUnavailable;
     defer sayall_darwin_free(home);
     try @constCast(env).put("HOME", std.mem.span(home));
