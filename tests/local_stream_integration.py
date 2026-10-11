@@ -44,7 +44,7 @@ def gone(pid):
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--bundle", type=Path, required=True)
-    p.add_argument("--slow", action="store_true", help="exercise completion beyond the former 40s stream deadline")
+    p.add_argument("--slow", action="store_true", help="exercise startup and completion beyond the former 10s/40s deadlines")
     args = p.parse_args()
     bundle = args.bundle.resolve()
     worker = bundle / "sayall-process"
@@ -67,13 +67,28 @@ def main():
                    "llm_api_key": "", "processing_profile": "clean"}
         kinds = ["silence", "invalid_finish", "timeout", "parent_death", "parent_death_paused", "disconnect"]
         if args.slow:
-            kinds.append("delayed_finish")
+            kinds.extend(("delayed_startup", "delayed_finish"))
         for kind in kinds:
             proc = subprocess.Popen([str(worker), "--local-stream"], stdin=subprocess.PIPE,
                                     stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env={}, start_new_session=True)
             helper = None
             try:
                 proc.stdin.write(json.dumps(request).encode() + b"\n"); proc.stdin.flush()
+                if kind == "delayed_startup":
+                    deadline = time.monotonic() + 30
+                    while time.monotonic() < deadline:
+                        children = Path(f"/proc/{proc.pid}/task/{proc.pid}/children").read_text().split()
+                        if children:
+                            helper = int(children[0])
+                            break
+                        time.sleep(.01)
+                    assert helper is not None, "helper did not start"
+                    os.kill(helper, signal.SIGSTOP)
+                    with selectors.DefaultSelector() as selector:
+                        selector.register(proc.stdout, selectors.EVENT_READ)
+                        assert not selector.select(0), "helper was already ready before test pause"
+                    time.sleep(13)
+                    os.kill(helper, signal.SIGCONT)
                 ready = frame(proc)
                 assert ready == {"version": 4, "event": "ready", "streaming": True}
                 children = Path(f"/proc/{proc.pid}/task/{proc.pid}/children").read_text().split()
@@ -98,7 +113,7 @@ def main():
                         os.kill(helper, signal.SIGCONT)
                     result = frame(proc)
                     assert result["transport"] == "local"
-                    if kind in ("silence", "delayed_finish"):
+                    if kind in ("silence", "delayed_startup", "delayed_finish"):
                         assert result["status"] == "no_speech"
                     else:
                         assert result["status"] == "error"

@@ -96,9 +96,14 @@ legacy Linux control remains v1.
 
 Batch requests add `stt_provider` (`deepgram` by default, or `local`) and
 `local_model_path`. Existing required key fields remain present but must be
-empty in local requests. All unknown fields/providers are rejected. There is
-no local streaming request yet; the strict streaming schema rejects local
-fields rather than starting a cloud session.
+empty in local requests. All unknown fields/providers are rejected.
+Linux `sayall-process --local-stream` accepts a v4 local request with
+`local_model_path` and a growing `pcm_path` alongside `wav_path`. It emits
+`ready` after model initialization, accepts the host's `finish` frame after
+capture is flushed, and returns one finalized local result. It never falls
+back to cloud or batch on stream failure. See
+[the live-incremental contract](local-stt-live-incremental.md) for the native
+host lifecycle and complete request constraints.
 
 Results add closed transport `local`, optional `local_stt_ms`, and error codes
 `local_model_missing`, `local_model_invalid`, `local_unavailable`, `local_failed`,

@@ -324,6 +324,16 @@ pub fn local_readiness(path: &Path, cfg: &ProviderConfig) -> Result<(), String> 
     Ok(())
 }
 
+fn startup_timeout(cfg: &ProviderConfig) -> Duration {
+    // Local startup includes hashing the 731 MB model, then up to 90s for the
+    // helper to load it. Keep cloud connection readiness at its existing 2s.
+    Duration::from_secs(if cfg.local_model_path.is_some() {
+        120
+    } else {
+        2
+    })
+}
+
 fn completion_timeout(cfg: &ProviderConfig) -> Duration {
     // Local batch inference and streaming backlog draining each have a 120s
     // helper watchdog / 125s reader deadline. Include setup and cleanup margin.
@@ -365,8 +375,7 @@ impl Worker {
             }],
             false,
         )?;
-        let ready_deadline =
-            Instant::now() + Duration::from_secs(if local_stream { 12 } else { 2 });
+        let ready_deadline = Instant::now() + startup_timeout(cfg);
         if let Err(error) = write_line(
             running.input.as_mut(),
             &request,
@@ -1039,8 +1048,10 @@ mod tests {
         for streaming in [false, true] {
             let mut cfg = config(streaming);
             assert_eq!(completion_timeout(&cfg), Duration::from_secs(45));
+            assert_eq!(startup_timeout(&cfg), Duration::from_secs(2));
             cfg.local_model_path = Some(PathBuf::from("/models/q8.gguf"));
             assert_eq!(completion_timeout(&cfg), Duration::from_secs(150));
+            assert_eq!(startup_timeout(&cfg), Duration::from_secs(120));
         }
     }
 
@@ -1073,6 +1084,35 @@ mod tests {
 fi"#,
             crate::BUILD_VERSION
         )
+    }
+
+    #[test]
+    #[ignore = "13-second startup deadline regression; run explicitly"]
+    fn local_startup_accepts_readiness_after_former_deadline() {
+        let body = format!(
+            r#"{}
+[ "${{1-}}" = "--local-stream" ] || exit 31
+IFS= read -r request
+sleep 13
+printf '%s\n' '{{"version":4,"event":"ready","streaming":true}}'
+IFS= read -r finish
+printf '%s\n' '{{"version":4,"status":"no_speech","processing_profile":"clean","transport":"local"}}'
+"#,
+            probe()
+        );
+        let fixture = Fixture::new(&body);
+        let mut cfg = config(true);
+        cfg.local_model_path = Some("/models/q8.gguf".into());
+        let worker = Worker::start(
+            &fixture.worker,
+            &fixture.wav,
+            &fixture.pcm,
+            &cfg,
+            shutdown(),
+        )
+        .unwrap();
+        assert!(worker.running.is_some());
+        assert!(worker.finish_session().is_ok());
     }
 
     #[test]

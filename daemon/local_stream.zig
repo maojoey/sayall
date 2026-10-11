@@ -9,6 +9,9 @@ const protocol = @import("worker_protocol.zig");
 const secure_audio = @import("secure_audio.zig");
 const recorder = @import("recorder.zig");
 
+// The host allows 120s total, including model hashing before this load phase.
+const startup_timeout_seconds = 90;
+
 pub fn run(gpa: std.mem.Allocator, io: std.Io) !void {
     var storage: [batch.max_request_bytes + 1]u8 = undefined;
     var input = std.Io.File.stdin().reader(io, &storage);
@@ -65,7 +68,7 @@ fn execute(gpa: std.mem.Allocator, io: std.Io, r: stream.Request, input: *std.Io
     var output: std.Io.File.MultiReader = undefined;
     output.init(gpa, io, buffers.toStreams(), &.{child.stdout.?});
     defer output.deinit();
-    const startup: std.Io.Timeout = .{ .deadline = .fromNow(io, .{ .clock = .awake, .raw = .fromSeconds(10) }) };
+    const startup: std.Io.Timeout = .{ .deadline = .fromNow(io, .{ .clock = .awake, .raw = .fromSeconds(startup_timeout_seconds) }) };
     while (std.mem.indexOfScalar(u8, output.reader(0).buffered(), '\n') == null) {
         try output.fill(256, startup);
         if (output.reader(0).buffered().len > 4096) return error.ResponseTooLarge;
