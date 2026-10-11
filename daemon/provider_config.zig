@@ -1,7 +1,10 @@
 /// Provider-only configuration. This module deliberately has no product,
 /// platform, environment, or filesystem dependencies.
+pub const Kind = enum { deepgram, local };
+
 pub const SttConfig = struct {
     provider: []const u8 = "deepgram",
+    local_model_path: []const u8 = "",
     api_key: []const u8 = "",
     model: []const u8 = "nova-3",
     language: []const u8 = "en",

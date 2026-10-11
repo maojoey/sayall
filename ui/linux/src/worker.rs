@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 const CONTROL_MAX: usize = 64 * 1024;
 const RESULT_MAX: usize = 1024 * 1024;
 const SUPERVISED_MAX: usize = 4097;
-const PROTOCOL_VERSION: u32 = 3;
+const PROTOCOL_VERSION: u32 = 4;
 
 pub struct SupervisedOutput {
     pub status: ExitStatus,
@@ -130,6 +130,7 @@ pub enum Outcome {
 pub enum Transport {
     Rest,
     Stream,
+    Local,
 }
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -157,6 +158,12 @@ enum ErrorCode {
     DeepgramServer,
     DeepgramNetwork,
     ResponseTooLarge,
+    LocalModelMissing,
+    LocalModelInvalid,
+    LocalUnavailable,
+    LocalFailed,
+    LocalTimeout,
+    UnsupportedFeatures,
     Internal,
 }
 impl ErrorCode {
@@ -173,6 +180,12 @@ impl ErrorCode {
             Self::DeepgramServer => "deepgram_server",
             Self::DeepgramNetwork => "deepgram_network",
             Self::ResponseTooLarge => "response_too_large",
+            Self::LocalModelMissing => "local_model_missing",
+            Self::LocalModelInvalid => "local_model_invalid",
+            Self::LocalUnavailable => "local_unavailable",
+            Self::LocalFailed => "local_failed",
+            Self::LocalTimeout => "local_timeout",
+            Self::UnsupportedFeatures => "unsupported_features",
             Self::Internal => "internal",
         }
     }
@@ -202,6 +215,10 @@ struct ResultFrame {
 struct Request<'a> {
     version: u32,
     wav_path: &'a Path,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stt_provider: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    local_model_path: Option<&'a Path>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pcm_path: Option<&'a Path>,
     deepgram_api_key: &'a str,
@@ -239,6 +256,7 @@ struct RecvFailure {
 }
 pub struct Worker {
     running: Option<Running>,
+    local_stream: bool,
     request: Vec<u8>,
     path: PathBuf,
     shutdown: Arc<AtomicBool>,
@@ -268,6 +286,43 @@ pub fn resolve() -> io::Result<PathBuf> {
     ))
 }
 
+/// Check local resources before opening the microphone. Integrity is verified
+/// again by Zig on the exact model handle used for inference.
+pub fn local_readiness(path: &Path, cfg: &ProviderConfig) -> Result<(), String> {
+    let Some(model) = &cfg.local_model_path else {
+        return Ok(());
+    };
+    let model = model.to_str().ok_or("local model path must be UTF-8")?;
+    let output = supervised(
+        path,
+        &["--local-readiness", model],
+        &[],
+        Duration::from_secs(2),
+    )?;
+    #[derive(Deserialize)]
+    struct LocalReady {
+        version: u32,
+        ready: bool,
+        error: Option<ErrorCode>,
+    }
+    let ready: LocalReady =
+        serde_json::from_slice(&output.stdout).map_err(|_| "invalid local readiness response")?;
+    if !output.status.success() || ready.version != PROTOCOL_VERSION {
+        return Err("local worker is incompatible".into());
+    }
+    if !ready.ready || ready.error.is_some() {
+        return Err(match ready.error {
+            Some(ErrorCode::LocalModelMissing) => "Q8 model is missing; check stt.local_model_path",
+            Some(ErrorCode::LocalModelInvalid) => {
+                "Q8 model is invalid; reinstall the pinned Q8 model"
+            }
+            _ => "local Q8 runtime is unavailable in this installation",
+        }
+        .into());
+    }
+    Ok(())
+}
+
 impl Worker {
     pub fn start(
         path: &Path,
@@ -278,16 +333,27 @@ impl Worker {
     ) -> Result<Self, String> {
         probe(path, &shutdown)?;
         let request = encode(wav, Some(pcm), cfg)?;
+        let local_stream = cfg.local_model_path.is_some() && cfg.streaming;
         if !cfg.streaming {
             return Ok(Self {
                 running: None,
+                local_stream,
                 request,
                 path: path.to_owned(),
                 shutdown,
             });
         }
-        let mut running = spawn(path, &["--stream"], false)?;
-        let ready_deadline = Instant::now() + Duration::from_secs(2);
+        let mut running = spawn(
+            path,
+            &[if local_stream {
+                "--local-stream"
+            } else {
+                "--stream"
+            }],
+            false,
+        )?;
+        let ready_deadline =
+            Instant::now() + Duration::from_secs(if local_stream { 12 } else { 2 });
         if let Err(error) = write_line(
             running.input.as_mut(),
             &request,
@@ -317,8 +383,12 @@ impl Worker {
         }
         if !ready.streaming {
             terminate(&mut running.child, ready_deadline);
+            if local_stream {
+                return Err("local incremental worker is unavailable".into());
+            }
             return Ok(Self {
                 running: None,
+                local_stream,
                 request,
                 path: path.to_owned(),
                 shutdown,
@@ -326,6 +396,7 @@ impl Worker {
         }
         Ok(Self {
             running: Some(running),
+            local_stream,
             request,
             path: path.to_owned(),
             shutdown,
@@ -344,7 +415,7 @@ impl Worker {
                 Ok(FrameEvent::Failed { bytes_seen: false })
                 | Err(mpsc::TryRecvError::Disconnected) => {
                     terminate(&mut running.child, deadline);
-                    return batch(&self.path, &self.request, deadline, &self.shutdown);
+                    return self.retry_batch(deadline);
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
             }
@@ -365,7 +436,7 @@ impl Worker {
                     return Err("processing cancelled".into());
                 }
                 return if conclusively_no_output(&running.frames, deadline) {
-                    batch(&self.path, &self.request, deadline, &self.shutdown).map_err(|_| first)
+                    self.retry_batch(deadline).map_err(|_| first)
                 } else {
                     Err(first)
                 };
@@ -388,14 +459,19 @@ impl Worker {
                     if first.bytes_seen || !conclusively_no_output(&running.frames, deadline) {
                         Err(first.message)
                     } else {
-                        batch(&self.path, &self.request, deadline, &self.shutdown)
-                            .map_err(|_| first.message)
+                        self.retry_batch(deadline).map_err(|_| first.message)
                     }
                 }
             }
         } else {
             batch(&self.path, &self.request, deadline, &self.shutdown)
         }
+    }
+    fn retry_batch(&self, deadline: Instant) -> Result<Outcome, String> {
+        if self.local_stream {
+            return Err("local incremental processing failed; no fallback was attempted".into());
+        }
+        batch(&self.path, &self.request, deadline, &self.shutdown)
     }
     pub fn cancel(mut self) {
         if let Some(mut r) = self.running.take() {
@@ -412,24 +488,40 @@ impl Drop for Worker {
 }
 
 fn encode(wav: &Path, pcm: Option<&Path>, c: &ProviderConfig) -> Result<Vec<u8>, String> {
+    let local = c.local_model_path.is_some();
+    if local
+        && !matches!(
+            c.processing_profile,
+            ProcessingProfile::Clean | ProcessingProfile::Verbatim
+        )
+    {
+        return Err("local mode supports only Verbatim and Clean".into());
+    }
+    let pcm = if local && !c.streaming { None } else { pcm };
     let r = Request {
         version: PROTOCOL_VERSION,
         wav_path: wav,
+        stt_provider: local.then_some("local"),
+        local_model_path: c.local_model_path.as_deref(),
         pcm_path: pcm,
-        deepgram_api_key: &c.deepgram_api_key,
-        deepgram_model: &c.deepgram_model,
-        deepgram_language: &c.deepgram_language,
-        deepgram_region: &c.deepgram_region,
-        deepgram_keyterms: &c.keyterms,
-        deepgram_smart_format: c.smart_format,
-        deepgram_punctuate: c.punctuate,
-        deepgram_dictation: c.dictation,
-        deepgram_numerals: c.numerals,
-        deepgram_measurements: c.measurements,
+        deepgram_api_key: if local { "" } else { &c.deepgram_api_key },
+        deepgram_model: if local { "nova-3" } else { &c.deepgram_model },
+        deepgram_language: if local { "en" } else { &c.deepgram_language },
+        deepgram_region: if local { "global" } else { &c.deepgram_region },
+        deepgram_keyterms: if local { &[] } else { &c.keyterms },
+        deepgram_smart_format: !local && c.smart_format,
+        deepgram_punctuate: !local && c.punctuate,
+        deepgram_dictation: !local && c.dictation,
+        deepgram_numerals: !local && c.numerals,
+        deepgram_measurements: !local && c.measurements,
         stream_finalize_timeout_ms: pcm.map(|_| c.finalize_ms),
-        llm_api_key: &c.llm_api_key,
-        llm_model: &c.llm_model,
-        llm_base_url: &c.llm_base_url,
+        llm_api_key: if local { "" } else { &c.llm_api_key },
+        llm_model: if local { "gpt-oss-120b" } else { &c.llm_model },
+        llm_base_url: if local {
+            "https://api.cerebras.ai/v1/chat/completions"
+        } else {
+            &c.llm_base_url
+        },
         processing_profile: c.processing_profile,
     };
     let b = serde_json::to_vec(&r).map_err(|_| "invalid processing request")?;
@@ -902,6 +994,7 @@ mod tests {
 
     fn config(streaming: bool) -> ProviderConfig {
         ProviderConfig {
+            local_model_path: None,
             deepgram_api_key: "secret-deepgram".into(),
             deepgram_model: "nova-3".into(),
             deepgram_language: "en".into(),
@@ -944,12 +1037,103 @@ mod tests {
     fn probe() -> String {
         format!(
             r#"if [ "${{1-}}" = "--worker-info" ]; then
-  printf '%s\n' '{{"protocol_version":3,"build_version":"{}"}}'
+  printf '%s\n' '{{"protocol_version":4,"build_version":"{}"}}'
   IFS= read -r ignored || true
   exit 0
 fi"#,
             crate::BUILD_VERSION
         )
+    }
+
+    #[test]
+    fn local_explicit_batch_keeps_cloud_credentials_out() {
+        let body = format!(
+            r#"{}
+if [ "${{1-}}" = "--local-readiness" ]; then
+  printf '%s' '{{"version":4,"ready":true}}'; exit 0
+fi
+[ "${{1-}}" != "--stream" ] || exit 31
+IFS= read -r request || true
+case "$request" in *secret-deepgram*|*secret-cerebras*|*pcm_path*|*stream_finalize_timeout_ms*) exit 32;; esac
+case "$request" in *'"stt_provider":"local"'*) ;; *) exit 33;; esac
+printf '%s' '{{"version":4,"status":"success","text":"local result","processing_profile":"clean","transport":"local"}}'
+"#,
+            probe()
+        );
+        let fixture = Fixture::new(&body);
+        let mut cfg = config(false);
+        cfg.local_model_path = Some("/models/q8.gguf".into());
+        cfg.llm_api_key = "secret-cerebras".into();
+        local_readiness(&fixture.worker, &cfg).unwrap();
+        let worker = Worker::start(
+            &fixture.worker,
+            &fixture.wav,
+            &fixture.pcm,
+            &cfg,
+            shutdown(),
+        )
+        .unwrap();
+        assert!(worker.running.is_none());
+        assert_eq!(
+            worker.finish(Duration::from_secs(2)).unwrap(),
+            Outcome::Transcript {
+                text: "local result".into(),
+                processing_profile: ProcessingProfile::Clean,
+                transport: Transport::Local,
+                warning: None,
+            }
+        );
+        cfg.processing_profile = ProcessingProfile::Polished;
+        assert!(encode(&fixture.wav, None, &cfg).is_err());
+    }
+
+    #[test]
+    fn local_incremental_uses_private_mode_and_never_retries_failed_streams() {
+        for success in [true, false] {
+            let terminal = if success {
+                "printf '%s\\n' '{\"version\":4,\"status\":\"success\",\"text\":\"local result\",\"processing_profile\":\"clean\",\"transport\":\"local\"}'"
+            } else {
+                "exit 0"
+            };
+            let body = format!(
+                r#"{}
+if [ "${{1-}}" != --local-stream ]; then touch "$(dirname "$0")/fallback"; exit 99; fi
+IFS= read -r request
+case "$request" in *secret-deepgram*|*secret-cerebras*) exit 32;; esac
+case "$request" in *'"pcm_path"'*) ;; *) exit 33;; esac
+printf '%s\n' '{{"version":4,"event":"ready","streaming":true}}'
+IFS= read -r finish
+{}
+"#,
+                probe(),
+                terminal
+            );
+            let fixture = Fixture::new(&body);
+            let mut cfg = config(true);
+            cfg.local_model_path = Some("/models/q8.gguf".into());
+            let worker = Worker::start(
+                &fixture.worker,
+                &fixture.wav,
+                &fixture.pcm,
+                &cfg,
+                shutdown(),
+            )
+            .unwrap();
+            assert!(worker.running.is_some());
+            let result = worker.finish(Duration::from_secs(2));
+            if success {
+                assert!(matches!(
+                    result,
+                    Ok(Outcome::Transcript {
+                        transport: Transport::Local,
+                        ..
+                    })
+                ));
+            } else {
+                assert!(result.is_err());
+            }
+            assert!(!fixture.root.join("fallback").exists());
+        }
     }
 
     #[test]
@@ -960,10 +1144,10 @@ fi"#,
 [ "${{1-}}" = "--stream" ]
 IFS= read -r request
 case "$request" in *secret-deepgram*) ;; *) exit 31;; esac
-printf '%s\n' '{{"version":3,"event":"ready","streaming":true}}'
+printf '%s\n' '{{"version":4,"event":"ready","streaming":true}}'
 IFS= read -r finish
-[ "$finish" = '{{"command":"finish","force_rest":false,"version":3}}' ]
-printf '%s\n' '{{"version":3,"status":"success","text":"hello","processing_profile":"clean","transport":"stream"}}'"#,
+[ "$finish" = '{{"command":"finish","force_rest":false,"version":4}}' ]
+printf '%s\n' '{{"version":4,"status":"success","text":"hello","processing_profile":"clean","transport":"stream"}}'"#,
             probe()
         );
         let fixture = Fixture::new(&body);
@@ -995,7 +1179,7 @@ printf '%s\n' '{{"version":3,"status":"success","text":"hello","processing_profi
 if [ "${{1-}}" = "--stream" ]; then exit 32; fi
 IFS= read -r request
 case "$request" in *pcm_path*) exit 33;; esac
-printf '%s' '{{"version":3,"status":"no_speech","processing_profile":"clean","transport":"rest"}}'"#,
+printf '%s' '{{"version":4,"status":"no_speech","processing_profile":"clean","transport":"rest"}}'"#,
             probe()
         );
         let fixture = Fixture::new(&body);
@@ -1029,13 +1213,13 @@ if [ "${{1-}}" = "--stream" ]; then
   printf S >> '{}'
   IFS= read -r request
   case "$request" in *'"processing_profile":"clean"'*) ;; *) exit 37;; esac
-  printf '%s\n' '{{"version":3,"event":"ready","streaming":true}}'
+  printf '%s\n' '{{"version":4,"event":"ready","streaming":true}}'
   exit 0
 fi
 printf B >> '{}'
 IFS= read -r request
 case "$request" in *'"processing_profile":"clean"'*) ;; *) exit 38;; esac
-printf '%s' '{{"version":3,"status":"success","text":"fallback","processing_profile":"clean","transport":"rest"}}'"#,
+printf '%s' '{{"version":4,"status":"success","text":"fallback","processing_profile":"clean","transport":"rest"}}'"#,
             probe(),
             log.display(),
             log.display()
@@ -1074,7 +1258,7 @@ printf '%s' '{{"version":3,"status":"success","text":"fallback","processing_prof
 if [ "${{1-}}" = "--stream" ]; then
   printf S >> '{}'
   IFS= read -r request
-  printf '%s\n' '{{"version":3,"event":"ready","streaming":true}}'
+  printf '%s\n' '{{"version":4,"event":"ready","streaming":true}}'
   IFS= read -r finish
   printf '%s\n' '{{'
   exit 0
@@ -1111,7 +1295,7 @@ exit 34"#,
 if [ "${{1-}}" = "--stream" ]; then
   printf S >> '{}'
   IFS= read -r request
-  printf '%s\n' '{{"version":3,"event":"ready","streaming":true}}'
+  printf '%s\n' '{{"version":4,"event":"ready","streaming":true}}'
   IFS= read -r finish
   printf '{{'
   /bin/sleep 2
@@ -1149,8 +1333,8 @@ exit 35"#,
 if [ "${{1-}}" = "--stream" ]; then
   printf S >> '{}'
   IFS= read -r request
-  printf '%s\n' '{{"version":3,"event":"ready","streaming":true}}'
-  printf '%s\n' '{{"version":3,"status":"success","text":"unsolicited","processing_profile":"clean","transport":"stream"}}'
+  printf '%s\n' '{{"version":4,"event":"ready","streaming":true}}'
+  printf '%s\n' '{{"version":4,"status":"success","text":"unsolicited","processing_profile":"clean","transport":"stream"}}'
   IFS= read -r finish || true
   exit 0
 fi
@@ -1179,7 +1363,7 @@ exit 36"#,
     fn incompatible_worker_build_is_rejected() {
         let fixture = Fixture::new(
             r#"if [ "${1-}" = "--worker-info" ]; then
-  printf '%s\n' '{"protocol_version":3,"build_version":"different"}'
+  printf '%s\n' '{"protocol_version":4,"build_version":"different"}'
   IFS= read -r ignored || true
 fi"#,
         );
@@ -1196,17 +1380,34 @@ fi"#,
     }
 
     #[test]
-    fn v3_codec_requires_metadata_and_projects_transformation_warning() {
+    fn v4_codec_requires_metadata_and_projects_transformation_warning() {
+        let local = include_bytes!("../../../tests/contracts-0.2/worker-result-local.json");
+        assert_eq!(
+            decode_result(local.to_vec()).unwrap(),
+            Outcome::Transcript {
+                text: "Local speech.".into(),
+                processing_profile: ProcessingProfile::Clean,
+                transport: Transport::Local,
+                warning: None,
+            }
+        );
+        assert!(
+            decode_result(
+                include_bytes!("../../../tests/contracts-0.2/worker-result-v3-rejected.json")
+                    .to_vec()
+            )
+            .is_err()
+        );
         let request: serde_json::Value =
             serde_json::from_slice(&encode(Path::new("/tmp/a.wav"), None, &config(false)).unwrap())
                 .unwrap();
-        assert_eq!(request["version"], 3);
+        assert_eq!(request["version"], 4);
         assert_eq!(request["processing_profile"], "clean");
         assert!(request.get("cleanup_enabled").is_none());
 
         assert_eq!(
             decode_result(
-                br#"{"version":3,"status":"success","text":"raw","warning":"transformation_failed","processing_profile":"polished","transport":"stream"}"#.to_vec()
+                br#"{"version":4,"status":"success","text":"raw","warning":"transformation_failed","processing_profile":"polished","transport":"stream"}"#.to_vec()
             )
             .unwrap(),
             Outcome::Transcript {
@@ -1218,14 +1419,14 @@ fi"#,
         );
         for invalid in [
             br#"{"version":2,"status":"no_speech","processing_profile":"clean","transport":"rest"}"#.as_slice(),
-            br#"{"version":3,"status":"no_speech","transport":"rest"}"#.as_slice(),
-            br#"{"version":3,"status":"no_speech","processing_profile":"clean"}"#.as_slice(),
-            br#"{"version":3,"status":"success","text":"raw","warning":"provider_failed","processing_profile":"polished","transport":"stream"}"#.as_slice(),
-            br#"{"version":3,"status":"success","text":"raw","error":"internal","processing_profile":"polished","transport":"stream"}"#.as_slice(),
-            br#"{"version":3,"status":"no_speech","text":"raw","processing_profile":"clean","transport":"rest"}"#.as_slice(),
-            br#"{"version":3,"status":"error","processing_profile":"clean","transport":"rest"}"#.as_slice(),
-            br#"{"version":3,"status":"error","error":"future_error","processing_profile":"clean","transport":"rest"}"#.as_slice(),
-            br#"{"version":3,"status":"future_status","processing_profile":"clean","transport":"rest"}"#.as_slice(),
+            br#"{"version":4,"status":"no_speech","transport":"rest"}"#.as_slice(),
+            br#"{"version":4,"status":"no_speech","processing_profile":"clean"}"#.as_slice(),
+            br#"{"version":4,"status":"success","text":"raw","warning":"provider_failed","processing_profile":"polished","transport":"stream"}"#.as_slice(),
+            br#"{"version":4,"status":"success","text":"raw","error":"internal","processing_profile":"polished","transport":"stream"}"#.as_slice(),
+            br#"{"version":4,"status":"no_speech","text":"raw","processing_profile":"clean","transport":"rest"}"#.as_slice(),
+            br#"{"version":4,"status":"error","processing_profile":"clean","transport":"rest"}"#.as_slice(),
+            br#"{"version":4,"status":"error","error":"future_error","processing_profile":"clean","transport":"rest"}"#.as_slice(),
+            br#"{"version":4,"status":"future_status","processing_profile":"clean","transport":"rest"}"#.as_slice(),
         ] {
             assert!(decode_result(invalid.to_vec()).is_err());
         }

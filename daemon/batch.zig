@@ -2,6 +2,7 @@ const std = @import("std");
 const recorder = @import("recorder.zig");
 const provider = @import("provider_config.zig");
 const deepgram = @import("stt/deepgram.zig");
+const local = @import("stt/local.zig");
 const cloud_planner = @import("llm/cloud_planner.zig");
 const keywords = @import("keywords.zig");
 const processing = @import("processing.zig");
@@ -15,6 +16,8 @@ pub const max_output_bytes = worker_protocol.max_result_bytes;
 pub const Request = struct {
     version: u32,
     wav_path: []const u8,
+    stt_provider: provider.Kind = .deepgram,
+    local_model_path: []const u8 = "",
     deepgram_api_key: []const u8,
     deepgram_model: []const u8 = "nova-3",
     deepgram_language: []const u8 = "en",
@@ -42,15 +45,22 @@ pub const ErrorCode = enum {
     deepgram_server,
     deepgram_network,
     response_too_large,
+    local_model_missing,
+    local_model_invalid,
+    local_unavailable,
+    local_failed,
+    local_timeout,
+    unsupported_features,
     internal,
 };
 pub const Warning = enum { transformation_failed };
 pub const Status = enum { success, no_speech, @"error" };
-pub const Transport = enum { rest, stream };
+pub const Transport = enum { rest, stream, local };
 pub const Timing = struct {
     deepgram_connect_ms: ?u64 = null,
     deepgram_stop_to_final_ms: ?u64 = null,
     rest_stt_ms: ?u64 = null,
+    local_stt_ms: ?u64 = null,
     deterministic_processing_ms: u64,
     planner_ms: ?u64 = null,
     processing_total_ms: u64,
@@ -78,6 +88,7 @@ pub const WireResult = struct {
 pub const Seam = struct {
     context: ?*anyopaque = null,
     transcribe: *const fn (?*anyopaque, std.mem.Allocator, std.Io, *const provider.SttConfig, []const u8) anyerror![]u8 = liveTranscribe,
+    local_transcribe: *const fn (?*anyopaque, std.mem.Allocator, std.Io, []const u8, []const u8) anyerror![]u8 = liveLocalTranscribe,
     clean: *const fn (?*anyopaque, std.mem.Allocator, []const []const u8, []const u8) anyerror![]u8 = liveClean,
     planner: *const fn (?*anyopaque, std.mem.Allocator, std.Io, *const provider.LlmConfig, []const []const u8, processing.Profile, []const u8) anyerror![]u8 = livePlanner,
 };
@@ -96,9 +107,18 @@ pub fn processWithTranscript(gpa: std.mem.Allocator, io: std.Io, r: Request, sea
 }
 
 pub fn processWithTranscriptTiming(gpa: std.mem.Allocator, io: std.Io, r: Request, seam: Seam, streamed: ?[]const u8, connect_ms: ?u64, stop_to_final_ms: ?u64) Result {
-    const transport: Transport = if (streamed != null) .stream else .rest;
+    const transport: Transport = if (r.stt_provider == .local) .local else if (streamed != null) .stream else .rest;
     if (r.version != worker_protocol.version) return fail(.incompatible_version, r.processing_profile, transport);
-    if (r.deepgram_api_key.len == 0) return fail(.missing_deepgram_key, r.processing_profile, transport);
+    if (r.stt_provider == .local) {
+        if (streamed != null or connect_ms != null or stop_to_final_ms != null or (r.processing_profile != .verbatim and r.processing_profile != .clean) or
+            !std.mem.eql(u8, r.deepgram_language, "en") or r.deepgram_keyterms.len != 0 or
+            r.deepgram_smart_format or r.deepgram_punctuate or r.deepgram_dictation or
+            r.deepgram_numerals or r.deepgram_measurements)
+            return fail(.unsupported_features, r.processing_profile, transport);
+        if (r.deepgram_api_key.len != 0 or r.llm_api_key.len != 0)
+            return fail(.invalid_request, r.processing_profile, transport);
+        if (!std.fs.path.isAbsolute(r.local_model_path)) return fail(.local_model_missing, r.processing_profile, transport);
+    } else if (r.deepgram_api_key.len == 0) return fail(.missing_deepgram_key, r.processing_profile, transport);
     if (r.deepgram_dictation and !r.deepgram_punctuate) return fail(.invalid_request, r.processing_profile, transport);
     if (!safeSecret(r.deepgram_api_key) or !safeSecret(r.llm_api_key)) return fail(.invalid_request, r.processing_profile, transport);
     if (!safeProviderValue(r.deepgram_model) or !safeProviderValue(r.deepgram_language) or
@@ -144,14 +164,15 @@ pub fn processWithTranscriptTiming(gpa: std.mem.Allocator, io: std.Io, r: Reques
         .clean = coreClean,
         .planner = corePlanner,
     }) catch |err| return fail(
-        if (err == error.ResponseTooLarge) .response_too_large else mapDeepgramError(err),
+        if (err == error.ResponseTooLarge) .response_too_large else if (r.stt_provider == .local) mapLocalError(err) else mapDeepgramError(err),
         r.processing_profile,
         transport,
     );
     const timing: Timing = .{
         .deepgram_connect_ms = connect_ms,
         .deepgram_stop_to_final_ms = stop_to_final_ms,
-        .rest_stt_ms = context.rest_stt_ms,
+        .rest_stt_ms = if (r.stt_provider == .deepgram) context.rest_stt_ms else null,
+        .local_stt_ms = if (r.stt_provider == .local) context.rest_stt_ms else null,
         .deterministic_processing_ms = context.deterministic_processing_ms,
         .planner_ms = context.planner_ms,
         .processing_total_ms = elapsedMs(processing_started, io),
@@ -184,6 +205,8 @@ fn coreRest(context_ptr: ?*anyopaque, gpa: std.mem.Allocator) ![]u8 {
     const context: *CoreContext = @ptrCast(@alignCast(context_ptr.?));
     const started = nowMs(context.io);
     defer context.rest_stt_ms = elapsedMs(started, context.io);
+    if (context.request.stt_provider == .local)
+        return context.seam.local_transcribe(context.seam.context, gpa, context.io, context.request.local_model_path, context.wav);
     return context.seam.transcribe(context.seam.context, gpa, context.io, context.stt, context.wav);
 }
 
@@ -191,7 +214,12 @@ fn coreClean(context_ptr: ?*anyopaque, gpa: std.mem.Allocator, raw: []const u8) 
     const context: *CoreContext = @ptrCast(@alignCast(context_ptr.?));
     const started = nowMs(context.io);
     defer context.deterministic_processing_ms += elapsedMs(started, context.io);
-    return context.seam.clean(context.seam.context, gpa, context.request.deepgram_keyterms, raw);
+    const cleaned = try context.seam.clean(context.seam.context, gpa, context.request.deepgram_keyterms, raw);
+    // Conservative local question repair and final declarative periods.
+    // Deterministic, local-only; cloud Clean output is byte-identical to before.
+    if (context.request.stt_provider != .local) return cleaned;
+    defer gpa.free(cleaned);
+    return cloud_planner.cleanup_engine.normalizeLocalEndings(gpa, cleaned);
 }
 
 fn corePlanner(context_ptr: ?*anyopaque, gpa: std.mem.Allocator, profile: processing.Profile, raw: []const u8) ![]u8 {
@@ -295,6 +323,21 @@ pub fn parseResult(gpa: std.mem.Allocator, bytes: []const u8) !std.json.Parsed(W
     return parsed;
 }
 
+pub fn mapLocalError(err: anyerror) ErrorCode {
+    return switch (err) {
+        error.ModelMissing => .local_model_missing,
+        error.ModelInvalid => .local_model_invalid,
+        error.LocalUnavailable, error.UnsupportedPlatform => .local_unavailable,
+        error.Timeout => .local_timeout,
+        error.ResponseTooLarge => .response_too_large,
+        else => .local_failed,
+    };
+}
+
+fn liveLocalTranscribe(_: ?*anyopaque, gpa: std.mem.Allocator, io: std.Io, model_path: []const u8, wav: []const u8) ![]u8 {
+    return local.transcribe(gpa, io, model_path, wav);
+}
+
 fn liveTranscribe(_: ?*anyopaque, gpa: std.mem.Allocator, io: std.Io, cfg: *const provider.SttConfig, wav: []const u8) ![]u8 {
     return deepgram.transcribe(gpa, io, cfg, wav, false);
 }
@@ -313,11 +356,14 @@ fn livePlanner(_: ?*anyopaque, gpa: std.mem.Allocator, io: std.Io, cfg: *const p
 
 const FakeProvider = struct {
     transcript: []const u8 = "München",
+    clean_transcript: ?[]const u8 = null,
     cleanup_fails: bool = false,
     planner_fails: bool = false,
     expected_region: []const u8 = "global",
     expected_formatting: bool = false,
     transcribe_calls: usize = 0,
+    local_calls: usize = 0,
+    local_error: ?anyerror = null,
     clean_calls: usize = 0,
     planner_calls: usize = 0,
     polished_calls: usize = 0,
@@ -339,6 +385,7 @@ const FakeProvider = struct {
         const self: *FakeProvider = @ptrCast(@alignCast(context.?));
         self.clean_calls += 1;
         if (self.cleanup_fails) return error.RequestFailed;
+        if (self.clean_transcript) |text| return gpa.dupe(u8, text);
         return std.fmt.allocPrint(gpa, "clean: {s}", .{raw});
     }
 
@@ -356,8 +403,15 @@ const FakeProvider = struct {
         return std.fmt.allocPrint(gpa, "{s}: {s}", .{ @tagName(profile), raw });
     }
 
+    fn localTranscribe(context: ?*anyopaque, gpa: std.mem.Allocator, _: std.Io, _: []const u8, _: []const u8) ![]u8 {
+        const self: *FakeProvider = @ptrCast(@alignCast(context.?));
+        self.local_calls += 1;
+        if (self.local_error) |err| return err;
+        return gpa.dupe(u8, self.transcript);
+    }
+
     fn seam(self: *FakeProvider) Seam {
-        return .{ .context = self, .transcribe = transcribe, .clean = clean, .planner = planner };
+        return .{ .context = self, .transcribe = transcribe, .local_transcribe = localTranscribe, .clean = clean, .planner = planner };
     }
 };
 
@@ -379,13 +433,129 @@ fn writeTestWav(tmp: *std.testing.TmpDir, sample_bytes: usize) ![]u8 {
     return std.testing.allocator.dupe(u8, real_path);
 }
 
+test "Q8 local file mode needs no keys and cannot reach cloud seams" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const path = try writeTestWav(&tmp, 16000);
+    defer gpa.free(path);
+    var r: Request = .{ .version = worker_protocol.version, .wav_path = path, .stt_provider = .local, .local_model_path = "/synthetic/q8.gguf", .deepgram_api_key = "", .llm_api_key = "", .processing_profile = .verbatim };
+    var fake: FakeProvider = .{};
+    for ([_]processing.Profile{ .verbatim, .clean }) |profile| {
+        r.processing_profile = profile;
+        const result = process(gpa, std.testing.io, r, fake.seam());
+        defer if (result.text) |text| gpa.free(text);
+        try std.testing.expectEqual(Status.success, result.status);
+        try std.testing.expectEqual(Transport.local, result.transport);
+        try std.testing.expect(result.timing.?.local_stt_ms != null);
+        try std.testing.expect(result.timing.?.rest_stt_ms == null);
+        try std.testing.expectEqualStrings(if (profile == .verbatim) "München" else "clean: München", result.text.?);
+    }
+    try std.testing.expectEqual(@as(usize, 2), fake.local_calls);
+    try std.testing.expectEqual(@as(usize, 0), fake.transcribe_calls);
+    try std.testing.expectEqual(@as(usize, 0), fake.planner_calls);
+    fake.transcript = "";
+    try std.testing.expectEqual(Status.no_speech, process(gpa, std.testing.io, r, fake.seam()).status);
+    for ([_]anyerror{ error.ModelMissing, error.ModelInvalid, error.LocalUnavailable, error.Timeout, error.RequestFailed }) |err| {
+        fake.local_error = err;
+        const result = process(gpa, std.testing.io, r, fake.seam());
+        try std.testing.expectEqual(mapLocalError(err), result.@"error".?);
+        try std.testing.expectEqual(@as(usize, 0), fake.transcribe_calls);
+        try std.testing.expectEqual(@as(usize, 0), fake.planner_calls);
+    }
+}
+
+test "local Clean fixes question endings while cloud Clean stays byte-identical" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const path = try writeTestWav(&tmp, 16000);
+    defer gpa.free(path);
+    var fake: FakeProvider = .{ .transcript = "unused", .clean_transcript = "What is the question, please." };
+    const local_req: Request = .{ .version = worker_protocol.version, .wav_path = path, .stt_provider = .local, .local_model_path = "/synthetic/q8.gguf", .deepgram_api_key = "", .llm_api_key = "", .processing_profile = .clean };
+    const local_result = process(gpa, std.testing.io, local_req, fake.seam());
+    defer if (local_result.text) |text| gpa.free(text);
+    try std.testing.expectEqualStrings("What is the question, please?", local_result.text.?);
+    const cloud_req: Request = .{ .version = worker_protocol.version, .wav_path = path, .deepgram_api_key = "synthetic", .llm_api_key = "", .processing_profile = .clean };
+    const cloud_result = process(gpa, std.testing.io, cloud_req, fake.seam());
+    defer if (cloud_result.text) |text| gpa.free(text);
+    try std.testing.expectEqualStrings("What is the question, please.", cloud_result.text.?);
+    const verbatim_req: Request = .{ .version = worker_protocol.version, .wav_path = path, .stt_provider = .local, .local_model_path = "/synthetic/q8.gguf", .deepgram_api_key = "", .llm_api_key = "", .processing_profile = .verbatim };
+    fake.transcript = "What is the question, please.";
+    const verbatim = process(gpa, std.testing.io, verbatim_req, fake.seam());
+    defer if (verbatim.text) |text| gpa.free(text);
+    try std.testing.expectEqualStrings("What is the question, please.", verbatim.text.?);
+}
+
+test "real Clean repairs missing local question punctuation without changing cloud or Verbatim" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const path = try writeTestWav(&tmp, 16000);
+    defer gpa.free(path);
+    const cases = [_]struct { raw: []const u8, clean: []const u8 }{
+        .{ .raw = "What is your name", .clean = "What is your name?" },
+        .{ .raw = "Who called.", .clean = "Who called?" },
+        .{ .raw = "What’s your name", .clean = "What’s your name?" },
+        .{ .raw = "What I need is this.", .clean = "What I need is this." },
+        .{ .raw = "What I need is this", .clean = "What I need is this." },
+        .{ .raw = "I recorded this in two separate recordings", .clean = "I recorded this in two separate recordings." },
+        .{ .raw = "This is working", .clean = "This is working." },
+        .{ .raw = "two separate recordings", .clean = "two separate recordings" },
+        .{ .raw = "Is the model working", .clean = "Is the model working?" },
+        .{ .raw = "Isn’t it ready", .clean = "Isn’t it ready?" },
+        .{ .raw = "Or is there anything remaining", .clean = "Or is there anything remaining?" },
+        .{ .raw = "I mean questions can start with is as well and other words too", .clean = "I mean questions can start with is as well and other words too." },
+    };
+    for (cases) |case| {
+        var fake: FakeProvider = .{ .transcript = case.raw };
+        var seam = fake.seam();
+        seam.clean = liveClean;
+        for (0..3) |mode| {
+            const req: Request = .{
+                .version = worker_protocol.version,
+                .wav_path = path,
+                .stt_provider = if (mode == 2) .deepgram else .local,
+                .local_model_path = if (mode == 2) "" else "/synthetic/q8.gguf",
+                .deepgram_api_key = if (mode == 2) "synthetic" else "",
+                .llm_api_key = "",
+                .processing_profile = if (mode == 1) .verbatim else .clean,
+            };
+            const result = process(gpa, std.testing.io, req, seam);
+            defer if (result.text) |text| gpa.free(text);
+            try std.testing.expectEqual(Status.success, result.status);
+            try std.testing.expectEqualStrings(if (mode == 0) case.clean else case.raw, result.text.?);
+        }
+    }
+}
+
+test "local rejects unsupported profiles credentials and streamed injection before inference" {
+    const gpa = std.testing.allocator;
+    var fake: FakeProvider = .{};
+    var r: Request = .{ .version = worker_protocol.version, .wav_path = "/not-opened.wav", .stt_provider = .local, .local_model_path = "/synthetic/q8.gguf", .deepgram_api_key = "", .llm_api_key = "", .processing_profile = .polished };
+    for ([_]processing.Profile{ .polished, .legacy_v1 }) |profile| {
+        r.processing_profile = profile;
+        try std.testing.expectEqual(ErrorCode.unsupported_features, process(gpa, std.testing.io, r, fake.seam()).@"error".?);
+    }
+    r.processing_profile = .clean;
+    r.deepgram_api_key = "must-not-use";
+    try std.testing.expectEqual(ErrorCode.invalid_request, process(gpa, std.testing.io, r, fake.seam()).@"error".?);
+    r.deepgram_api_key = "";
+    try std.testing.expectEqual(ErrorCode.unsupported_features, processWithTranscript(gpa, std.testing.io, r, fake.seam(), "cloud result").@"error".?);
+    r.deepgram_language = "fr";
+    try std.testing.expectEqual(ErrorCode.unsupported_features, process(gpa, std.testing.io, r, fake.seam()).@"error".?);
+    try std.testing.expectEqual(@as(usize, 0), fake.local_calls);
+    try std.testing.expectEqual(@as(usize, 0), fake.transcribe_calls);
+    try std.testing.expectEqual(@as(usize, 0), fake.planner_calls);
+}
+
 test "strict bounded request and result JSON" {
-    const json = "{\"version\":3,\"wav_path\":\"/a\",\"deepgram_api_key\":\"d\",\"llm_api_key\":\"g\",\"processing_profile\":\"polished\"}";
+    const json = "{\"version\":4,\"wav_path\":\"/a\",\"deepgram_api_key\":\"d\",\"llm_api_key\":\"g\",\"processing_profile\":\"polished\"}";
     const parsed = try parseRequest(std.testing.allocator, json);
     defer parsed.deinit();
     try std.testing.expectError(error.InvalidRequest, parseRequest(std.testing.allocator, json ++ "x"));
-    try std.testing.expectError(error.InvalidRequest, parseRequest(std.testing.allocator, "{\"version\":3,\"wav_path\":\"/a\",\"deepgram_api_key\":\"d\",\"llm_api_key\":\"g\"}"));
-    try std.testing.expectError(error.InvalidRequest, parseRequest(std.testing.allocator, "{\"version\":3,\"wav_path\":\"/a\",\"deepgram_api_key\":\"d\",\"llm_api_key\":\"g\",\"cleanup_enabled\":true}"));
+    try std.testing.expectError(error.InvalidRequest, parseRequest(std.testing.allocator, "{\"version\":4,\"wav_path\":\"/a\",\"deepgram_api_key\":\"d\",\"llm_api_key\":\"g\"}"));
+    try std.testing.expectError(error.InvalidRequest, parseRequest(std.testing.allocator, "{\"version\":4,\"wav_path\":\"/a\",\"deepgram_api_key\":\"d\",\"llm_api_key\":\"g\",\"cleanup_enabled\":true}"));
     const out = try stringifyResult(std.testing.allocator, .{
         .status = .success,
         .text = "München",
@@ -418,16 +588,16 @@ test "result timing is additive and round trips" {
 }
 
 test "worker result decoder requires fields and status semantics" {
-    const valid = try parseResult(std.testing.allocator, "{\"version\":3,\"status\":\"success\",\"text\":\"hello\",\"processing_profile\":\"clean\",\"transport\":\"stream\",\"future\":true}");
+    const valid = try parseResult(std.testing.allocator, "{\"version\":4,\"status\":\"success\",\"text\":\"hello\",\"processing_profile\":\"clean\",\"transport\":\"stream\",\"future\":true}");
     defer valid.deinit();
     try std.testing.expectEqualStrings("hello", valid.value.text.?);
     for ([_][]const u8{
         "{\"status\":\"success\",\"text\":\"hello\"}",
-        "{\"version\":3,\"status\":\"success\",\"text\":\"hello\",\"transport\":\"rest\"}",
-        "{\"version\":3,\"status\":\"success\",\"text\":\"hello\",\"processing_profile\":\"verbatim\"}",
-        "{\"version\":3,\"status\":\"success\",\"text\":\"\",\"processing_profile\":\"verbatim\",\"transport\":\"rest\"}",
-        "{\"version\":3,\"status\":\"no_speech\",\"text\":\"unexpected\",\"processing_profile\":\"verbatim\",\"transport\":\"rest\"}",
-        "{\"version\":3,\"status\":\"error\",\"processing_profile\":\"verbatim\",\"transport\":\"rest\"}",
+        "{\"version\":4,\"status\":\"success\",\"text\":\"hello\",\"transport\":\"rest\"}",
+        "{\"version\":4,\"status\":\"success\",\"text\":\"hello\",\"processing_profile\":\"verbatim\"}",
+        "{\"version\":4,\"status\":\"success\",\"text\":\"\",\"processing_profile\":\"verbatim\",\"transport\":\"rest\"}",
+        "{\"version\":4,\"status\":\"no_speech\",\"text\":\"unexpected\",\"processing_profile\":\"verbatim\",\"transport\":\"rest\"}",
+        "{\"version\":4,\"status\":\"error\",\"processing_profile\":\"verbatim\",\"transport\":\"rest\"}",
     }) |invalid_json| try std.testing.expectError(error.InvalidResult, parseResult(std.testing.allocator, invalid_json));
 }
 
@@ -499,7 +669,7 @@ test "REST and stream planner failure preserve polished profile with Clean fallb
     try std.testing.expectEqualStrings("clean: streamed", streamed.text.?);
 }
 
-test "protocol v3 routes clean polished and legacy engines by profile" {
+test "protocol v4 routes clean polished and legacy engines by profile" {
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     const path = try writeTestWav(&tmp, 16_000);

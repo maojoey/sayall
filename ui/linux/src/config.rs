@@ -100,6 +100,8 @@ impl Default for Output {
 
 #[derive(Clone, Debug)]
 pub struct ProviderConfig {
+    /// Some selects Q8-only local inference; `streaming` then means local incremental processing.
+    pub local_model_path: Option<PathBuf>,
     pub deepgram_api_key: String,
     pub deepgram_model: String,
     pub deepgram_language: String,
@@ -146,6 +148,7 @@ impl Default for Hud {
 #[serde(default)]
 struct Stt {
     provider: String,
+    local_model_path: String,
     api_key: String,
     model: String,
     language: String,
@@ -163,6 +166,7 @@ impl Default for Stt {
     fn default() -> Self {
         Self {
             provider: "deepgram".into(),
+            local_model_path: String::new(),
             api_key: String::new(),
             model: "nova-3".into(),
             language: "en".into(),
@@ -239,6 +243,9 @@ pub fn selected_processing_mode() -> io::Result<ProcessingMode> {
     let (_, bytes) = read_secure_config()?;
     let cfg: Config =
         serde_json::from_slice(&bytes).map_err(|e| invalid(&format!("invalid config: {e}")))?;
+    if cfg.stt.provider == "local" {
+        return Ok(cfg.processing.mode.unwrap_or(ProcessingMode::Clean));
+    }
     Ok(
         match effective_processing_profile(cfg.processing.mode, cfg.llm.enabled.unwrap_or(false)) {
             ProcessingProfile::Verbatim => ProcessingMode::Verbatim,
@@ -430,8 +437,11 @@ pub fn load_hud_appearance() -> io::Result<Appearance> {
 fn project_session_config(bytes: &[u8], parent: &Path) -> io::Result<SessionConfig> {
     let mut cfg: Config =
         serde_json::from_slice(bytes).map_err(|e| invalid(&format!("invalid config: {e}")))?;
-    migrate_legacy_llm(&mut cfg.llm);
     validate(&cfg.recording)?;
+    if cfg.stt.provider == "local" {
+        return project_local_config(cfg);
+    }
+    migrate_legacy_llm(&mut cfg.llm);
     let processing_profile =
         effective_processing_profile(cfg.processing.mode, cfg.llm.enabled.unwrap_or(false));
     let deepgram_api_key = resolve_secret(cfg.stt.api_key, "DEEPGRAM_API_KEY");
@@ -472,6 +482,7 @@ fn project_session_config(bytes: &[u8], parent: &Path) -> io::Result<SessionConf
         show_timer: cfg.hud.show_timer,
         notifications: cfg.notifications,
         provider: ProviderConfig {
+            local_model_path: None,
             deepgram_api_key,
             deepgram_model: model,
             deepgram_language: language,
@@ -488,6 +499,72 @@ fn project_session_config(bytes: &[u8], parent: &Path) -> io::Result<SessionConf
             llm_model,
             llm_base_url: base,
             processing_profile,
+        },
+    })
+}
+
+fn project_local_config(cfg: Config) -> io::Result<SessionConfig> {
+    if !["nova-3", "parakeet-unified-en-q8"].contains(&cfg.stt.model.as_str())
+        || cfg.stt.language != "en"
+        || !cfg.stt.keyterms.is_empty()
+        || cfg.recording.max_seconds > 300
+    {
+        return Err(invalid(
+            "local mode supports only Parakeet Q8, English, no keyterms, and recordings up to 300 seconds",
+        ));
+    }
+    let profile = match cfg.processing.mode {
+        None | Some(ProcessingMode::Clean) => ProcessingProfile::Clean,
+        Some(ProcessingMode::Verbatim) => ProcessingProfile::Verbatim,
+        Some(ProcessingMode::Polished) => {
+            return Err(invalid(
+                "local mode supports Verbatim or Clean, not Polished",
+            ));
+        }
+    };
+    let model = if cfg.stt.local_model_path.is_empty() {
+        let base = match std::env::var_os("XDG_DATA_HOME").filter(|v| !v.is_empty()) {
+            Some(base) => PathBuf::from(base),
+            None => PathBuf::from(
+                std::env::var_os("HOME").ok_or_else(|| invalid("model home unavailable"))?,
+            )
+            .join(".local/share"),
+        };
+        base.join("sayall/models/parakeet-unified-en-0.6b-Q8_0.gguf")
+    } else {
+        PathBuf::from(cfg.stt.local_model_path)
+    };
+    if !model.is_absolute() {
+        return Err(invalid("local model path must be absolute"));
+    }
+    Ok(SessionConfig {
+        recording: cfg.recording,
+        output: OutputConfig {
+            method: parse_output_method(&cfg.output.method)?,
+            trailing_space: cfg.output.trailing_space,
+        },
+        show_timer: cfg.hud.show_timer,
+        notifications: cfg.notifications,
+        provider: ProviderConfig {
+            local_model_path: Some(model),
+            // Never resolve cloud environment references or legacy keyword
+            // stores on this branch. Cloud values are not forwarded.
+            deepgram_api_key: String::new(),
+            deepgram_model: "nova-3".into(),
+            deepgram_language: "en".into(),
+            deepgram_region: "global".into(),
+            keyterms: vec![],
+            smart_format: false,
+            punctuate: false,
+            dictation: false,
+            numerals: false,
+            measurements: false,
+            streaming: cfg.stt.streaming.unwrap_or(true),
+            finalize_ms: 2000,
+            llm_api_key: String::new(),
+            llm_model: "gpt-oss-120b".into(),
+            llm_base_url: "https://api.cerebras.ai/v1/chat/completions".into(),
+            processing_profile: profile,
         },
     })
 }
@@ -834,6 +911,35 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn local_mode_never_resolves_cloud_credentials_or_keywords() {
+        let bytes = br#"{"stt":{"provider":"local","local_model_path":"/models/q8.gguf","api_key":"$DEEPGRAM_API_KEY","streaming":true},"llm":{"enabled":true,"api_key":"$CEREBRAS_API_KEY"}}"#;
+        let cfg = project_session_config(bytes, Path::new("/not-read")).unwrap();
+        assert_eq!(
+            cfg.provider.local_model_path,
+            Some(PathBuf::from("/models/q8.gguf"))
+        );
+        assert!(cfg.provider.streaming);
+        assert!(cfg.provider.deepgram_api_key.is_empty() && cfg.provider.llm_api_key.is_empty());
+        assert_eq!(cfg.provider.processing_profile, ProcessingProfile::Clean);
+        assert!(cfg.provider.keyterms.is_empty());
+        for fragment in [
+            r#""model":"parakeet-unified-en-q4""#,
+            r#""language":"fr""#,
+            r#""local_model_path":"relative""#,
+        ] {
+            let bytes = format!("{{\"stt\":{{\"provider\":\"local\",{fragment}}}}}");
+            assert!(project_session_config(bytes.as_bytes(), Path::new("/not-read")).is_err());
+        }
+        assert!(
+            project_session_config(
+                br#"{"stt":{"provider":"local"},"processing":{"mode":"polished"}}"#,
+                Path::new("/not-read")
+            )
+            .is_err()
+        );
     }
 
     #[test]

@@ -168,6 +168,10 @@ pub fn loadReadOnlyWithPresence(gpa: Allocator, io: Io, env: *const std.process.
         .{};
     applyEnvironment(&cfg, env);
 
+    if (std.mem.eql(u8, cfg.stt.provider, "local")) {
+        try validate(&cfg);
+        return .{ .config = cfg, .present = config_bytes != null };
+    }
     if (try readPrivateFile(gpa, io, parent, "keywords.json", 64 * 1024)) |bytes|
         cfg.stt.keyterms = try keywords.parseFileContents(gpa, bytes)
     else
@@ -185,6 +189,21 @@ fn readOnlyDefaults(gpa: Allocator, env: *const std.process.Environ.Map) !ReadOn
 }
 
 fn applyEnvironment(cfg: *Config, env: *const std.process.Environ.Map) void {
+    if (std.mem.eql(u8, cfg.stt.provider, "local")) {
+        cfg.stt.api_key = "";
+        cfg.llm = .{};
+        cfg.processing.mode = cfg.processing.mode orelse .clean;
+        if (std.mem.eql(u8, cfg.stt.model, "nova-3")) cfg.stt.model = "parakeet-unified-en-q8";
+        cfg.stt.streaming = false;
+        cfg.stt.stream_finalize_timeout_ms = 2000;
+        cfg.stt.smart_format = false;
+        cfg.stt.punctuate = false;
+        cfg.stt.dictation = false;
+        cfg.stt.numerals = false;
+        cfg.stt.measurements = false;
+        cfg.stt.region = "global";
+        return;
+    }
     // One-cycle upgrade bridge: never reinterpret the legacy credential as a
     // Cerebras key. Only migrate provider metadata in memory so Polished can
     // surface the normal missing-Cerebras-key guidance.
@@ -246,6 +265,10 @@ fn loadWithPolicy(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, m
 
     applyEnvironment(&cfg, env);
 
+    if (std.mem.eql(u8, cfg.stt.provider, "local")) {
+        try validate(&cfg);
+        return cfg;
+    }
     if (try paths.Config.keywords(gpa, env)) |keywords_path| {
         const store = keywords.Store.init(keywords_path);
         if (try store.load(gpa, io)) |stored| {
@@ -289,7 +312,20 @@ pub fn loadLegacyKeyterms(gpa: Allocator, io: Io, env: *const std.process.Enviro
 }
 
 pub fn validate(cfg: *const Config) ValidationError!void {
-    if (!std.mem.eql(u8, cfg.stt.provider, "deepgram")) return invalid("stt.provider must be 'deepgram'");
+    const local_mode = std.mem.eql(u8, cfg.stt.provider, "local");
+    if (!local_mode and !std.mem.eql(u8, cfg.stt.provider, "deepgram")) return invalid("stt.provider must be 'deepgram' or 'local'");
+    if (local_mode) {
+        if (!std.mem.eql(u8, cfg.stt.model, "parakeet-unified-en-q8") and !std.mem.eql(u8, cfg.stt.model, "nova-3"))
+            return invalid("local mode supports only Parakeet Unified Q8");
+        if (!std.mem.eql(u8, cfg.stt.language, "en") or cfg.stt.keyterms.len != 0)
+            return invalid("local mode supports English without keyterms");
+        if (cfg.stt.local_model_path.len > 0 and !std.fs.path.isAbsolute(cfg.stt.local_model_path))
+            return invalid("local model path must be absolute");
+        if (effectiveProcessingProfile(cfg).usesPlanner())
+            return invalid("local mode supports Verbatim or Clean, not Polished");
+        if (cfg.recording.max_seconds > 300)
+            return invalid("local recording limit must not exceed 300 seconds");
+    }
     if (!std.mem.eql(u8, cfg.llm.provider, "cerebras")) return invalid("llm.provider must be 'cerebras'");
     if (!std.mem.eql(u8, cfg.stt.region, "global") and !std.mem.eql(u8, cfg.stt.region, "eu") and
         !std.mem.eql(u8, cfg.stt.region, "au"))
@@ -593,6 +629,31 @@ test "dictation requires punctuation" {
     try std.testing.expectError(error.InvalidConfig, validate(&cfg));
     cfg.stt.punctuate = true;
     try validate(&cfg);
+}
+
+test "local configuration defaults to Q8 Clean without any credential lookup" {
+    const gpa = std.testing.allocator;
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    try env.put("XDG_CONFIG_HOME", "not-an-absolute-config-directory");
+    var cfg: Config = .{};
+    cfg.stt.provider = "local";
+    cfg.stt.local_model_path = "/models/q8.gguf";
+    try env.put("DEEPGRAM_API_KEY", "synthetic-must-not-use");
+    try env.put("CEREBRAS_API_KEY", "synthetic-must-not-use");
+    try env.put("SAYALL_STT_MODEL", "parakeet-unified-en-q4");
+    applyEnvironment(&cfg, &env);
+    try validate(&cfg);
+    try std.testing.expectEqualStrings("parakeet-unified-en-q8", cfg.stt.model);
+    try std.testing.expectEqualStrings("", cfg.stt.api_key);
+    try std.testing.expectEqualStrings("", cfg.llm.api_key);
+    try std.testing.expect(!cfg.stt.streaming);
+    try std.testing.expectEqual(processing.Profile.clean, effectiveProcessingProfile(&cfg));
+    cfg.processing.mode = .polished;
+    try std.testing.expectError(error.InvalidConfig, validate(&cfg));
+    cfg.processing.mode = .clean;
+    cfg.stt.model = "parakeet-unified-en-q4";
+    try std.testing.expectError(error.InvalidConfig, validate(&cfg));
 }
 
 test "provider tokens are bounded consistently with worker protocol" {

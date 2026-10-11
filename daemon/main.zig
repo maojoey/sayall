@@ -196,8 +196,8 @@ fn run(init: std.process.Init) !u8 {
     }
 
     if (std.mem.eql(u8, cmd, "transcribe")) {
-        var values: [3][]const u8 = undefined;
-        if (argv.len < 3 or argv.len > 5) return invalidArguments("transcribe");
+        var values: [cli_transcribe.max_args][]const u8 = undefined;
+        if (argv.len < 3 or argv.len > cli_transcribe.max_args + 2) return invalidArguments("transcribe");
         for (argv[2..], 0..) |arg, i| values[i] = std.mem.span(arg);
         const options = cli_transcribe.parse(values[0 .. argv.len - 2]) catch return invalidArguments("transcribe");
         return cli_transcribe.run(gpa, arena, io, env, options);

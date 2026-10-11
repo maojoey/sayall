@@ -1,4 +1,6 @@
 pub const worker_ready_streaming = @embedFile("contracts-0.2/worker-ready-streaming.json");
+pub const worker_result_v3_rejected = @embedFile("contracts-0.2/worker-result-v3-rejected.json");
+pub const worker_result_local = @embedFile("contracts-0.2/worker-result-local.json");
 pub const worker_result_success = @embedFile("contracts-0.2/worker-result-success.json");
 pub const worker_result_transformation_warning = @embedFile("contracts-0.2/worker-result-transformation-warning.json");
 pub const worker_result_no_speech = @embedFile("contracts-0.2/worker-result-no-speech.json");

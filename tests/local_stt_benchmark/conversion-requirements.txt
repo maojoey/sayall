@@ -1,0 +1,25 @@
+# Observed version lock for CPython 3.12.12, Linux x86_64 CPU conversion.
+# Install torch separately from https://download.pytorch.org/whl/cpu;
+# install other pins from PyPI. No NeMo/CUDA dependency is required by our loader.
+antlr4-python3-runtime==4.9.3
+certifi==2026.7.22
+charset-normalizer==3.5.2
+filelock==3.32.3
+fsspec==2026.7.0
+gguf==0.18.0
+idna==3.20
+jinja2==3.1.6
+markupsafe==3.0.3
+mpmath==1.3.0
+networkx==3.6.1
+numpy==2.2.6
+omegaconf==2.3.0
+pyyaml==6.0.2
+requests==2.34.2
+sentencepiece==0.2.1
+setuptools==78.1.0
+sympy==1.14.0
+torch==2.11.0+cpu
+tqdm==4.70.1
+typing-extensions==4.16.0
+urllib3==2.8.0

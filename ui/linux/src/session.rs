@@ -660,11 +660,12 @@ where
     let mut loaded_notifications = None;
     let started = config::load().map_err(|e| e.to_string()).and_then(|cfg| {
         loaded_notifications = Some(cfg.notifications);
+        let path = worker::resolve().map_err(|e| e.to_string())?;
+        worker::local_readiness(&path, &cfg.provider)?;
         let capture = capture::Capture::start(root, *generation, &cfg.recording.source)
             .map_err(|e| e.to_string())?;
         publish(State::Starting, *generation, None, None, cfg.show_timer);
         let (pcm, wav) = capture.paths();
-        let path = worker::resolve().map_err(|e| e.to_string())?;
         let worker = worker::Worker::start(&path, wav, pcm, &cfg.provider, shutdown)?;
         Ok((
             capture,
@@ -935,6 +936,93 @@ fn no_signal(path: &Path) -> bool {
 mod tests {
     use super::*;
     use std::sync::{Barrier, atomic::AtomicUsize};
+
+    #[test]
+    #[ignore = "requires consented fixture, Q8 bundle, and isolated local config; never records a microphone"]
+    fn real_local_capture_pipeline_delivers_once_and_cleans_audio() {
+        use std::os::unix::fs::PermissionsExt;
+        assert!(std::env::var_os("SAYALL_TEST_AUDIO_FIXTURE").is_some());
+        let eof = PathBuf::from(
+            std::env::var_os("SAYALL_TEST_AUDIO_EOF_PATH").expect("fixture EOF path"),
+        );
+        let root = PathBuf::from(
+            std::env::var_os("SAYALL_TEST_SESSION_ROOT").expect("private scratch root"),
+        );
+        assert_eq!(
+            std::fs::metadata(&root).unwrap().permissions().mode() & 0o077,
+            0
+        );
+        let cfg = config::load().unwrap();
+        assert!(cfg.provider.local_model_path.is_some());
+        assert!(
+            !cfg.notifications,
+            "test must not produce desktop notifications"
+        );
+        struct Sink(Arc<AtomicUsize>);
+        impl Delivery for Sink {
+            fn deliver(
+                &mut self,
+                text: &str,
+                _: &config::OutputConfig,
+            ) -> Result<desktop::DeliveryOutcome, String> {
+                assert!(!text.trim().is_empty());
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(desktop::DeliveryOutcome::Typed)
+            }
+        }
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (tx, rx) = mpsc::channel();
+        let controller = Controller::spawn(root.clone(), Sink(calls.clone()), tx);
+        struct Shutdown(Controller);
+        impl Drop for Shutdown {
+            fn drop(&mut self) {
+                self.0.shutdown_and_join();
+            }
+        }
+        let guard = Shutdown(controller.clone());
+        let start = Instant::now();
+        assert_eq!(controller.toggle().unwrap().state, State::Recording);
+        let startup_ms = start.elapsed().as_millis();
+        if std::env::var_os("SAYALL_TEST_CANCEL_LOCAL").is_some() {
+            std::thread::sleep(Duration::from_millis(2500));
+            let cancel = Instant::now();
+            drop(guard);
+            assert!(cancel.elapsed() < Duration::from_secs(2));
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+            println!(
+                "SAYALL_LOCAL_TIMING {{\"startup_ms\":{startup_ms},\"cancel_ms\":{}}}",
+                cancel.elapsed().as_millis()
+            );
+            return;
+        }
+        let deadline = Instant::now() + Duration::from_secs(45);
+        while !eof.exists() {
+            assert!(Instant::now() < deadline, "fixture capture timed out");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let stop = Instant::now();
+        let result = controller.toggle().unwrap();
+        let stop_ms = stop.elapsed().as_millis();
+        assert_eq!(result.state, State::Success);
+        drop(guard);
+        println!(
+            "SAYALL_LOCAL_TIMING {{\"startup_ms\":{startup_ms},\"stop_to_dummy_delivery_ms\":{stop_ms},\"incremental\":{}}}",
+            cfg.provider.streaming
+        );
+        let states: Vec<_> = rx.try_iter().map(|s| s.state).collect();
+        for state in [
+            State::Recording,
+            State::Stopping,
+            State::Processing,
+            State::Delivering,
+            State::Success,
+        ] {
+            assert!(states.contains(&state), "missing session lifecycle state");
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+    }
 
     #[test]
     fn manual_stop_tail_defaults_to_ten_ms_bounded_by_recording_limit() {

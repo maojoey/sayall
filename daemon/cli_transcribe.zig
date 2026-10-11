@@ -4,28 +4,40 @@ const batch = @import("batch.zig");
 const config = @import("config.zig");
 const worker_protocol = @import("worker_protocol.zig");
 
+pub const max_args = 6;
+
 pub const Options = struct {
     wav_path: []const u8,
     json: bool = false,
     raw: bool = false,
+    local: bool = false,
+    model_path: ?[]const u8 = null,
 };
 
 pub const ParseError = error{InvalidArguments};
 
 pub fn parse(args: []const []const u8) ParseError!Options {
     var result: Options = .{ .wav_path = "" };
-    for (args) |arg| {
+    var index: usize = 0;
+    while (index < args.len) : (index += 1) {
+        const arg = args[index];
         if (std.mem.eql(u8, arg, "--json") and !result.json) {
             result.json = true;
         } else if (std.mem.eql(u8, arg, "--raw") and !result.raw) {
             result.raw = true;
+        } else if (std.mem.eql(u8, arg, "--local") and !result.local) {
+            result.local = true;
+        } else if (std.mem.eql(u8, arg, "--model-path") and result.model_path == null) {
+            index += 1;
+            if (index >= args.len or !std.fs.path.isAbsolute(args[index])) return error.InvalidArguments;
+            result.model_path = args[index];
         } else if (!std.mem.startsWith(u8, arg, "-") and result.wav_path.len == 0) {
             result.wav_path = arg;
         } else {
             return error.InvalidArguments;
         }
     }
-    if (result.wav_path.len == 0) return error.InvalidArguments;
+    if (result.wav_path.len == 0 or (result.model_path != null and !result.local)) return error.InvalidArguments;
     return result;
 }
 
@@ -36,11 +48,14 @@ pub fn run(
     env: *const std.process.Environ.Map,
     options: Options,
 ) !u8 {
-    const cfg = config.load(arena, io, env) catch |err| {
+    // Explicit local file mode must not load cloud keys, invoke keyring tools,
+    // migrate cloud configuration, or inherit a cloud formatting profile.
+    const cfg: config.Config = if (options.local) .{} else config.load(arena, io, env) catch |err| {
         try diagnostic(io, "configuration is invalid", @errorName(err));
         return 78;
     };
-    if (cfg.stt.api_key.len == 0) {
+    const local_mode = options.local or std.mem.eql(u8, cfg.stt.provider, "local");
+    if (!local_mode and cfg.stt.api_key.len == 0) {
         try write(io, .stderr(), "sayall: transcribe: Deepgram credentials are not configured\n");
         return 78;
     }
@@ -90,12 +105,15 @@ pub fn run(
     const request = batch.Request{
         .version = worker_protocol.version,
         .wav_path = private_wav,
+        .stt_provider = if (local_mode) .local else .deepgram,
+        .local_model_path = if (local_mode) options.model_path orelse
+            (if (cfg.stt.local_model_path.len > 0) cfg.stt.local_model_path else try defaultLocalModel(arena, env)) else "",
         .deepgram_api_key = cfg.stt.api_key,
         .deepgram_model = cfg.stt.model,
         .deepgram_language = cfg.stt.language,
         .deepgram_region = cfg.stt.region,
         .deepgram_keyterms = cfg.stt.keyterms,
-        .deepgram_smart_format = cfg.stt.smart_format,
+        .deepgram_smart_format = if (local_mode) false else cfg.stt.smart_format,
         .deepgram_punctuate = cfg.stt.punctuate,
         .deepgram_dictation = cfg.stt.dictation,
         .deepgram_numerals = cfg.stt.numerals,
@@ -103,7 +121,7 @@ pub fn run(
         .llm_api_key = cfg.llm.api_key,
         .llm_model = cfg.llm.model,
         .llm_base_url = cfg.llm.base_url,
-        .processing_profile = if (options.raw) .verbatim else config.effectiveProcessingProfile(&cfg),
+        .processing_profile = if (options.raw) .verbatim else if (options.local) .clean else config.effectiveProcessingProfile(&cfg),
     };
     const request_json = try std.json.Stringify.valueAlloc(arena, request, .{});
     if (request_json.len > batch.max_request_bytes) {
@@ -166,6 +184,17 @@ pub fn run(
         return if (parsed.value.status == .@"error") 1 else 0;
     }
     return presentHuman(io, parsed.value);
+}
+
+fn defaultLocalModel(gpa: std.mem.Allocator, env: *const std.process.Environ.Map) ![]const u8 {
+    const filename = @import("stt/local.zig").model_filename;
+    if (env.get("XDG_DATA_HOME")) |root| {
+        if (!std.fs.path.isAbsolute(root)) return error.InvalidDataDirectory;
+        return std.fs.path.join(gpa, &.{ root, "sayall", "models", filename });
+    }
+    const home = env.get("HOME") orelse return error.MissingHome;
+    if (!std.fs.path.isAbsolute(home)) return error.InvalidDataDirectory;
+    return std.fs.path.join(gpa, &.{ home, ".local", "share", "sayall", "models", filename });
 }
 
 fn presentHuman(io: std.Io, result: batch.WireResult) !u8 {
@@ -260,6 +289,24 @@ fn diagnostic(io: std.Io, message: []const u8, detail: []const u8) !void {
 
 fn write(io: std.Io, file: std.Io.File, bytes: []const u8) !void {
     if (bytes.len != 0) try file.writeStreamingAll(io, bytes);
+}
+
+test "local CLI selects Q8 without loading cloud configuration" {
+    const selected = try parse(&.{ "--local", "clip.wav", "--model-path", "/models/q8.gguf" });
+    try std.testing.expect(selected.local);
+    try std.testing.expectEqualStrings("/models/q8.gguf", selected.model_path.?);
+    for ([_][]const []const u8{
+        &.{ "clip.wav", "--model-path", "/models/q8.gguf" },
+        &.{ "clip.wav", "--local", "--model-path", "relative.gguf" },
+        &.{ "clip.wav", "--local", "--local" },
+        &.{ "clip.wav", "--local", "--model-path" },
+    }) |args| try std.testing.expectError(error.InvalidArguments, parse(args));
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    try env.put("HOME", "/home/test");
+    const path = try defaultLocalModel(std.testing.allocator, &env);
+    defer std.testing.allocator.free(path);
+    try std.testing.expectEqualStrings("/home/test/.local/share/sayall/models/parakeet-unified-en-0.6b-Q8_0.gguf", path);
 }
 
 test "standalone transcribe grammar is exact" {

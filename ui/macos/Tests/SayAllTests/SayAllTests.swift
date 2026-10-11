@@ -1012,29 +1012,29 @@ final class AudioCaptureConversionTests: XCTestCase {
 
 final class HelperDecoderTests: XCTestCase {
     func testSuccessAndNoSpeechDecode() throws {
-        let success = try HelperDecoder.decode(Data(#"{"version":3,"status":"success","text":"hello","processing_profile":"clean","transport":"rest"}"#.utf8))
+        let success = try HelperDecoder.decode(Data(#"{"version":4,"status":"success","text":"hello","processing_profile":"clean","transport":"rest"}"#.utf8))
         XCTAssertEqual(success.text, "hello")
         XCTAssertEqual(success.processingProfile, .clean)
         XCTAssertEqual(success.transport, .rest)
-        XCTAssertEqual(try HelperDecoder.decode(Data(#"{"version":3,"status":"no_speech","processing_profile":"verbatim","transport":"stream"}"#.utf8)).status, .noSpeech)
+        XCTAssertEqual(try HelperDecoder.decode(Data(#"{"version":4,"status":"no_speech","processing_profile":"verbatim","transport":"stream"}"#.utf8)).status, .noSpeech)
     }
     func testStableErrorMapping() {
-        XCTAssertThrowsError(try HelperDecoder.decode(Data(#"{"version":3,"status":"error","error":"deepgram_network","processing_profile":"polished","transport":"rest"}"#.utf8))) { XCTAssertEqual($0 as? HelperFailure, .unsuccessful("deepgram_network")) }
-        XCTAssertThrowsError(try HelperDecoder.decode(Data(#"{"version":3,"status":"error","error":"future_error","processing_profile":"polished","transport":"rest"}"#.utf8))) { XCTAssertEqual($0 as? HelperFailure, .malformedOutput) }
+        XCTAssertThrowsError(try HelperDecoder.decode(Data(#"{"version":4,"status":"error","error":"deepgram_network","processing_profile":"polished","transport":"rest"}"#.utf8))) { XCTAssertEqual($0 as? HelperFailure, .unsuccessful("deepgram_network")) }
+        XCTAssertThrowsError(try HelperDecoder.decode(Data(#"{"version":4,"status":"error","error":"future_error","processing_profile":"polished","transport":"rest"}"#.utf8))) { XCTAssertEqual($0 as? HelperFailure, .malformedOutput) }
         XCTAssertThrowsError(try HelperDecoder.decode(Data(#"{"version":2,"status":"success","text":"old","processing_profile":"clean","transport":"rest"}"#.utf8))) { XCTAssertEqual($0 as? HelperFailure, .unsupportedVersion) }
-        XCTAssertThrowsError(try HelperDecoder.decode(Data(#"{"version":3,"status":"success","text":"missing fields"}"#.utf8))) { XCTAssertEqual($0 as? HelperFailure, .malformedOutput) }
-        XCTAssertThrowsError(try HelperDecoder.decode(Data(#"{"version":3,"status":"success","text":"hello","warning":"future","processing_profile":"clean","transport":"rest"}"#.utf8))) { XCTAssertEqual($0 as? HelperFailure, .malformedOutput) }
-        XCTAssertThrowsError(try HelperDecoder.decode(Data(#"{"version":3,"status":"no_speech","text":"unexpected","processing_profile":"clean","transport":"rest"}"#.utf8))) { XCTAssertEqual($0 as? HelperFailure, .malformedOutput) }
+        XCTAssertThrowsError(try HelperDecoder.decode(Data(#"{"version":4,"status":"success","text":"missing fields"}"#.utf8))) { XCTAssertEqual($0 as? HelperFailure, .malformedOutput) }
+        XCTAssertThrowsError(try HelperDecoder.decode(Data(#"{"version":4,"status":"success","text":"hello","warning":"future","processing_profile":"clean","transport":"rest"}"#.utf8))) { XCTAssertEqual($0 as? HelperFailure, .malformedOutput) }
+        XCTAssertThrowsError(try HelperDecoder.decode(Data(#"{"version":4,"status":"no_speech","text":"unexpected","processing_profile":"clean","transport":"rest"}"#.utf8))) { XCTAssertEqual($0 as? HelperFailure, .malformedOutput) }
         XCTAssertThrowsError(try HelperDecoder.decode(Data("nope".utf8))) { XCTAssertEqual($0 as? HelperFailure, .malformedOutput) }
         XCTAssertThrowsError(try HelperDecoder.decode(Data(repeating: 0, count: HelperDecoder.maximumOutputBytes + 1))) { XCTAssertEqual($0 as? HelperFailure, .oversizedOutput) }
     }
 
     func testStreamingDecoderRequiresReadyAndTerminalFrames() throws {
-        let ready = try StreamingHelperDecoder.decodeReady(Data(#"{"version":3,"event":"ready","streaming":true}"#.utf8))
+        let ready = try StreamingHelperDecoder.decodeReady(Data(#"{"version":4,"event":"ready","streaming":true}"#.utf8))
         XCTAssertTrue(ready.streaming)
-        let rest = try StreamingHelperDecoder.decodeReady(Data(#"{"version":3,"event":"ready","streaming":false}"#.utf8))
+        let rest = try StreamingHelperDecoder.decodeReady(Data(#"{"version":4,"event":"ready","streaming":false}"#.utf8))
         XCTAssertFalse(rest.streaming)
-        XCTAssertEqual(try StreamingHelperDecoder.decode(Data(#"{"version":3,"status":"success","text":"hello","processing_profile":"polished","transport":"stream"}"#.utf8)).text, "hello")
+        XCTAssertEqual(try StreamingHelperDecoder.decode(Data(#"{"version":4,"status":"success","text":"hello","processing_profile":"polished","transport":"stream"}"#.utf8)).text, "hello")
         XCTAssertThrowsError(try StreamingHelperDecoder.decodeReady(Data("{}".utf8)))
         XCTAssertThrowsError(try StreamingHelperDecoder.decodeReady(Data(#"{"version":2,"event":"ready","streaming":true}"#.utf8)))
         XCTAssertThrowsError(try StreamingHelperDecoder.decodeReady(Data(repeating: 0, count: StreamingHelperDecoder.maximumReadyBytes + 1)))
@@ -1047,7 +1047,7 @@ final class HelperDecoderTests: XCTestCase {
             llmAPIKey: "", llmModel: "gpt-oss-120b",
             llmBaseURL: "https://api.cerebras.ai/v1/chat/completions", processingProfile: .clean)
         let object = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(request)) as? [String: Any])
-        XCTAssertEqual(object["version"] as? Int, 3)
+        XCTAssertEqual(object["version"] as? Int, 4)
         XCTAssertEqual(object["processing_profile"] as? String, "clean")
         XCTAssertNil(object["cleanup_enabled"])
     }
@@ -1097,7 +1097,7 @@ final class HelperRunnerTests: XCTestCase {
 int main(void) {
     signal(SIGTERM, SIG_IGN);
     usleep(700000);
-    fputs("{\"protocol_version\":3,\"build_version\":\"test-build\"}\n", stdout);
+    fputs("{\"protocol_version\":4,\"build_version\":\"test-build\"}\n", stdout);
     fflush(stdout);
     sleep(3);
     return 0;
@@ -1138,7 +1138,7 @@ extern char **environ;
 int main(void) {
     if (environ[0] != NULL) return 4;
     while (getchar() != EOF) {}
-    fputs("{\"version\":3,\"status\":\"success\",\"text\":\"ok\",\"processing_profile\":\"clean\",\"transport\":\"rest\"}", stdout);
+    fputs("{\"version\":4,\"status\":\"success\",\"text\":\"ok\",\"processing_profile\":\"clean\",\"transport\":\"rest\"}", stdout);
     return 0;
 }
 """#.utf8).write(to: source)
@@ -1165,10 +1165,10 @@ int main(int argc, char **argv) {
     char line[65536];
     if (environ[0] != NULL) return 4;
     if (argc != 2 || strcmp(argv[1], "--stream") != 0 || !fgets(line, sizeof(line), stdin)) return 2;
-    fputs("{\"version\":3,\"event\":\"ready\",\"streaming\":true}\n", stdout);
+    fputs("{\"version\":4,\"event\":\"ready\",\"streaming\":true}\n", stdout);
     fflush(stdout);
     if (!fgets(line, sizeof(line), stdin) || !strstr(line, "\"command\":\"finish\"")) return 3;
-    fputs("{\"version\":3,\"status\":\"success\",\"text\":\"streamed\",\"processing_profile\":\"clean\",\"transport\":\"stream\"}\n", stdout);
+    fputs("{\"version\":4,\"status\":\"success\",\"text\":\"streamed\",\"processing_profile\":\"clean\",\"transport\":\"stream\"}\n", stdout);
     return 0;
 }
 """#.utf8).write(to: source)
@@ -1190,9 +1190,9 @@ int main(int argc, char **argv) {
 int main(void) {
     char line[65536];
     if (!fgets(line, sizeof(line), stdin)) return 2;
-    fputs("{\"version\":3,\"event\":\"ready\",\"streaming\":true}\n", stdout); fflush(stdout);
+    fputs("{\"version\":4,\"event\":\"ready\",\"streaming\":true}\n", stdout); fflush(stdout);
     if (!fgets(line, sizeof(line), stdin)) return 3;
-    fputs("{\"version\":3,\"status\":\"error\",\"error\":\"deepgram_network\",\"processing_profile\":\"clean\",\"transport\":\"stream\"}\n", stdout);
+    fputs("{\"version\":4,\"status\":\"error\",\"error\":\"deepgram_network\",\"processing_profile\":\"clean\",\"transport\":\"stream\"}\n", stdout);
     return 0;
 }
 """#.utf8).write(to: source)
@@ -1222,7 +1222,7 @@ int main(void) {
     char line[65536];
     for (int number = 1; number < 32; number++) signal(number, SIG_IGN);
     if (!fgets(line, sizeof(line), stdin)) return 2;
-    fputs("{\"version\":3,\"event\":\"ready\",\"streaming\":true}\n", stdout); fflush(stdout);
+    fputs("{\"version\":4,\"event\":\"ready\",\"streaming\":true}\n", stdout); fflush(stdout);
     for (;;) pause();
 }
 """#.utf8).write(to: source)
@@ -1280,7 +1280,7 @@ int main(void) {
     char line[65536];
     for (int number = 1; number < 32; number++) signal(number, SIG_IGN);
     if (!fgets(line, sizeof(line), stdin)) return 2;
-    fputs("{\"version\":3,\"event\":\"ready\",\"streaming\":true}\n", stdout); fflush(stdout);
+    fputs("{\"version\":4,\"event\":\"ready\",\"streaming\":true}\n", stdout); fflush(stdout);
     if (!fgets(line, sizeof(line), stdin)) return 3;
     for (;;) pause();
 }
@@ -1408,6 +1408,14 @@ final class SharedBackendContractTests: XCTestCase {
         XCTAssertEqual(try JSONDecoder().decode(StreamingHelperFinish.self, from: fixture("worker-finish")),
             StreamingHelperFinish(version: ProcessingProtocol.version, command: "finish", forceRest: false))
 
+        XCTAssertThrowsError(try HelperDecoder.decode(fixture("worker-result-v3-rejected"))) {
+            XCTAssertEqual($0 as? HelperFailure, .unsupportedVersion)
+        }
+        let local = try HelperDecoder.decode(fixture("worker-result-local"))
+        XCTAssertEqual(local.transport, .local)
+        XCTAssertEqual(local.timing?.localSTTMs, 100)
+        XCTAssertNil(local.timing?.restSTTMs)
+
         let success = try HelperDecoder.decode(fixture("worker-result-success"))
         XCTAssertEqual(success.status, .success)
         XCTAssertEqual(success.text, "Hello, world.")
@@ -1448,6 +1456,17 @@ final class SharedBackendContractTests: XCTestCase {
 }
 
 final class ConfigurationLoaderTests: XCTestCase {
+    func testUnsupportedLocalLiveModeFailsBeforeMissingCloudKey() throws {
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: home) }
+        let loader = ConfigurationLoader(environment: [:], homeDirectory: home)
+        try preparePrivateParent(for: loader)
+        try Data(#"{"stt":{"provider":"local"}}"#.utf8).write(to: loader.url)
+        XCTAssertThrowsError(try loader.load()) {
+            XCTAssertEqual($0 as? ConfigurationError, .invalidProvider)
+        }
+    }
+
     private func preparePrivateParent(for loader: ConfigurationLoader) throws {
         let parent = loader.url.deletingLastPathComponent()
         try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
@@ -1856,12 +1875,12 @@ final class StartupMetricsTests: XCTestCase {
 
 final class PipelineMetricsTests: XCTestCase {
     func testTimingDecodesWithoutWeakeningResultContract() throws {
-        let result = try HelperDecoder.decode(Data(#"{"version":3,"status":"success","text":"hello","processing_profile":"clean","transport":"stream","timing":{"deepgram_connect_ms":12,"deepgram_stop_to_final_ms":34,"deterministic_processing_ms":5,"processing_total_ms":40}}"#.utf8))
+        let result = try HelperDecoder.decode(Data(#"{"version":4,"status":"success","text":"hello","processing_profile":"clean","transport":"stream","timing":{"deepgram_connect_ms":12,"deepgram_stop_to_final_ms":34,"deterministic_processing_ms":5,"processing_total_ms":40}}"#.utf8))
         XCTAssertEqual(result.timing?.deepgramConnectMs, 12)
         XCTAssertEqual(result.timing?.deepgramStopToFinalMs, 34)
         XCTAssertEqual(result.timing?.deterministicProcessingMs, 5)
         XCTAssertNil(result.timing?.restSTTMs)
-        XCTAssertThrowsError(try HelperDecoder.decode(Data(#"{"version":3,"status":"success","text":"hello","processing_profile":"clean","transport":"stream","timing":{"processing_total_ms":40}}"#.utf8)))
+        XCTAssertThrowsError(try HelperDecoder.decode(Data(#"{"version":4,"status":"success","text":"hello","processing_profile":"clean","transport":"stream","timing":{"processing_total_ms":40}}"#.utf8)))
     }
 
     func testPipelineStoreIsBoundedAndPrivate() async throws {

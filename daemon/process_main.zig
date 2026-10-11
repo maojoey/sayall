@@ -31,6 +31,24 @@ fn run(init: std.process.Init) !void {
         }
         return;
     }
+    if (argv.len == 3 and std.mem.eql(u8, std.mem.span(argv[1]), "--local-readiness")) {
+        const failure: ?batch.ErrorCode = blk: {
+            @import("stt/local.zig").readiness(gpa, io, std.mem.span(argv[2])) catch |err|
+                break :blk batch.mapLocalError(err);
+            break :blk null;
+        };
+        const response = try std.json.Stringify.valueAlloc(gpa, .{
+            .version = worker_protocol.version,
+            .ready = failure == null,
+            .@"error" = failure,
+        }, .{ .emit_null_optional_fields = false });
+        defer gpa.free(response);
+        try writeBytes(io, response);
+        return;
+    }
+    if (argv.len == 2 and std.mem.eql(u8, std.mem.span(argv[1]), "--local-stream")) {
+        return @import("local_stream.zig").run(gpa, io);
+    }
     if (argv.len == 2 and std.mem.eql(u8, std.mem.span(argv[1]), "--stream")) {
         return stream_batch.run(gpa, io);
     }

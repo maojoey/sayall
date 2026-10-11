@@ -5,6 +5,26 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- Added opt-in English local Q8 file transcription and Linux incremental
+  dictation using explicitly provisioned, hash-verified model/runtime artifacts.
+  Local mode requires no provider key and never falls back to cloud processing.
+  Existing cloud configuration is unchanged; macOS local recording is rejected.
+- Added a reproducible direct NVIDIA-source Q8 conversion path with pinned
+  provenance, model-license attribution, and offline comparison tooling.
+
+### Changed
+
+- Improved local Clean question endings and missing final periods using bounded
+  English rules. Verbatim and cloud Clean are unchanged; ambiguous structures
+  may still need correction.
+- Updated the private matched host/worker protocol to v4. Public control
+  protocols are unchanged; legacy worker frames are rejected.
+- Included model, runtime, application and Rust notices in local bundles.
+  Missing dependency license texts now require verified upstream snapshots
+  rather than substituting an unrelated crate's copyright notice.
+
 ## [0.3.3] - 2026-10-06
 
 ### Added

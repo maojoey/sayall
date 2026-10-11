@@ -1,7 +1,7 @@
 import Foundation
 
 enum ProcessingProtocol {
-    static let version = 3
+    static let version = 4
 }
 
 enum ProcessingMode: String, Codable, CaseIterable, Equatable {
@@ -143,6 +143,12 @@ enum WorkerErrorCode: String, Codable, Equatable {
     case deepgramServer = "deepgram_server"
     case deepgramNetwork = "deepgram_network"
     case responseTooLarge = "response_too_large"
+    case localModelMissing = "local_model_missing"
+    case localModelInvalid = "local_model_invalid"
+    case localUnavailable = "local_unavailable"
+    case localFailed = "local_failed"
+    case localTimeout = "local_timeout"
+    case unsupportedFeatures = "unsupported_features"
     case internalError = "internal"
 }
 
@@ -151,6 +157,7 @@ struct HelperResult: Codable, Equatable {
         let deepgramConnectMs: Int?
         let deepgramStopToFinalMs: Int?
         let restSTTMs: Int?
+        let localSTTMs: Int?
         let deterministicProcessingMs: Int
         let plannerMs: Int?
         let processingTotalMs: Int
@@ -158,13 +165,14 @@ struct HelperResult: Codable, Equatable {
             case deepgramConnectMs = "deepgram_connect_ms"
             case deepgramStopToFinalMs = "deepgram_stop_to_final_ms"
             case restSTTMs = "rest_stt_ms"
+            case localSTTMs = "local_stt_ms"
             case deterministicProcessingMs = "deterministic_processing_ms"
             case plannerMs = "planner_ms"
             case processingTotalMs = "processing_total_ms"
         }
     }
     enum Status: String, Codable { case success, noSpeech = "no_speech", error }
-    enum Transport: String, Codable { case rest, stream }
+    enum Transport: String, Codable { case rest, stream, local }
     let version: Int
     let status: Status
     let text: String?

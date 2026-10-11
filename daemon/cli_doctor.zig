@@ -37,7 +37,9 @@ pub fn run(arena: std.mem.Allocator, io: std.Io, env: *const std.process.Environ
     const audit = auditConfig(arena, io, env) catch |err| ConfigAudit{ .safe = false, .detail = @errorName(err) };
     if (audit.safe) {
         if (config.loadReadOnly(arena, io, env)) |cfg| {
-            if (cfg.stt.api_key.len == 0) {
+            if (std.mem.eql(u8, cfg.stt.provider, "local")) {
+                config_detail = "local configuration valid; credentials not required (Q8 readiness is checked before capture)";
+            } else if (cfg.stt.api_key.len == 0) {
                 config_ok = false;
                 config_detail = "Deepgram credentials are missing";
             } else if (config.effectiveProcessingProfile(&cfg).usesPlanner() and cfg.llm.api_key.len == 0) {
