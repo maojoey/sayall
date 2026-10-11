@@ -107,6 +107,8 @@ pub const Outcome = union(enum) {
     outdated: struct { restored: bool },
     host_failed: struct { diagnostic: []const u8, restored: bool },
     rollback_failed: []const u8,
+    /// The app's reply was lost and it did not confirm reloading the restored file.
+    rollback_unconfirmed: struct { diagnostic: []const u8, attempted: State },
 };
 
 const Paths = struct { state: []const u8, lock: []const u8 };
@@ -170,10 +172,30 @@ pub fn apply(gpa: Allocator, io: Io, env: *const std.process.Environ.Map, reques
     };
     if (changed) {
         restoreIfCurrentMatches(gpa, io, paths.state, new_bytes, old_bytes) catch return .{ .rollback_failed = paths.state };
-        // The app keeps its previous registration on failure; this resynchronizes its menu.
-        _ = host.apply();
+        // Rejections, mismatches, and outdated apps leave the registration unchanged, so
+        // this only resynchronizes the menu. After a lost reply the app may already use
+        // the new chord, so it must confirm reloading the restored preference.
+        const resync = host.apply();
+        if (unconfirmed == .host_failed and !confirmsRestored(gpa, resync, old_bytes))
+            return .{ .rollback_unconfirmed = .{ .diagnostic = unconfirmed.host_failed.diagnostic, .attempted = state } };
     }
     return unconfirmed;
+}
+
+fn confirmsRestored(gpa: Allocator, reply: HostReply, old_bytes: ?[]const u8) bool {
+    return switch (reply) {
+        // A stopped app loads the restored file at launch; an outdated one never read it.
+        .not_running, .outdated => true,
+        .rejected, .failed => false,
+        .applied => |active| blk: {
+            const restored: State = if (old_bytes) |bytes|
+                decode(gpa, bytes) catch break :blk false
+            else
+                .{ .enabled = true, .shortcut = default_shortcut, .persisted = false };
+            break :blk active.enabled == restored.enabled and
+                (!restored.enabled or std.mem.eql(u8, active.shortcut, restored.shortcut));
+        },
+    };
 }
 
 /// Runs `sayall shortcut <args>` with the same grammar as Linux.
@@ -235,6 +257,11 @@ fn present(gpa: Allocator, outcome: Outcome) !cli.Presentation {
         .host_failed => |failed| return failure(gpa, "{s}sayall: the shortcut change was not confirmed by SayAll. {s}\n", .{
             failed.diagnostic,
             if (failed.restored) restored_note else unchanged_note,
+        }),
+        .rollback_unconfirmed => |rollback| return failure(gpa, "{s}sayall: SayAll did not confirm the change to {s} or reloading the restored shortcut, so it may still be using {s}. The previous shortcut was restored in the saved preference; quit and reopen SayAll to load it.\n", .{
+            rollback.diagnostic,
+            if (rollback.attempted.enabled) rollback.attempted.shortcut else "no shortcut",
+            if (rollback.attempted.enabled) rollback.attempted.shortcut else "no shortcut",
         }),
         .rollback_failed => |path| return failure(gpa, "sayall: SayAll rejected the shortcut and {s} changed concurrently, so it was not restored; inspect it before retrying.\n", .{path}),
     }
@@ -441,6 +468,39 @@ test "shortcut CLI restores the previous preference when the app rejects a chang
     const result = try fresh.invoke(&.{"reset"}, &rejected);
     try std.testing.expectEqual(@as(u8, 1), result.exit_code);
     try std.testing.expect((try fresh.saved()) == null);
+}
+
+test "shortcut CLI verifies resynchronization after a lost app reply" {
+    var home: TestHome = undefined;
+    try home.init();
+    defer home.deinit();
+    var first = FakeHost{ .replies = &.{.{ .applied = .{ .enabled = true, .shortcut = "CTRL+F10" } }} };
+    _ = try home.invoke(&.{ "set", "CTRL+F10" }, &first);
+    const before = (try home.saved()).?;
+
+    const lost: HostReply = .{ .failed = "sayall: timed out\n" };
+    const unconfirmed = [_]HostReply{
+        .{ .applied = .{ .enabled = true, .shortcut = "SUPER+K" } },
+        .{ .rejected = .{ .code = "invalid_shortcut", .message = "bad" } },
+        lost,
+    };
+    for (unconfirmed) |resync| {
+        var fake = FakeHost{ .replies = &.{ lost, resync } };
+        const result = try home.invoke(&.{ "set", "SUPER+K" }, &fake);
+        try std.testing.expectEqual(@as(u8, 1), result.exit_code);
+        try std.testing.expect(std.mem.indexOf(u8, result.stderr, "may still be using SUPER+K") != null);
+        try std.testing.expectEqualStrings(before, (try home.saved()).?);
+    }
+    for ([_]HostReply{ .{ .applied = .{ .enabled = true, .shortcut = "CTRL+F10" } }, .not_running, .outdated }) |resync| {
+        var fake = FakeHost{ .replies = &.{ lost, resync } };
+        const result = try home.invoke(&.{ "set", "SUPER+K" }, &fake);
+        try std.testing.expect(std.mem.indexOf(u8, result.stderr, "not confirmed by SayAll. The previous shortcut was restored.") != null);
+    }
+
+    // A rejection already proves the app kept its registration; a failed resync is only cosmetic.
+    var rejected = FakeHost{ .replies = &.{ .{ .rejected = .{ .code = "shortcut_conflict", .message = "in use" } }, lost } };
+    const result = try home.invoke(&.{ "set", "SUPER+K" }, &rejected);
+    try std.testing.expect(std.mem.indexOf(u8, result.stderr, "previous shortcut was restored") != null);
 }
 
 test "shortcut CLI reports an unchanged rejected preference without claiming a restore" {

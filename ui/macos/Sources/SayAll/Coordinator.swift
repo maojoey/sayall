@@ -28,7 +28,18 @@ final class Coordinator {
     private(set) var message = "Ready — ⌃/ to start"
     /// The registered global shortcut in menu notation, or nil when only the menu works.
     var shortcutHint: String? = "⌃/" {
-        didSet { if state == .idle, message.hasPrefix("Ready — ") { message = readyMessage } }
+        didSet {
+            // Only the hint-bearing messages change; other states keep their text and notifications.
+            let updated: String?
+            switch state {
+            case .idle where message.hasPrefix("Ready — "): updated = readyMessage
+            case .recording where message.hasPrefix("Recording — "): updated = recordingMessage
+            default: updated = nil
+            }
+            guard let updated, updated != message else { return }
+            message = updated
+            changed()
+        }
     }
     private var readyMessage: String { shortcutHint.map { "Ready — \($0) to start" } ?? "Ready — use the menu to start" }
     private var recordingMessage: String { shortcutHint.map { "Recording — \($0) to stop" } ?? "Recording — use the menu to stop" }
