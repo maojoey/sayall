@@ -23,6 +23,13 @@ version-1 protocol because errors become structured `{code,message}` values.
 Status never launches a host. Toggle may launch the exact installed host, but a
 client must not retry after the mutation could have been accepted. Reload
 validates configuration while idle and applies it to the next dictation.
+`shortcut` asks a host that owns global shortcut registration to re-read the
+saved `shortcut.json` and register it; a successful reply echoes the registered
+`shortcut` object. Hosts without that ownership answer `invalid_request`.
+
+`macos-shortcut-keys.json` and `macos-shortcut-chords.json` freeze the macOS
+shortcut key table (xkb name to Carbon `kVK_*` code) and chord validation shared
+by the Zig CLI and the Swift app.
 
 Unknown object fields are additive. Worker status/warning/error values and host
 states are closed unless the architecture ADR explicitly marks a field open;

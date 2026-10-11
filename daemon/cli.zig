@@ -13,6 +13,8 @@ pub const help =
     \\  sayall config validate [--json]
     \\  sayall transcribe <WAV> [--raw] [--json] [--local [--model-path <absolute-Q8-path>]]
     \\  sayall doctor [--json]
+    \\  sayall shortcut [show|reset|disable]
+    \\  sayall shortcut set <CHORD>  e.g. CTRL+SLASH, CMD+SHIFT+SPACE, F9
     \\  sayall update
     \\
 ;
@@ -164,6 +166,7 @@ test "help contains only the canonical public surface" {
     for ([_][]const u8{ " daemon", " service", " setup", " restart", " stop", " start" }) |hidden|
         try std.testing.expect(std.mem.indexOf(u8, help, hidden) == null);
     try std.testing.expect(std.mem.indexOf(u8, help, " transcribe") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, " shortcut set <CHORD>") != null);
 }
 
 test "canonical usage and invalid presentations are stable" {

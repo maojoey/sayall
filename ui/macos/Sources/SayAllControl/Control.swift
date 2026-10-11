@@ -1,7 +1,14 @@
 import Darwin
 import Foundation
 
-public enum ControlMethod: String, Codable { case status, toggle, reload }
+public enum ControlMethod: String, Codable { case status, toggle, reload, shortcut }
+
+/// The global shortcut the app actually registered, echoed for `shortcut` requests.
+public struct HostShortcutState: Codable, Equatable {
+    public let enabled: Bool
+    public let shortcut: String
+    public init(enabled: Bool, shortcut: String) { self.enabled = enabled; self.shortcut = shortcut }
+}
 
 public struct ControlRequest: Codable, Equatable {
     public let version: Int
@@ -14,12 +21,13 @@ public struct ControlResponse: Codable, Equatable {
     public let ok: Bool
     public let state: String
     public let error: String?
-    public init(version: Int = 1, ok: Bool, state: String, error: String? = nil) {
-        self.version = version; self.ok = ok; self.state = state; self.error = error
+    public let shortcut: HostShortcutState?
+    public init(version: Int = 1, ok: Bool, state: String, error: String? = nil, shortcut: HostShortcutState? = nil) {
+        self.version = version; self.ok = ok; self.state = state; self.error = error; self.shortcut = shortcut
     }
 }
 
-public enum HostControlMethod: String, Codable { case status, toggle, reload }
+public enum HostControlMethod: String, Codable { case status, toggle, reload, shortcut }
 public enum HostControlState: String, Codable, CaseIterable {
     case idle, starting, recording, stopping, processing, delivering, success, error, cancelled
 }
@@ -38,8 +46,10 @@ public struct HostControlResponse: Codable, Equatable {
     public let ok: Bool
     public let state: HostControlState
     public let error: HostControlError?
-    public init(version: Int = 2, ok: Bool, state: HostControlState, error: HostControlError? = nil) {
-        self.version = version; self.ok = ok; self.state = state; self.error = error
+    public let shortcut: HostShortcutState?
+    public init(version: Int = 2, ok: Bool, state: HostControlState, error: HostControlError? = nil,
+                shortcut: HostShortcutState? = nil) {
+        self.version = version; self.ok = ok; self.state = state; self.error = error; self.shortcut = shortcut
     }
     public func validate() throws {
         guard version == 2, ok != (error != nil) else { throw POSIXError(.EPROTO) }

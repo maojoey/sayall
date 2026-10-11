@@ -29,6 +29,7 @@ func dispatchControlRoute<T>(_ route: ControlRoute, handler: @MainActor (Control
         case .status: return handler(.status)
         case .toggle: return handler(.toggle)
         case .reload: return handler(.reload)
+        case .shortcut: return handler(.shortcut)
         }
     case .invalid: return nil
     }
@@ -134,7 +135,8 @@ final class ControlServer: @unchecked Sendable {
                     guard let legacy = dispatchControlRoute(route, handler: handler) else { close(client); return }
                     let state = HostControlState(rawValue: legacy.state) ?? .error
                     let response = HostControlResponse(ok: legacy.ok, state: state,
-                        error: legacy.ok ? nil : hostV2Failure(legacy.error ?? "Request failed", method: method))
+                        error: legacy.ok ? nil : hostV2Failure(legacy.error ?? "Request failed", method: method),
+                        shortcut: legacy.ok ? legacy.shortcut : nil)
                     self.writeV2(response, to: client, deadline: deadline)
                 }
             case .v1:
@@ -190,6 +192,12 @@ final class ControlServer: @unchecked Sendable {
 }
 
 func hostV2Failure(_ legacy: String, method: HostControlMethod) -> HostControlError {
+    if method == .shortcut, let separator = legacy.range(of: ": ") {
+        let code = String(legacy[..<separator.lowerBound])
+        if GlobalShortcut.failureCodes.contains(code) {
+            return .init(code: code, message: String(legacy[separator.upperBound...]))
+        }
+    }
     if legacy.hasPrefix("busy: ") {
         return .init(code: "busy", message: String(legacy.dropFirst("busy: ".count)))
     }
