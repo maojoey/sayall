@@ -1951,8 +1951,10 @@ final class GlobalShortcutTests: XCTestCase {
         XCTAssertThrowsError(try ShortcutPreference.decode(Data(#"{"version":1,"shortcut":"SHIFT+K"}"#.utf8))) {
             XCTAssertEqual($0 as? ShortcutPreferenceError, .invalidShortcut)
         }
-        XCTAssertThrowsError(try ShortcutPreference.decode(Data("{".utf8))) {
-            XCTAssertEqual($0 as? ShortcutPreferenceError, .malformed)
+        for malformed in ["{", #"{"version":null}"#, #"{"version":1,"enabled":null}"#, #"{"version":1,"shortcut":null}"#] {
+            XCTAssertThrowsError(try ShortcutPreference.decode(Data(malformed.utf8)), malformed) {
+                XCTAssertEqual($0 as? ShortcutPreferenceError, .malformed)
+            }
         }
     }
 

@@ -144,5 +144,9 @@ test "persisted state round-trips through the canonical encoder" {
     try std.testing.expectEqualStrings("SUPER+H", decoded.shortcut);
     try std.testing.expectEqualStrings("CTRL+SLASH", (try decodeState(gpa, "{\"version\":1,\"shortcut\":\"control+slash\",\"future\":1}")).shortcut);
     try std.testing.expectError(error.UnsupportedShortcutStateVersion, decodeState(gpa, "{\"version\":2}"));
+    // Explicit nulls are malformed; the Swift host decoder rejects them the same way.
+    for ([_][]const u8{ "{\"version\":null}", "{\"version\":1,\"enabled\":null}", "{\"version\":1,\"shortcut\":null}" }) |bytes| {
+        try std.testing.expect(std.meta.isError(decodeState(gpa, bytes)));
+    }
     try std.testing.expectError(error.InvalidShortcut, decodeState(gpa, "{\"version\":1,\"shortcut\":\"CTRL+\"}"));
 }

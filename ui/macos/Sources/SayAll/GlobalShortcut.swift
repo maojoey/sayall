@@ -151,10 +151,18 @@ struct ShortcutPreference: Equatable {
         return ShortcutPreference(enabled: document.enabled ?? true, chord: chord)
     }
 
+    /// Missing fields take defaults, but an explicit null is malformed, matching the Zig decoder.
     private struct Document: Decodable {
         let version: Int?
         let enabled: Bool?
         let shortcut: String?
+        enum CodingKeys: String, CodingKey { case version, enabled, shortcut }
+        init(from decoder: Decoder) throws {
+            let values = try decoder.container(keyedBy: CodingKeys.self)
+            version = values.contains(.version) ? try values.decode(Int.self, forKey: .version) : nil
+            enabled = values.contains(.enabled) ? try values.decode(Bool.self, forKey: .enabled) : nil
+            shortcut = values.contains(.shortcut) ? try values.decode(String.self, forKey: .shortcut) : nil
+        }
     }
 }
 
