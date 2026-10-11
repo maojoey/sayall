@@ -82,7 +82,7 @@ fn execute(gpa: std.mem.Allocator, io: std.Io, r: stream.Request, input: *std.Io
         finish.value.force_rest) return error.InvalidRequest;
     const started = std.Io.Clock.now(.awake, io).toMilliseconds();
     if (std.os.linux.kill(child.id.?, .USR1) != 0) return error.LocalFailed;
-    const deadline: std.Io.Timeout = .{ .deadline = .fromNow(io, .{ .clock = .awake, .raw = .fromSeconds(40) }) };
+    const deadline: std.Io.Timeout = .{ .deadline = .fromNow(io, .{ .clock = .awake, .raw = .fromSeconds(local.result_timeout_seconds) }) };
     while (output.fill(4096, deadline)) |_| {
         if (output.reader(0).buffered().len > batch.max_output_bytes) return error.ResponseTooLarge;
     } else |err| switch (err) {

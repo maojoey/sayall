@@ -44,6 +44,7 @@ def gone(pid):
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--bundle", type=Path, required=True)
+    p.add_argument("--slow", action="store_true", help="exercise completion beyond the former 40s stream deadline")
     args = p.parse_args()
     bundle = args.bundle.resolve()
     worker = bundle / "sayall-process"
@@ -64,7 +65,10 @@ def main():
         request = {"version": 4, "stt_provider": "local", "local_model_path": str(model),
                    "wav_path": str(wav), "pcm_path": str(pcm), "deepgram_api_key": "",
                    "llm_api_key": "", "processing_profile": "clean"}
-        for kind in ("silence", "invalid_finish", "timeout", "parent_death", "parent_death_paused", "disconnect"):
+        kinds = ["silence", "invalid_finish", "timeout", "parent_death", "parent_death_paused", "disconnect"]
+        if args.slow:
+            kinds.append("delayed_finish")
+        for kind in kinds:
             proc = subprocess.Popen([str(worker), "--local-stream"], stdin=subprocess.PIPE,
                                     stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env={}, start_new_session=True)
             helper = None
@@ -82,14 +86,19 @@ def main():
                 elif kind == "disconnect":
                     proc.stdin.close()
                 else:
+                    if kind == "delayed_finish":
+                        os.kill(helper, signal.SIGSTOP)
                     if kind == "timeout":
                         os.kill(helper, signal.SIGALRM)
                         time.sleep(.05)
                     finish = {"version": 4, "command": "finish", "force_rest": kind == "invalid_finish"}
                     proc.stdin.write(json.dumps(finish).encode() + b"\n"); proc.stdin.flush()
+                    if kind == "delayed_finish":
+                        time.sleep(46)
+                        os.kill(helper, signal.SIGCONT)
                     result = frame(proc)
                     assert result["transport"] == "local"
-                    if kind == "silence":
+                    if kind in ("silence", "delayed_finish"):
                         assert result["status"] == "no_speech"
                     else:
                         assert result["status"] == "error"

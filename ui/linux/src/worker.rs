@@ -325,10 +325,10 @@ pub fn local_readiness(path: &Path, cfg: &ProviderConfig) -> Result<(), String> 
 }
 
 fn completion_timeout(cfg: &ProviderConfig) -> Duration {
-    // Batch Q8 starts inference only after capture stops. Allow its full 120s
-    // helper watchdog / 125s reader deadline plus model validation and cleanup.
-    // Streaming has already loaded the model; preserve its existing deadline.
-    Duration::from_secs(if cfg.local_model_path.is_some() && !cfg.streaming {
+    // Local batch inference and streaming backlog draining each have a 120s
+    // helper watchdog / 125s reader deadline. Include setup and cleanup margin.
+    // Cloud processing keeps its existing budget.
+    Duration::from_secs(if cfg.local_model_path.is_some() {
         150
     } else {
         45
@@ -1035,15 +1035,12 @@ mod tests {
     }
 
     #[test]
-    fn completion_budget_preserves_the_full_local_batch_watchdog() {
+    fn completion_budget_preserves_the_full_local_watchdog() {
         for streaming in [false, true] {
             let mut cfg = config(streaming);
             assert_eq!(completion_timeout(&cfg), Duration::from_secs(45));
             cfg.local_model_path = Some(PathBuf::from("/models/q8.gguf"));
-            assert_eq!(
-                completion_timeout(&cfg),
-                Duration::from_secs(if streaming { 45 } else { 150 })
-            );
+            assert_eq!(completion_timeout(&cfg), Duration::from_secs(150));
         }
     }
 

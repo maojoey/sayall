@@ -10,6 +10,8 @@ pub const model_sha256 = "4b50b6dd862bf6e346929aaf4f5eaacec003bfa3f56462d6c874b4
 pub const own_model_size = 731_357_696;
 pub const own_model_sha256 = "41762900886984bfa1283c38b2f20bd9ae9dd18d55a32fe71414af52e0e49e75";
 const max_output = 1024 * 1024;
+// Both batch and stream readers must outlast the native 120s watchdog.
+pub const result_timeout_seconds = 125;
 
 fn allowedSize(size: u64) bool {
     return size == model_size or size == own_model_size;
@@ -123,7 +125,7 @@ fn invoke(gpa: std.mem.Allocator, io: std.Io, helper: []const u8, model: std.Io.
     var reader: std.Io.File.MultiReader = undefined;
     reader.init(gpa, io, storage.toStreams(), &.{child.stdout.?});
     defer reader.deinit();
-    const deadline: std.Io.Timeout = .{ .deadline = .fromNow(io, .{ .clock = .awake, .raw = .fromSeconds(125) }) };
+    const deadline: std.Io.Timeout = .{ .deadline = .fromNow(io, .{ .clock = .awake, .raw = .fromSeconds(result_timeout_seconds) }) };
     while (reader.fill(4096, deadline)) |_| {
         if (reader.reader(0).buffered().len > max_output) return error.ResponseTooLarge;
     } else |err| switch (err) {

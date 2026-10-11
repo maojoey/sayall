@@ -26,7 +26,11 @@
 
 static_assert(std::atomic<bool>::is_always_lock_free, "signal handler requires lock-free atomics");
 static std::atomic<bool> finished{false};
-static void finish_signal(int) { finished.store(true, std::memory_order_relaxed); }
+static void finish_signal(int) {
+    // POSIX alarm is async-signal-safe. Start the bounded finish budget even
+    // while inference is busy; repeated finish signals must not extend it.
+    if (!finished.exchange(true, std::memory_order_relaxed)) alarm(120);
+}
 static constexpr size_t max_pcm = 16000 * 2 * 300;
 
 static std::string quote(const std::string &text) {
@@ -114,7 +118,7 @@ int main(int argc, char **argv) {
             unsigned char bytes[3200];
             bool finishing = false;
             while (true) {
-                if (finished.load(std::memory_order_relaxed) && !finishing) { finishing = true; alarm(120); }
+                if (finished.load(std::memory_order_relaxed)) finishing = true;
                 if (fstat(STDIN_FILENO, &stat) != 0 || stat.st_size < 0 ||
                     static_cast<uint64_t>(stat.st_size) > max_pcm || static_cast<uint64_t>(stat.st_size) < consumed) return 2;
                 const size_t remaining = static_cast<size_t>(stat.st_size) - consumed;
