@@ -60,6 +60,9 @@ struct ConfigurationLoader {
         return homeDirectory.appendingPathComponent(".config/sayall/config.json")
     }
 
+    /// The global shortcut preference written by `sayall shortcut`, shared with Linux.
+    var shortcutURL: URL { url.deletingLastPathComponent().appendingPathComponent("shortcut.json") }
+
     func load() throws -> ProviderSettings {
         let document: Document
         if FileManager.default.fileExists(atPath: url.path) {

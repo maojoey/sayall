@@ -2,7 +2,7 @@
 
 - **Status:** Accepted
 - **Applies to:** Unreleased macOS CLI
-- **Date:** 2026-08-01
+- **Date:** 2026-08-01 (shortcut amendment 2026-10-11)
 
 ## Context
 
@@ -43,6 +43,28 @@ native update adapters remain separate future work.
 The CLI and `sayall-process` are signed before the outer app, then the complete
 bundle is notarized and stapled. Release verification checks both nested
 executables independently.
+
+## Amendment: configurable global shortcut
+
+The CLI also exposes `sayall shortcut [show|set <CHORD>|reset|disable]` with
+the Linux grammar and the same version-1 `shortcut.json` preference beside
+`config.json`. The CLI owns that file under an exclusive `shortcut.lock`, and
+the app owns registration. After an atomic write, the CLI sends the
+parameterless v2 `shortcut` method: the app re-reads the file and registers
+the chord. It replies with the registered `{enabled, shortcut}`, or with a
+`shortcut_conflict`, `shortcut_unavailable`, or `invalid_shortcut` error. The
+CLI restores the previous file unless the app confirmed the same chord. A
+mismatched echo means the app reads a different configuration directory. An
+app that predates the method answers `invalid_request`. A stopped app is
+never launched; it applies the saved preference at startup.
+
+The app registers a new Carbon hotkey before releasing the old one, so a failed
+change never leaves SayAll without a working shortcut. Enabled system-wide
+symbolic hotkeys (for example Spotlight or input-source switching) are
+treated as conflicts because they would swallow the chord. Valid keys are a
+fixed table of xkb names mapped to `kVK_*` codes; a chord outside F1–F20 needs
+Control, Option, or Command. The Zig and Swift implementations are pinned by
+the shared `macos-shortcut-*` contract fixtures.
 
 ## Consequences
 

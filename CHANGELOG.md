@@ -5,6 +5,15 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- Made the macOS global shortcut configurable with the same `sayall shortcut`
+  commands, chord syntax, and `shortcut.json` preference as Linux. macOS accepts
+  `CMD`/`COMMAND` and `OPTION`/`OPT` as aliases for `SUPER` and `ALT`, rejects
+  chords that would capture ordinary typing, applies changes to the running app
+  immediately, and keeps the previous shortcut when the new one is reserved by
+  macOS or another app. The menu shows the active shortcut and any conflict.
+
 ## [0.3.3] - 2026-10-06
 
 ### Added

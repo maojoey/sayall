@@ -8,12 +8,11 @@ import UserNotifications
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!, coordinator: Coordinator!
-    private var hotKey: EventHotKeyRef?
+    private lazy var globalShortcut = GlobalShortcut { [weak self] in self?.triggerShortcut() }
     private var accessibilityTimer: Timer?
     private var accessibilityChecksRemaining = 0
     private let statusPanel = StatusPanel()
     private let errorNotifier = ErrorNotifier()
-    private var shortcutAvailable = false
     private var statusGeneration = 0
     private var menuState: HostControlState?
     private var menuConfigurationRevision = 0
@@ -41,7 +40,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         do { try controlServer.start(state: { [weak self] in
             self?.coordinator.hostControlState ?? .error
         }) { [weak self] method in
-            self?.coordinator.handleControl(method) ?? ControlResponse(ok: false, state: "unavailable", error: "app unavailable")
+            guard let self else { return ControlResponse(ok: false, state: "unavailable", error: "app unavailable") }
+            return method == .shortcut ? self.applySavedShortcut() : self.coordinator.handleControl(method)
         } } catch {
             NSApp.terminate(nil)
             return
@@ -52,7 +52,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.button?.image = NSImage(systemSymbolName: "waveform", accessibilityDescription: "SayAll")
         statusItem.button?.imagePosition = .imageOnly
         statusItem.button?.toolTip = "SayAll"
-        rebuildMenu(); registerShortcut()
+        applySavedShortcut()
         audioDeviceMonitor = AudioInputDeviceMonitor { [weak self] in
             DispatchQueue.main.async {
                 MainActor.assumeIsolated {
@@ -258,10 +258,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
         mode.isEnabled = false
         menu.addItem(mode)
-        if !shortcutAvailable {
-            let conflict = NSMenuItem(title: "Control+/ unavailable — use this menu", action: nil, keyEquivalent: "")
-            conflict.isEnabled = false; menu.addItem(conflict)
-        }
+        menu.addItem(shortcutMenuItem())
         let toggle = NSMenuItem(
             title: coordinator.state == .recording ? "Stop Dictation" : "Start Dictation",
             action: #selector(trigger),
@@ -381,16 +378,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             statusPanel.update(state: .idle, message: "", audioLevel: 0, showTimer: true)
         }
     }
-    private func registerShortcut() {
-        let id = EventHotKeyID(signature: OSType(0x53415941), id: 1)
-        shortcutAvailable = RegisterEventHotKey(UInt32(kVK_ANSI_Slash), UInt32(controlKey), id, GetApplicationEventTarget(), 0, &hotKey) == noErr
-        var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
-        InstallEventHandler(GetApplicationEventTarget(), { _, _, context in
-            guard let context else { return noErr }
-            Unmanaged<AppDelegate>.fromOpaque(context).takeUnretainedValue().triggerShortcut()
-            return noErr
-        }, 1, &spec, Unmanaged.passUnretained(self).toOpaque(), nil)
+    /// Registers the saved `shortcut.json` preference. On failure the previously
+    /// registered shortcut stays active and `sayall shortcut` restores its file.
+    @discardableResult
+    private func applySavedShortcut() -> ControlResponse {
+        let result = globalShortcut.apply(contentsOf: ConfigurationLoader().shortcutURL)
+        if case .registered(let chord) = globalShortcut.status {
+            coordinator.shortcutHint = chord.symbols
+        } else {
+            coordinator.shortcutHint = nil
+        }
         rebuildMenu()
+        switch result {
+        case .success(let registered):
+            return ControlResponse(ok: true, state: coordinator.controlState, shortcut: registered)
+        case .failure(let failure):
+            return ControlResponse(ok: false, state: coordinator.controlState, error: failure.legacy)
+        }
+    }
+    private func shortcutMenuItem() -> NSMenuItem {
+        let item: NSMenuItem
+        switch globalShortcut.status {
+        case .registered(let chord):
+            item = NSMenuItem(title: "Shortcut: \(chord.symbols)", action: nil, keyEquivalent: "")
+            item.toolTip = "Change it with ‘sayall shortcut set <MODIFIERS+KEY>’ (currently \(chord.canonical))."
+        case .disabled:
+            item = NSMenuItem(title: "Shortcut: Disabled — use this menu", action: nil, keyEquivalent: "")
+            item.toolTip = "Restore it with ‘sayall shortcut reset’."
+        case .unavailable(let chord, let reason):
+            item = NSMenuItem(title: "\(chord?.symbols ?? "Shortcut") unavailable — use this menu", action: nil, keyEquivalent: "")
+            item.toolTip = reason
+        }
+        item.isEnabled = false
+        return item
     }
 }
 

@@ -25,7 +25,13 @@ final class Coordinator {
     }
 
     var state: DictationState { machine.state }
-    private(set) var message = "Ready — Control+/ to start"
+    private(set) var message = "Ready — ⌃/ to start"
+    /// The registered global shortcut in menu notation, or nil when only the menu works.
+    var shortcutHint: String? = "⌃/" {
+        didSet { if state == .idle, message.hasPrefix("Ready — ") { message = readyMessage } }
+    }
+    private var readyMessage: String { shortcutHint.map { "Ready — \($0) to start" } ?? "Ready — use the menu to start" }
+    private var recordingMessage: String { shortcutHint.map { "Recording — \($0) to stop" } ?? "Recording — use the menu to stop" }
     private(set) var audioLevel = 0.0
     private(set) var showTimer = true
     private(set) var configurationRevision = 0
@@ -160,6 +166,9 @@ final class Coordinator {
             }
             trigger(source: .control)
             return ControlResponse(ok: true, state: controlState)
+        case .shortcut:
+            // AppDelegate owns global shortcut registration and answers this method itself.
+            return ControlResponse(ok: false, state: controlState, error: "error: Shortcut control is unavailable")
         }
     }
     func selectProcessingMode(_ mode: ProcessingMode) -> String? {
@@ -183,7 +192,7 @@ final class Coordinator {
     private func reset(after delay: TimeInterval = 1.5) {
         DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
             guard let self, [.success, .error, .cancelled].contains(self.state) else { return }
-            self.set(.idle, "Ready — Control+/ to start")
+            self.set(.idle, readyMessage)
         }
     }
     private func finish(_ id: UUID, as terminalState: DictationState, message: String, resetAfter delay: TimeInterval = 1.5) {
@@ -199,7 +208,7 @@ final class Coordinator {
         operationConfig = nil
         deliveryTarget = nil
         operationID = nil
-        set(.idle, "Ready — Control+/ to start")
+        set(.idle, readyMessage)
     }
     private func audioCaptureFailed() {
         guard let id = operationID, state == .starting || state == .recording || state == .stopping else { return }
@@ -282,7 +291,7 @@ final class Coordinator {
                 return
             }
             streamSession = session
-            set(.recording, "Recording — Control+/ to stop")
+            set(.recording, recordingMessage)
             persistStartup(outcome: "recording_ready", recordingReady: true)
             let remaining = max(0.001, 300 - Double(capture.captureElapsedNanoseconds) / 1_000_000_000)
             maximumTimer = Timer.scheduledTimer(withTimeInterval: remaining, repeats: false) { [weak self] _ in

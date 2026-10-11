@@ -1886,3 +1886,127 @@ final class PipelineMetricsTests: XCTestCase {
         XCTAssertEqual(fileMode.intValue & 0o777, 0o600)
     }
 }
+
+final class GlobalShortcutTests: XCTestCase {
+    private struct KeyFixture: Decodable { let version: Int; let keys: [String: UInt32] }
+    private struct ChordFixture: Decodable {
+        struct Valid: Decodable { let input: String; let shortcut: String; let key_code: UInt32; let modifiers: [String] }
+        let version: Int
+        let valid: [Valid]
+        let invalid: [String]
+    }
+
+    private func fixture(_ name: String) throws -> Data {
+        var root = URL(fileURLWithPath: #filePath)
+        for _ in 0..<5 { root.deleteLastPathComponent() }
+        return try Data(contentsOf: root.appendingPathComponent("tests/contracts-0.2/\(name).json"))
+    }
+
+    func testKeyTableMatchesTheSharedFixture() throws {
+        let keys = try JSONDecoder().decode(KeyFixture.self, from: fixture("macos-shortcut-keys"))
+        XCTAssertEqual(keys.version, 1)
+        XCTAssertEqual(ShortcutChord.keyCodes, keys.keys)
+    }
+
+    func testChordGrammarMatchesTheSharedFixture() throws {
+        let chords = try JSONDecoder().decode(ChordFixture.self, from: fixture("macos-shortcut-chords"))
+        XCTAssertEqual(chords.version, 1)
+        let names: [String: ShortcutChord.Modifiers] = ["SUPER": .command, "CTRL": .control, "ALT": .option, "SHIFT": .shift]
+        for valid in chords.valid {
+            let chord = try XCTUnwrap(ShortcutChord(valid.input), valid.input)
+            XCTAssertEqual(chord.canonical, valid.shortcut)
+            XCTAssertEqual(chord.keyCode, valid.key_code)
+            XCTAssertEqual(chord.modifiers, ShortcutChord.Modifiers(valid.modifiers.compactMap { names[$0] }))
+            XCTAssertEqual(ShortcutChord(chord.canonical), chord)
+        }
+        for invalid in chords.invalid { XCTAssertNil(ShortcutChord(invalid), invalid) }
+    }
+
+    func testChordPresentationUsesAppleModifierOrderAndCarbonFlags() throws {
+        let chord = try XCTUnwrap(ShortcutChord("cmd+shift+ctrl+alt+space"))
+        XCTAssertEqual(chord.symbols, "⌃⌥⇧⌘Space")
+        XCTAssertEqual(chord.carbonModifiers, UInt32(cmdKey | shiftKey | controlKey | optionKey))
+        XCTAssertEqual(ShortcutChord(ShortcutChord.defaultValue)?.symbols, "⌃/")
+    }
+
+    func testPreferenceUsesLinuxFormatAndDefaults() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("shortcut.json")
+        XCTAssertEqual(try ShortcutPreference.load(from: url), .default)
+
+        // Byte-for-byte what `sayall shortcut disable` writes on either platform.
+        try Data("{\n  \"version\": 1,\n  \"enabled\": false,\n  \"shortcut\": \"SUPER+H\"\n}".utf8).write(to: url)
+        let disabled = try ShortcutPreference.load(from: url)
+        XCTAssertFalse(disabled.enabled)
+        XCTAssertEqual(disabled.chord.canonical, "SUPER+H")
+
+        XCTAssertEqual(try ShortcutPreference.decode(Data(#"{"version":1,"shortcut":"opt+f12","future":true}"#.utf8)).chord.canonical,
+            "ALT+F12")
+        XCTAssertThrowsError(try ShortcutPreference.decode(Data(#"{"version":2}"#.utf8))) {
+            XCTAssertEqual($0 as? ShortcutPreferenceError, .unsupportedVersion)
+        }
+        XCTAssertThrowsError(try ShortcutPreference.decode(Data(#"{"version":1,"shortcut":"SHIFT+K"}"#.utf8))) {
+            XCTAssertEqual($0 as? ShortcutPreferenceError, .invalidShortcut)
+        }
+        XCTAssertThrowsError(try ShortcutPreference.decode(Data("{".utf8))) {
+            XCTAssertEqual($0 as? ShortcutPreferenceError, .malformed)
+        }
+    }
+
+    @MainActor
+    func testSystemReservedAndDisabledShortcutsDoNotRegister() throws {
+        var checked: [String] = []
+        let shortcut = GlobalShortcut(systemReservation: { checked.append($0.canonical); return true }) {}
+        let reserved = ShortcutPreference(enabled: true, chord: try XCTUnwrap(ShortcutChord("CMD+SPACE")))
+        guard case .failure(let failure) = shortcut.apply(reserved) else { return XCTFail("reserved shortcut registered") }
+        XCTAssertEqual(failure.code, "shortcut_conflict")
+        XCTAssertTrue(failure.legacy.hasPrefix("shortcut_conflict: ⌘Space is reserved"))
+        XCTAssertEqual(checked, ["SUPER+SPACE"])
+        XCTAssertEqual(shortcut.status, .unavailable(reserved.chord, reason: failure.message))
+
+        let disabled = ShortcutPreference(enabled: false, chord: reserved.chord)
+        XCTAssertEqual(try shortcut.apply(disabled).get(), HostShortcutState(enabled: false, shortcut: "SUPER+SPACE"))
+        XCTAssertEqual(shortcut.status, .disabled(reserved.chord))
+        XCTAssertEqual(checked.count, 1)
+    }
+
+    @MainActor
+    func testUnreadablePreferenceReportsInvalidShortcut() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("shortcut.json")
+        try Data(#"{"version":1,"shortcut":"CTRL+NOPE"}"#.utf8).write(to: url)
+        let shortcut = GlobalShortcut(systemReservation: { _ in XCTFail("invalid preference reached registration"); return true }) {}
+        guard case .failure(let failure) = shortcut.apply(contentsOf: url) else { return XCTFail("invalid preference applied") }
+        XCTAssertEqual(failure.code, "invalid_shortcut")
+        XCTAssertTrue(failure.message.contains("sayall shortcut reset"))
+        guard case .unavailable(.none, _) = shortcut.status else { return XCTFail("unexpected status \(shortcut.status)") }
+    }
+
+    @MainActor
+    func testShortcutControlRouteAndStructuredFailures() throws {
+        let request = try fixture("host-shortcut-request")
+        XCTAssertEqual(decodeControlRoute(request.dropLast()), .v2(.shortcut))
+        var calls: [ControlMethod] = []
+        _ = dispatchControlRoute(decodeControlRoute(request.dropLast())) { calls.append($0) }
+        XCTAssertEqual(calls, [.shortcut])
+
+        let response = try JSONDecoder().decode(HostControlResponse.self, from: fixture("host-shortcut-response"))
+        try response.validate()
+        XCTAssertEqual(response.shortcut, HostShortcutState(enabled: true, shortcut: "SUPER+SHIFT+SPACE"))
+        let encoded = try JSONEncoder().encode(HostControlResponse(ok: true, state: .idle))
+        XCTAssertFalse(String(decoding: encoded, as: UTF8.self).contains("shortcut"))
+
+        XCTAssertEqual(hostV2Failure("shortcut_conflict: ⌘Space is reserved", method: .shortcut),
+            HostControlError(code: "shortcut_conflict", message: "⌘Space is reserved"))
+        XCTAssertEqual(hostV2Failure("invalid_shortcut: bad file", method: .shortcut),
+            HostControlError(code: "invalid_shortcut", message: "bad file"))
+        XCTAssertEqual(hostV2Failure("error: Shortcut control is unavailable", method: .shortcut),
+            HostControlError(code: "unavailable", message: "Shortcut control is unavailable"))
+        XCTAssertEqual(hostV2Failure("shortcut_conflict: x", method: .toggle),
+            HostControlError(code: "unavailable", message: "shortcut_conflict: x"))
+    }
+}

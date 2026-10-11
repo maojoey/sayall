@@ -76,6 +76,10 @@ At minimum, qualify:
   never auto-pastes into the wrong target.
 - [ ] Microphone denied then granted, Accessibility denied then granted, focus
   changes during processing, Control+/ conflict, and menu-only operation.
+- [ ] `sayall shortcut set` to a free chord (works immediately and after
+  relaunch), to a chord reserved by macOS such as `CMD+SPACE` and one held by
+  another app (both rejected, previous shortcut still works), then `disable`,
+  `reset`, and a change saved while SayAll is not running.
 - [ ] Deepgram success and network/auth/server failures; Cerebras disabled, success,
   and failure with raw-transcript warning/delivery.
 - [ ] Normal streaming without REST, final PCM drain, network loss during
