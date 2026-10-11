@@ -3,6 +3,7 @@ import AppKit
 import ApplicationServices
 import AVFoundation
 import AudioToolbox
+import Carbon
 import Darwin
 @testable import SayAll
 @testable import SayAllControl
