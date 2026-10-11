@@ -10,11 +10,17 @@ import selectors
 import signal
 import subprocess
 import tempfile
+import threading
 import time
 import wave
 
 
-def frame(process, timeout=15):
+# Outlast the host's 120s startup / 150s completion budgets with read margin.
+STARTUP_FRAME_TIMEOUT = 125
+RESULT_FRAME_TIMEOUT = 155
+
+
+def frame(process, timeout):
     # Read one byte at a time only in this bounded test protocol reader, avoiding
     # BufferedReader/select disagreement across the two result frames.
     deadline = time.monotonic() + timeout
@@ -31,6 +37,13 @@ def frame(process, timeout=15):
                 return json.loads(data)
             data.extend(value)
     raise RuntimeError("oversized worker frame")
+
+
+def resume_helper(pid):
+    try:
+        os.kill(pid, signal.SIGCONT)
+    except ProcessLookupError:
+        pass  # The frame reader will report the worker's failure.
 
 
 def gone(pid):
@@ -72,6 +85,7 @@ def main():
             proc = subprocess.Popen([str(worker), "--local-stream"], stdin=subprocess.PIPE,
                                     stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env={}, start_new_session=True)
             helper = None
+            resume = None
             try:
                 proc.stdin.write(json.dumps(request).encode() + b"\n"); proc.stdin.flush()
                 if kind == "delayed_startup":
@@ -87,9 +101,11 @@ def main():
                     with selectors.DefaultSelector() as selector:
                         selector.register(proc.stdout, selectors.EVENT_READ)
                         assert not selector.select(0), "helper was already ready before test pause"
-                    time.sleep(13)
-                    os.kill(helper, signal.SIGCONT)
-                ready = frame(proc)
+                    # Read while the helper is paused, exercising the harness
+                    # too (its former 15s limit must not reject valid startup).
+                    resume = threading.Timer(16, resume_helper, args=(helper,))
+                    resume.start()
+                ready = frame(proc, STARTUP_FRAME_TIMEOUT)
                 assert ready == {"version": 4, "event": "ready", "streaming": True}
                 children = Path(f"/proc/{proc.pid}/task/{proc.pid}/children").read_text().split()
                 assert len(children) == 1
@@ -109,9 +125,9 @@ def main():
                     finish = {"version": 4, "command": "finish", "force_rest": kind == "invalid_finish"}
                     proc.stdin.write(json.dumps(finish).encode() + b"\n"); proc.stdin.flush()
                     if kind == "delayed_finish":
-                        time.sleep(46)
-                        os.kill(helper, signal.SIGCONT)
-                    result = frame(proc)
+                        resume = threading.Timer(46, resume_helper, args=(helper,))
+                        resume.start()
+                    result = frame(proc, RESULT_FRAME_TIMEOUT)
                     assert result["transport"] == "local"
                     if kind in ("silence", "delayed_startup", "delayed_finish"):
                         assert result["status"] == "no_speech"
@@ -125,6 +141,9 @@ def main():
                 assert gone(helper), "orphan helper"
                 print("PASS:", kind)
             finally:
+                if resume is not None:
+                    resume.cancel()
+                    resume.join()
                 try:
                     os.killpg(proc.pid, signal.SIGKILL)
                 except ProcessLookupError:
