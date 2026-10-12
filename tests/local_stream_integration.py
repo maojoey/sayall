@@ -178,6 +178,20 @@ def main():
                                     capture_output=True, env={}, timeout=5)
             assert json.loads(result.stdout)["error"] == "invalid_request"
         print("PASS: unsupported requests rejected")
+        # Initial protocol failures must also return a small structured result,
+        # not just disappear before readiness or echo any request contents.
+        for data in (b"", b"\n", b"{\n",
+                     json.dumps(request | {"local_model_path": 7}).encode() + b"\n",
+                     b" " * (2 * 1024 * 1024) + b"\n"):
+            result = subprocess.run([str(worker), "--local-stream"], input=data,
+                                    capture_output=True, env={}, timeout=5)
+            assert result.returncode == 0 and result.stderr == b""
+            assert len(result.stdout) <= 4096
+            value = json.loads(result.stdout)
+            assert value["version"] == 4 and value["transport"] == "local"
+            assert value["status"] == "error" and value["error"] == "invalid_request"
+            assert "text" not in value
+        print("PASS: missing, malformed, wrongly typed and oversized initial requests")
 
 
 if __name__ == "__main__":

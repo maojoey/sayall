@@ -15,8 +15,9 @@ const startup_timeout_seconds = 90;
 pub fn run(gpa: std.mem.Allocator, io: std.Io) !void {
     var storage: [batch.max_request_bytes + 1]u8 = undefined;
     var input = std.Io.File.stdin().reader(io, &storage);
-    const header = input.interface.takeDelimiter('\n') catch return error.InvalidRequest;
-    const parsed = try stream.parseRequest(gpa, header orelse return);
+    const header = input.interface.takeDelimiter('\n') catch return writeInvalidRequest(gpa, io);
+    const parsed = stream.parseRequest(gpa, header orelse return writeInvalidRequest(gpa, io)) catch
+        return writeInvalidRequest(gpa, io);
     defer parsed.deinit();
     const r = parsed.value;
     const result = execute(gpa, io, r, &input.interface) catch |err| batch.Result{
@@ -27,6 +28,15 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io) !void {
     };
     defer if (result.text) |text| gpa.free(text);
     try write(gpa, io, result);
+}
+
+fn writeInvalidRequest(gpa: std.mem.Allocator, io: std.Io) !void {
+    return write(gpa, io, batch.Result{
+        .status = .@"error",
+        .@"error" = .invalid_request,
+        .processing_profile = .clean,
+        .transport = .local,
+    });
 }
 
 fn validate(r: stream.Request) !void {
