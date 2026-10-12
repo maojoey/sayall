@@ -154,7 +154,26 @@ pub fn run(
 
     var output_buffer: [4096]u8 = undefined;
     var output_reader = child.stdout.?.reader(io, &output_buffer);
-    const response = output_reader.interface.allocRemaining(arena, .limited(batch.max_output_bytes + 1)) catch {
+    const response = if (options.local) readLocalOutput(arena, io, child.stdout.?, .{
+        .deadline = .fromNow(io, .{ .clock = .awake, .raw = .fromSeconds(270) }),
+    }) catch |err| {
+        // This deadline includes hashing before the native helper (and its
+        // watchdog) exists. Never leave an abandoned worker running.
+        child.kill(io);
+        const failure: batch.WireResult = .{
+            .version = worker_protocol.version,
+            .status = .@"error",
+            .@"error" = batch.mapLocalError(err),
+            .processing_profile = if (options.raw) .verbatim else .clean,
+            .transport = .local,
+        };
+        if (options.json) {
+            try write(io, .stdout(), try std.json.Stringify.valueAlloc(arena, failure, .{ .emit_null_optional_fields = false }));
+            try write(io, .stdout(), "\n");
+            return 1;
+        }
+        return presentHuman(io, failure);
+    } else output_reader.interface.allocRemaining(arena, .limited(batch.max_output_bytes + 1)) catch {
         try write(io, .stderr(), "sayall: transcribe: worker response exceeded the 1 MiB limit\n");
         return 70;
     };
@@ -184,6 +203,37 @@ pub fn run(
         return if (parsed.value.status == .@"error") 1 else 0;
     }
     return presentHuman(io, parsed.value);
+}
+
+fn readLocalOutput(gpa: std.mem.Allocator, io: std.Io, stdout: std.Io.File, timeout: std.Io.Timeout) ![]u8 {
+    var storage: std.Io.File.MultiReader.Buffer(1) = undefined;
+    var reader: std.Io.File.MultiReader = undefined;
+    reader.init(gpa, io, storage.toStreams(), &.{stdout});
+    defer reader.deinit();
+    while (reader.fill(4096, timeout)) |_| {
+        if (reader.reader(0).buffered().len > batch.max_output_bytes) return error.ResponseTooLarge;
+    } else |err| switch (err) {
+        error.EndOfStream => {},
+        else => return err,
+    }
+    try reader.checkAnyError();
+    return gpa.dupe(u8, reader.reader(0).buffered());
+}
+
+test "local CLI output wait is bounded before any helper is started" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    const io = std.testing.io;
+    var child = try std.process.spawn(io, .{
+        .argv = &.{ "/bin/sleep", "30" },
+        .stdin = .ignore,
+        .stdout = .pipe,
+        .stderr = .ignore,
+    });
+    defer child.kill(io);
+    try std.testing.expectError(error.Timeout, readLocalOutput(std.testing.allocator, io, child.stdout.?, .{
+        .deadline = .fromNow(io, .{ .clock = .awake, .raw = .fromMilliseconds(50) }),
+    }));
+    try std.testing.expectEqual(batch.ErrorCode.local_timeout, batch.mapLocalError(error.Timeout));
 }
 
 fn defaultLocalModel(gpa: std.mem.Allocator, env: *const std.process.Environ.Map) ![]const u8 {

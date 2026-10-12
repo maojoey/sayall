@@ -20,6 +20,7 @@ pub struct Capture {
     wav: PathBuf,
     cleanup: bool,
     pcm_limit: Option<u64>,
+    frozen_at: Option<Instant>,
 }
 enum CaptureSource {
     Process(Child),
@@ -126,6 +127,7 @@ impl Capture {
         Ok(Self {
             source: CaptureSource::Process(child),
             pcm_limit: None,
+            frozen_at: None,
             started_at,
             dir,
             pcm,
@@ -175,6 +177,7 @@ impl Capture {
         });
         Ok(Self {
             pcm_limit: None,
+            frozen_at: None,
             source: CaptureSource::Fixture {
                 stop,
                 thread: Some(thread),
@@ -189,6 +192,16 @@ impl Capture {
     pub fn set_pcm_limit(&mut self, bytes: u64) {
         assert!(bytes > 0 && bytes % 2 == 0);
         self.pcm_limit = Some(bytes);
+    }
+
+    pub fn is_frozen(&self) -> bool {
+        self.frozen_at.is_some()
+    }
+
+    pub fn captured_duration(&self) -> Duration {
+        self.frozen_at
+            .unwrap_or_else(Instant::now)
+            .duration_since(self.started_at)
     }
 
     pub fn started_at(&self) -> Instant {
@@ -214,6 +227,9 @@ impl Capture {
     /// the shortcut boundary reaches both the stream worker and the final WAV.
     /// Shutdown must not wait for the tail or continue recording unnecessarily.
     pub fn wait_for_tail(&mut self, duration: Duration, shutdown: &AtomicBool) -> io::Result<()> {
+        if self.is_frozen() {
+            return Ok(());
+        }
         let deadline = Instant::now() + duration;
         loop {
             if shutdown.load(Ordering::Acquire) {
@@ -230,7 +246,12 @@ impl Capture {
         }
     }
 
-    pub fn stop(mut self) -> io::Result<PathBuf> {
+    /// Stop the microphone but retain both audio inodes until worker readiness.
+    pub fn freeze(&mut self) -> io::Result<()> {
+        if self.is_frozen() {
+            return Ok(());
+        }
+        let stopped_at = Instant::now();
         let process_result = self.terminate(Duration::from_secs(2));
         // pw-record 1.6 exits with status 1 after handling SIGINT even though
         // the recording completed normally. Only accept that status when this
@@ -241,12 +262,19 @@ impl Capture {
                 return Err(io::Error::other(format!("pw-record exited with {status}")));
             }
         }
+        self.frozen_at = Some(stopped_at);
+        Ok(())
+    }
+    pub fn stop(mut self) -> io::Result<PathBuf> {
+        self.freeze()?;
         self.finish_wav()?;
         self.cleanup = false;
         Ok(self.wav.clone())
     }
     pub fn cancel(mut self) {
-        let _ = self.terminate(Duration::from_millis(500));
+        if !self.is_frozen() {
+            let _ = self.terminate(Duration::from_millis(500));
+        }
         let _ = fs::remove_dir_all(&self.dir);
     }
     fn terminate(
@@ -870,6 +898,11 @@ mod tests {
         }
         let mut held = File::open(&pcm).unwrap();
         assert_eq!(held.metadata().unwrap().len(), 6);
+        capture.freeze().unwrap();
+        assert!(pcm.exists()); // a not-yet-ready worker can still open it
+        let duration = capture.captured_duration();
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(capture.captured_duration(), duration);
         let wav = capture.stop().unwrap();
         assert_eq!(held.metadata().unwrap().len(), 4);
         let mut actual = Vec::new();

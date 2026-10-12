@@ -257,14 +257,12 @@ struct RecvFailure {
 pub struct Startup {
     pub cancelled_generation: Arc<AtomicU64>,
     pub generation: u64,
-    pub capture_deadline: Instant,
 }
 
 impl Startup {
     fn interrupted(&self, shutdown: &AtomicBool) -> bool {
         shutdown.load(Ordering::Acquire)
             || self.cancelled_generation.load(Ordering::Acquire) == self.generation
-            || Instant::now() >= self.capture_deadline
     }
 }
 
@@ -375,7 +373,8 @@ fn completion_timeout(cfg: &ProviderConfig) -> Duration {
 
 impl Worker {
     /// Capture is already active. Interrupt every startup I/O phase on a user
-    /// stop, shutdown or the capture's own deadline, not just the model budget.
+    /// stop, shutdown or capture failure. The capture callback freezes audio at
+    /// its duration limit while preserving it for finalization after readiness.
     pub fn start_recording(
         path: &Path,
         wav: &Path,
@@ -383,31 +382,35 @@ impl Worker {
         cfg: &ProviderConfig,
         shutdown: Arc<AtomicBool>,
         startup: Startup,
+        mut poll_capture: impl FnMut() -> Result<(), String> + Send,
     ) -> Result<Self, String> {
         let done = AtomicBool::new(false);
         let interrupted = Arc::new(AtomicBool::new(false));
         let result = std::thread::scope(|scope| {
             let finished = StartupFinished(&done);
-            scope.spawn(|| {
+            let watcher = scope.spawn(|| {
                 while !done.load(Ordering::Acquire) {
                     if startup.interrupted(&shutdown) {
                         interrupted.store(true, Ordering::Release);
                         break;
                     }
+                    if let Err(error) = poll_capture() {
+                        interrupted.store(true, Ordering::Release);
+                        return Err(error);
+                    }
                     std::thread::sleep(Duration::from_millis(10));
                 }
+                Ok(())
             });
             let result = Self::start(path, wav, pcm, cfg, interrupted.clone());
             drop(finished); // also stops the watcher if startup unwinds
+            watcher
+                .join()
+                .map_err(|_| "capture monitor failed".to_string())??;
             result
         });
         if startup.interrupted(&shutdown) {
-            return Err(if Instant::now() >= startup.capture_deadline {
-                "recording limit reached before worker was ready"
-            } else {
-                "recording cancelled during worker startup"
-            }
-            .into());
+            return Err("recording cancelled during worker startup".into());
         }
         result.map(|mut worker| {
             // Startup cancellation must not replace ongoing session shutdown.
@@ -1173,8 +1176,8 @@ fi"#,
     }
 
     #[test]
-    fn recording_startup_observes_stop_shutdown_and_capture_limit() {
-        for reason in ["stop", "shutdown", "limit"] {
+    fn recording_startup_observes_stop_shutdown_and_capture_failure() {
+        for reason in ["stop", "shutdown", "capture_exit"] {
             let fixture = Fixture::new(&format!("{}\nIFS= read -r request\nsleep 30", probe()));
             let mut cfg = config(true);
             cfg.local_model_path = Some("/models/q8.gguf".into());
@@ -1200,12 +1203,13 @@ fi"#,
                 Startup {
                     cancelled_generation: stopped,
                     generation: 7,
-                    capture_deadline: started
-                        + if reason == "limit" {
-                            Duration::from_millis(100)
-                        } else {
-                            Duration::from_secs(5)
-                        },
+                },
+                || {
+                    if reason == "capture_exit" && started.elapsed() >= Duration::from_millis(100) {
+                        Err("capture process exited early".into())
+                    } else {
+                        Ok(())
+                    }
                 },
             );
             interrupt.join().unwrap();
@@ -1220,7 +1224,6 @@ fi"#,
         let startup = Startup {
             cancelled_generation: cancelled.clone(),
             generation: 7,
-            capture_deadline: Instant::now() + Duration::from_secs(5),
         };
         let shutdown = AtomicBool::new(false);
         assert!(!startup.interrupted(&shutdown));

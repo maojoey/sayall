@@ -12,9 +12,10 @@ Local startup has a 120-second host budget, including model hashing and a
 90-second helper initialization budget. Capture's configured maximum duration
 still applies throughout startup. Pressing the shortcut again while the HUD is
 `Starting` cancels initialization, stops capture and deletes the temporary audio
-without delivery. Reaching the recording limit before readiness aborts startup
-with an explicit error rather than continuing to record. Shutdown interrupts
-startup as well. Cancellation is scoped to the session generation, including
+without delivery. Reaching the recording limit before readiness stops capture
+but retains the audio; once the worker becomes ready, the captured prefix is
+finalized normally. Capture failures and shutdown interrupt startup promptly.
+A model startup failure still reports an error without fallback. Cancellation is scoped to the session generation, including
 the race where readiness arrives just as the user cancels.
 
 After normal recording stops, both local modes allow the native helper's
@@ -26,8 +27,10 @@ budget is 270 seconds: a separate 120-second setup allowance plus the full
 latency or a guarantee for arbitrarily slow filesystems. Neither startup
 interruption nor completion failure invokes a cloud or batch fallback.
 The opt-in native smoke harness supports `--startup-interrupt cancel`, `limit`
-and `shutdown` to verify prompt capture shutdown, zero delivery and audio cleanup
-against a deliberately delayed worker. The stream integration harness's `--slow`
+and `shutdown`, plus `capture-exit`, against a deliberately delayed worker.
+The limit case verifies that PCM stops growing while initialization continues
+and is finalized after readiness; cancellation/failure cases verify zero
+delivery and audio cleanup. The stream integration harness's `--slow`
 mode separately checks delayed readiness and completion; `--long` checks the
 300-second PCM boundary using synthetic silence. The local helper feeds at most
 300 seconds while waiting for the host's stop. The host trims any final recorder

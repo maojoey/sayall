@@ -25,7 +25,7 @@ def main():
     p.add_argument("--network-isolated", action="store_true", help="run under a new Linux user/network namespace")
     p.add_argument("--batch", action="store_true", help="compare the explicit local batch path")
     p.add_argument("--cancel", action="store_true", help="cancel during capture; assert no delivery and cleanup")
-    p.add_argument("--startup-interrupt", choices=("cancel", "limit", "shutdown"),
+    p.add_argument("--startup-interrupt", choices=("cancel", "limit", "shutdown", "capture-exit"),
                    help="delay worker startup and verify bounded stop plus audio cleanup")
     args = p.parse_args()
     if args.startup_interrupt and (args.batch or args.cancel):
@@ -82,10 +82,15 @@ def main():
                 assert 0.3 <= source.getnframes() / 16000 <= 30
                 with wave.open(str(fixture), "wb") as out:
                     out.setparams(source.getparams())
-                    out.writeframes(source.readframes(source.getnframes()))
+                    frames = min(source.getnframes(), 8000) if args.startup_interrupt == "capture-exit" else source.getnframes()
+                    out.writeframes(source.readframes(frames))
             env = dict(os.environ, XDG_CONFIG_HOME=str(root / "config"),
                        SAYALL_TEST_AUDIO_FIXTURE=str(fixture), SAYALL_TEST_AUDIO_EOF_PATH=str(root / "eof"),
                        SAYALL_TEST_SESSION_ROOT=str(scratch))
+            if args.startup_interrupt == "capture-exit":
+                # The fixture producer fails at EOF when its marker cannot be
+                # written; exercise real capture-thread liveness observation.
+                env["SAYALL_TEST_AUDIO_EOF_PATH"] = str(root / "absent" / "eof")
             env.pop("SAYALL_TEST_AUDIO_START_GATE", None)
             env.pop("SAYALL_TEST_CANCEL_LOCAL", None)
             env.pop("SAYALL_TEST_STARTUP_INTERRUPT", None)

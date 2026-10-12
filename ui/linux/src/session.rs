@@ -562,7 +562,7 @@ fn run(
                     publish(State::Idle, generation, None, None, show_timer);
                 }
                 if let Some((c, _, started, cfg, _, show_timer, _)) = active.as_mut() {
-                    if !c.alive().unwrap_or(false) {
+                    if !c.is_frozen() && !c.alive().unwrap_or(false) {
                         let (c, w, _, _, _, show_timer, notifications) = active.take().unwrap();
                         w.cancel();
                         c.cancel();
@@ -706,17 +706,31 @@ where
         }
         publish(State::Starting, *generation, None, None, cfg.show_timer);
         let (pcm, wav) = capture.paths();
+        let (pcm, wav) = (pcm.to_owned(), wav.to_owned());
+        let capture_deadline =
+            capture.started_at() + Duration::from_secs(cfg.recording.max_seconds as u64);
         let worker = worker::Worker::start_recording(
             &path,
-            wav,
-            pcm,
+            &wav,
+            &pcm,
             &cfg.provider,
             shutdown.clone(),
             worker::Startup {
                 cancelled_generation: startup_cancelled.clone(),
                 generation: *generation,
-                capture_deadline: capture.started_at()
-                    + Duration::from_secs(cfg.recording.max_seconds as u64),
+            },
+            || {
+                if !capture.is_frozen() {
+                    if !capture.alive().map_err(|e| e.to_string())? {
+                        return Err("capture process exited early during worker startup".into());
+                    }
+                    if Instant::now() >= capture_deadline {
+                        capture
+                            .freeze()
+                            .map_err(|e| format!("capture stop failed: {e}"))?;
+                    }
+                }
+                Ok(())
             },
         )?;
         Ok((
@@ -816,7 +830,7 @@ where
     let (mut capture, worker, started, cfg, output, show_timer, notifications) =
         active.take().expect("active capture");
     let stop_requested = Instant::now();
-    let recorded = stop_requested.duration_since(started);
+    let recorded = capture.captured_duration();
     let tail_deadline = stop_requested + stop_tail_duration(recorded, &cfg, reason);
     publish(State::Stopping, generation, Some(started), None, show_timer);
     let outcome = (|| -> Result<DeliveryCompletion, String> {
@@ -1050,26 +1064,45 @@ mod tests {
                 controller.toggle().unwrap();
             } else if mode == "shutdown" {
                 controller.shutdown_and_join();
+            } else if mode == "limit" {
+                // The delayed worker is still loading, but recording must
+                // stop at its one-second limit without deleting the PCM.
+                std::thread::sleep(Duration::from_millis(1500));
+                let pcm = root.join("session-1/audio.pcm");
+                let size = std::fs::metadata(&pcm).unwrap().len();
+                assert!(size > 0 && size < 64_000);
+                std::thread::sleep(Duration::from_millis(200));
+                assert_eq!(std::fs::metadata(&pcm).unwrap().len(), size);
             } else {
-                assert_eq!(mode, "limit");
+                assert_eq!(mode, "capture-exit");
             }
             let result = start_thread.join().unwrap();
-            assert!(start.elapsed() < Duration::from_secs(4));
             if mode == "limit" {
-                assert!(result.is_err());
-                assert_eq!(controller.status().state, State::Error);
-                assert!(
-                    controller
-                        .status()
-                        .message
-                        .unwrap()
-                        .contains("recording limit")
-                );
+                assert_eq!(result.unwrap().state, State::Recording);
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while !matches!(controller.status().state, State::Success | State::Error) {
+                    assert!(Instant::now() < deadline, "frozen capture did not finalize");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                assert_eq!(controller.status().state, State::Success);
+                assert!(calls.load(Ordering::SeqCst) <= 1);
             } else {
-                assert_eq!(result.unwrap().state, State::Cancelled);
+                assert!(start.elapsed() < Duration::from_secs(4));
+                if mode == "capture-exit" {
+                    assert!(result.is_err());
+                    assert!(
+                        controller
+                            .status()
+                            .message
+                            .unwrap()
+                            .contains("capture process exited")
+                    );
+                } else {
+                    assert_eq!(result.unwrap().state, State::Cancelled);
+                }
+                assert_eq!(calls.load(Ordering::SeqCst), 0);
             }
             drop(guard);
-            assert_eq!(calls.load(Ordering::SeqCst), 0);
             assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
             println!(
                 "SAYALL_LOCAL_TIMING {{\"startup_interrupt_ms\":{}}}",
