@@ -5,6 +5,7 @@ const cli_transcribe = @import("cli_transcribe.zig");
 const config = @import("config.zig");
 
 test {
+    _ = @import("cli_doctor.zig");
     _ = @import("darwin_shortcut.zig");
     _ = @import("product/shortcut_chord.zig");
 }
