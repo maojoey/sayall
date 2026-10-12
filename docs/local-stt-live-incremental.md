@@ -6,6 +6,26 @@ There is no partial typing. **Model residency between recordings remains future
 work**; this version releases the helper at session completion/cancellation.
 Q8 remains the only local model. Polished is not enabled.
 
+## Startup and completion bounds
+
+Local startup has a 120-second host budget, including model hashing and a
+90-second helper initialization budget. Capture's configured maximum duration
+still applies throughout startup. Pressing the shortcut again while the HUD is
+`Starting` cancels initialization, stops capture and deletes the temporary audio
+without delivery. Reaching the recording limit before readiness aborts startup
+with an explicit error rather than continuing to record. Shutdown interrupts
+startup as well. Cancellation is scoped to the session generation, including
+the race where readiness arrives just as the user cancels.
+
+After normal recording stops, both local modes allow the native helper's
+120-second finish watchdog, a 125-second Zig result deadline and a 150-second
+host completion budget. These are upper bounds, not expected latency. Neither
+startup interruption nor completion failure invokes a cloud or batch fallback.
+The opt-in native smoke harness supports `--startup-interrupt cancel`, `limit`
+and `shutdown` to verify prompt capture shutdown, zero delivery and audio cleanup
+against a deliberately delayed worker. The stream integration harness's `--slow`
+mode separately checks delayed readiness and completion.
+
 ## Local question endings
 
 Separate recordings of the same question can yield different Q8 punctuation.

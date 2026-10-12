@@ -6,7 +6,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
@@ -254,6 +254,27 @@ struct RecvFailure {
     message: String,
     bytes_seen: bool,
 }
+pub struct Startup {
+    pub cancelled_generation: Arc<AtomicU64>,
+    pub generation: u64,
+    pub capture_deadline: Instant,
+}
+
+impl Startup {
+    fn interrupted(&self, shutdown: &AtomicBool) -> bool {
+        shutdown.load(Ordering::Acquire)
+            || self.cancelled_generation.load(Ordering::Acquire) == self.generation
+            || Instant::now() >= self.capture_deadline
+    }
+}
+
+struct StartupFinished<'a>(&'a AtomicBool);
+impl Drop for StartupFinished<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
 pub struct Worker {
     running: Option<Running>,
     local_stream: bool,
@@ -346,6 +367,48 @@ fn completion_timeout(cfg: &ProviderConfig) -> Duration {
 }
 
 impl Worker {
+    /// Capture is already active. Interrupt every startup I/O phase on a user
+    /// stop, shutdown or the capture's own deadline, not just the model budget.
+    pub fn start_recording(
+        path: &Path,
+        wav: &Path,
+        pcm: &Path,
+        cfg: &ProviderConfig,
+        shutdown: Arc<AtomicBool>,
+        startup: Startup,
+    ) -> Result<Self, String> {
+        let done = AtomicBool::new(false);
+        let interrupted = Arc::new(AtomicBool::new(false));
+        let result = std::thread::scope(|scope| {
+            let finished = StartupFinished(&done);
+            scope.spawn(|| {
+                while !done.load(Ordering::Acquire) {
+                    if startup.interrupted(&shutdown) {
+                        interrupted.store(true, Ordering::Release);
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            });
+            let result = Self::start(path, wav, pcm, cfg, interrupted.clone());
+            drop(finished); // also stops the watcher if startup unwinds
+            result
+        });
+        if startup.interrupted(&shutdown) {
+            return Err(if Instant::now() >= startup.capture_deadline {
+                "recording limit reached before worker was ready"
+            } else {
+                "recording cancelled during worker startup"
+            }
+            .into());
+        }
+        result.map(|mut worker| {
+            // Startup cancellation must not replace ongoing session shutdown.
+            worker.shutdown = shutdown;
+            worker
+        })
+    }
+
     pub fn start(
         path: &Path,
         wav: &Path,
@@ -1084,6 +1147,62 @@ mod tests {
 fi"#,
             crate::BUILD_VERSION
         )
+    }
+
+    #[test]
+    fn recording_startup_observes_stop_shutdown_and_capture_limit() {
+        for reason in ["stop", "shutdown", "limit"] {
+            let fixture = Fixture::new(&format!("{}\nIFS= read -r request\nsleep 30", probe()));
+            let mut cfg = config(true);
+            cfg.local_model_path = Some("/models/q8.gguf".into());
+            let stopped = Arc::new(AtomicU64::new(0));
+            let shutdown = shutdown();
+            let stop_signal = stopped.clone();
+            let shutdown_signal = shutdown.clone();
+            let interrupt = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(100));
+                if reason == "stop" {
+                    stop_signal.store(7, Ordering::Release);
+                } else if reason == "shutdown" {
+                    shutdown_signal.store(true, Ordering::Release);
+                }
+            });
+            let started = Instant::now();
+            let result = Worker::start_recording(
+                &fixture.worker,
+                &fixture.wav,
+                &fixture.pcm,
+                &cfg,
+                shutdown,
+                Startup {
+                    cancelled_generation: stopped,
+                    generation: 7,
+                    capture_deadline: started
+                        + if reason == "limit" {
+                            Duration::from_millis(100)
+                        } else {
+                            Duration::from_secs(5)
+                        },
+                },
+            );
+            interrupt.join().unwrap();
+            assert!(result.is_err(), "{reason}");
+            assert!(started.elapsed() < Duration::from_secs(2), "{reason}");
+        }
+    }
+
+    #[test]
+    fn startup_cancellation_is_scoped_to_its_generation() {
+        let cancelled = Arc::new(AtomicU64::new(6));
+        let startup = Startup {
+            cancelled_generation: cancelled.clone(),
+            generation: 7,
+            capture_deadline: Instant::now() + Duration::from_secs(5),
+        };
+        let shutdown = AtomicBool::new(false);
+        assert!(!startup.interrupted(&shutdown));
+        cancelled.store(7, Ordering::Release);
+        assert!(startup.interrupted(&shutdown));
     }
 
     #[test]

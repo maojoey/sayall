@@ -79,6 +79,7 @@ impl fmt::Display for ToggleError {
 }
 
 enum Command {
+    CancelStartup(u64),
     Toggle(State, mpsc::Sender<Result<Snapshot, ToggleError>>),
     RestartReady,
     Reload(mpsc::Sender<Result<Snapshot, ToggleError>>),
@@ -102,6 +103,7 @@ fn is_finish_admission(owner: u64) -> bool {
 }
 
 struct Inner {
+    startup_cancelled: Arc<AtomicU64>,
     tx: mpsc::Sender<Command>,
     snapshot: Arc<Mutex<Snapshot>>,
     admitted: Arc<AtomicU64>,
@@ -111,6 +113,7 @@ struct Inner {
     join: Mutex<Option<JoinHandle<()>>>,
 }
 struct RunSignals {
+    startup_cancelled: Arc<AtomicU64>,
     admitted: Arc<AtomicU64>,
     next_admission: Arc<AtomicU64>,
     restart_requested: Arc<AtomicU64>,
@@ -127,7 +130,9 @@ impl Controller {
         let next_admission = Arc::new(AtomicU64::new(FIRST_ADMISSION));
         let restart_requested = Arc::new(AtomicU64::new(0));
         let shutdown = Arc::new(AtomicBool::new(false));
+        let startup_cancelled = Arc::new(AtomicU64::new(0));
         let signals = RunSignals {
+            startup_cancelled: startup_cancelled.clone(),
             admitted: admitted.clone(),
             next_admission: next_admission.clone(),
             restart_requested: restart_requested.clone(),
@@ -136,6 +141,7 @@ impl Controller {
         let join =
             std::thread::spawn(move || run(rx, shared, signals, root, Box::new(delivery), updates));
         Self(Arc::new(Inner {
+            startup_cancelled,
             tx,
             snapshot,
             admitted,
@@ -150,6 +156,23 @@ impl Controller {
     }
     pub fn toggle(&self) -> Result<Snapshot, ToggleError> {
         let expected = self.status();
+        if expected.state == State::Starting {
+            let current = self.0.snapshot.lock().unwrap();
+            if current.state != State::Starting || current.generation != expected.generation {
+                return Err(ToggleError::Busy);
+            }
+            self.0
+                .startup_cancelled
+                .store(current.generation, Ordering::Release);
+            // Wake startup directly, rather than wait behind its admission.
+            // The queued command also covers readiness winning the race:
+            // it runs before any later Recording toggle can be admitted.
+            self.0
+                .tx
+                .send(Command::CancelStartup(current.generation))
+                .map_err(|_| ToggleError::Unavailable)?;
+            return Ok(current.clone());
+        }
         if matches!(
             expected.state,
             State::Stopping
@@ -451,6 +474,18 @@ fn run(
                 }
                 break;
             }
+            Ok(Command::CancelStartup(requested)) => {
+                if requested == generation {
+                    if let Some((c, w, _, _, _, show_timer, _)) = active.take() {
+                        w.cancel();
+                        c.cancel();
+                        publish(State::Cancelled, generation, None, None, show_timer);
+                    }
+                    if shared.lock().unwrap().state == State::Cancelled {
+                        terminal_until = Some(Instant::now() + Duration::from_secs(2));
+                    }
+                }
+            }
             Ok(Command::Reload(reply)) => {
                 let result = if shared.lock().unwrap().state != State::Idle || active.is_some() {
                     Err(ToggleError::Busy)
@@ -491,9 +526,10 @@ fn run(
                         &mut generation,
                         &root,
                         signals.shutdown.clone(),
+                        signals.startup_cancelled.clone(),
                         &publish,
                     );
-                    if result.is_err() {
+                    if active.is_none() {
                         terminal_until = Some(Instant::now() + Duration::from_secs(2));
                     }
                     result
@@ -619,15 +655,15 @@ fn run(
             terminal_until = None;
             let show_timer = shared.lock().unwrap().show_timer;
             publish(State::Idle, generation, None, None, show_timer);
-            if start_active(
+            let _ = start_active(
                 &mut active,
                 &mut generation,
                 &root,
                 signals.shutdown.clone(),
+                signals.startup_cancelled.clone(),
                 &publish,
-            )
-            .is_err()
-            {
+            );
+            if active.is_none() {
                 terminal_until = Some(Instant::now() + Duration::from_secs(2));
             }
             let _ = signals.restart_requested.compare_exchange(
@@ -651,6 +687,7 @@ fn start_active<F>(
     generation: &mut u64,
     root: &Path,
     shutdown: Arc<AtomicBool>,
+    startup_cancelled: Arc<AtomicU64>,
     publish: &F,
 ) -> Result<Snapshot, ToggleError>
 where
@@ -666,7 +703,19 @@ where
             .map_err(|e| e.to_string())?;
         publish(State::Starting, *generation, None, None, cfg.show_timer);
         let (pcm, wav) = capture.paths();
-        let worker = worker::Worker::start(&path, wav, pcm, &cfg.provider, shutdown)?;
+        let worker = worker::Worker::start_recording(
+            &path,
+            wav,
+            pcm,
+            &cfg.provider,
+            shutdown.clone(),
+            worker::Startup {
+                cancelled_generation: startup_cancelled.clone(),
+                generation: *generation,
+                capture_deadline: capture.started_at()
+                    + Duration::from_secs(cfg.recording.max_seconds as u64),
+            },
+        )?;
         Ok((
             capture,
             worker,
@@ -699,6 +748,11 @@ where
             ))
         }
         Err(error) => {
+            if startup_cancelled.load(Ordering::Acquire) == *generation
+                || shutdown.load(Ordering::Acquire)
+            {
+                return Ok(publish(State::Cancelled, *generation, None, None, true));
+            }
             let message = format!("capture failed: {error}");
             if let Some(enabled) = loaded_notifications {
                 desktop::notify(
@@ -981,6 +1035,45 @@ mod tests {
         }
         let guard = Shutdown(controller.clone());
         let start = Instant::now();
+        if let Ok(mode) = std::env::var("SAYALL_TEST_STARTUP_INTERRUPT") {
+            let starter = controller.clone();
+            let start_thread = std::thread::spawn(move || starter.toggle());
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while controller.status().state != State::Starting {
+                assert!(Instant::now() < deadline, "startup was not entered");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            if mode == "cancel" {
+                controller.toggle().unwrap();
+            } else if mode == "shutdown" {
+                controller.shutdown_and_join();
+            } else {
+                assert_eq!(mode, "limit");
+            }
+            let result = start_thread.join().unwrap();
+            assert!(start.elapsed() < Duration::from_secs(4));
+            if mode == "limit" {
+                assert!(result.is_err());
+                assert_eq!(controller.status().state, State::Error);
+                assert!(
+                    controller
+                        .status()
+                        .message
+                        .unwrap()
+                        .contains("recording limit")
+                );
+            } else {
+                assert_eq!(result.unwrap().state, State::Cancelled);
+            }
+            drop(guard);
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+            println!(
+                "SAYALL_LOCAL_TIMING {{\"startup_interrupt_ms\":{}}}",
+                start.elapsed().as_millis()
+            );
+            return;
+        }
         assert_eq!(controller.toggle().unwrap().state, State::Recording);
         let startup_ms = start.elapsed().as_millis();
         if std::env::var_os("SAYALL_TEST_CANCEL_LOCAL").is_some() {
@@ -1191,6 +1284,33 @@ mod tests {
     }
 
     #[test]
+    fn starting_stop_bypasses_start_admission_without_queueing_a_restart() {
+        let (tx, rx) = mpsc::channel();
+        let controller = Controller(Arc::new(Inner {
+            tx,
+            snapshot: Arc::new(Mutex::new(Snapshot {
+                state: State::Starting,
+                generation: 7,
+                ..Snapshot::default()
+            })),
+            admitted: Arc::new(AtomicU64::new(FIRST_ADMISSION)),
+            next_admission: Arc::new(AtomicU64::new(FIRST_ADMISSION + 2)),
+            restart_requested: Arc::new(AtomicU64::new(0)),
+            startup_cancelled: Arc::new(AtomicU64::new(0)),
+            shutdown: Arc::new(AtomicBool::new(false)),
+            join: Mutex::new(None),
+        }));
+        assert_eq!(controller.toggle().unwrap().state, State::Starting);
+        assert!(matches!(rx.recv().unwrap(), Command::CancelStartup(7)));
+        assert_eq!(controller.0.startup_cancelled.load(Ordering::Acquire), 7);
+        assert_eq!(
+            controller.0.admitted.load(Ordering::Acquire),
+            FIRST_ADMISSION
+        );
+        assert_eq!(controller.0.restart_requested.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
     fn concurrent_toggles_admit_exactly_one_mutation() {
         let (tx, rx) = mpsc::channel();
         let inner = Arc::new(Inner {
@@ -1200,6 +1320,7 @@ mod tests {
             next_admission: Arc::new(AtomicU64::new(FIRST_ADMISSION)),
             restart_requested: Arc::new(AtomicU64::new(0)),
             shutdown: Arc::new(AtomicBool::new(false)),
+            startup_cancelled: Arc::new(AtomicU64::new(0)),
             join: Mutex::new(None),
         });
         let controller = Controller(inner);
@@ -1255,6 +1376,7 @@ mod tests {
             next_admission: next_admission.clone(),
             restart_requested: restart_requested.clone(),
             shutdown: Arc::new(AtomicBool::new(false)),
+            startup_cancelled: Arc::new(AtomicU64::new(0)),
             join: Mutex::new(None),
         }));
         let (accepted_tx, accepted_rx) = mpsc::channel();
@@ -1345,6 +1467,7 @@ mod tests {
                 next_admission: Arc::new(AtomicU64::new(FIRST_ADMISSION + 2)),
                 restart_requested: restart_requested.clone(),
                 shutdown: Arc::new(AtomicBool::new(false)),
+                startup_cancelled: Arc::new(AtomicU64::new(0)),
                 join: Mutex::new(None),
             }));
 
@@ -1371,6 +1494,7 @@ mod tests {
             next_admission: Arc::new(AtomicU64::new(FIRST_ADMISSION + 2)),
             restart_requested: restart_requested.clone(),
             shutdown: Arc::new(AtomicBool::new(false)),
+            startup_cancelled: Arc::new(AtomicU64::new(0)),
             join: Mutex::new(None),
         }));
 
@@ -1404,6 +1528,7 @@ mod tests {
             next_admission: Arc::new(AtomicU64::new(FIRST_ADMISSION)),
             restart_requested: restart_requested.clone(),
             shutdown: Arc::new(AtomicBool::new(false)),
+            startup_cancelled: Arc::new(AtomicU64::new(0)),
             join: Mutex::new(None),
         }));
         let mut locked_snapshot = snapshot.lock().unwrap();
@@ -1445,6 +1570,7 @@ mod tests {
             next_admission: Arc::new(AtomicU64::new(FIRST_ADMISSION)),
             restart_requested: Arc::new(AtomicU64::new(0)),
             shutdown: Arc::new(AtomicBool::new(false)),
+            startup_cancelled: Arc::new(AtomicU64::new(0)),
             join: Mutex::new(None),
         });
         let controller = Controller(inner);
@@ -1458,7 +1584,7 @@ mod tests {
                 | Command::Reload(reply)
                 | Command::SetProcessingMode(_, reply)
                 | Command::SetOutputMethod(_, reply) => reply,
-                Command::RestartReady | Command::Shutdown => panic!(),
+                Command::RestartReady | Command::Shutdown | Command::CancelStartup(_) => panic!(),
             };
             count.fetch_add(1, Ordering::SeqCst);
             accepted_tx.send(()).unwrap();
@@ -1508,6 +1634,7 @@ mod tests {
             next_admission: Arc::new(AtomicU64::new(FIRST_ADMISSION)),
             restart_requested: Arc::new(AtomicU64::new(0)),
             shutdown: Arc::new(AtomicBool::new(false)),
+            startup_cancelled: Arc::new(AtomicU64::new(0)),
             join: Mutex::new(None),
         }));
 
@@ -1527,6 +1654,7 @@ mod tests {
             next_admission: Arc::new(AtomicU64::new(FIRST_ADMISSION)),
             restart_requested: Arc::new(AtomicU64::new(0)),
             shutdown: Arc::new(AtomicBool::new(false)),
+            startup_cancelled: Arc::new(AtomicU64::new(0)),
             join: Mutex::new(None),
         }));
 
@@ -1549,6 +1677,7 @@ mod tests {
             next_admission: Arc::new(AtomicU64::new(FIRST_ADMISSION)),
             restart_requested: Arc::new(AtomicU64::new(0)),
             shutdown: Arc::new(AtomicBool::new(false)),
+            startup_cancelled: Arc::new(AtomicU64::new(0)),
             join: Mutex::new(None),
         }));
 

@@ -9,6 +9,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 from pathlib import Path
 import subprocess
 import tempfile
@@ -24,7 +25,11 @@ def main():
     p.add_argument("--network-isolated", action="store_true", help="run under a new Linux user/network namespace")
     p.add_argument("--batch", action="store_true", help="compare the explicit local batch path")
     p.add_argument("--cancel", action="store_true", help="cancel during capture; assert no delivery and cleanup")
+    p.add_argument("--startup-interrupt", choices=("cancel", "limit", "shutdown"),
+                   help="delay worker startup and verify bounded stop plus audio cleanup")
     args = p.parse_args()
+    if args.startup_interrupt and (args.batch or args.cancel):
+        p.error("--startup-interrupt requires an incremental session without --cancel")
     bundle = args.bundle.resolve()
     fixture_source = args.fixture.resolve()
     assert fixture_source.stat().st_size <= 10 * 1024 * 1024
@@ -49,11 +54,23 @@ def main():
     try:
         with tempfile.TemporaryDirectory(prefix="sayall-local-live-") as directory:
             root = Path(directory)
+            if args.startup_interrupt:
+                # Delay only startup, retaining the bundle's actual protocol
+                # probe/readiness checks. No production fixture hook is added.
+                wrapper = root / "delayed-worker"
+                wrapper.write_text("#!/bin/sh\n"
+                                   'if [ "${1-}" = "--local-stream" ]; then /usr/bin/sleep 10; fi\n'
+                                   "exec " + shlex.quote(str(bundle / "sayall-process")) + ' "$@"\n')
+                wrapper.chmod(0o700)
+                sibling.unlink()  # this harness owns the link it just created
+                sibling.symlink_to(wrapper)
             parent = root / "config/sayall"
             parent.mkdir(parents=True, mode=0o700)
             parent.chmod(0o700)
             config = {"stt": {"provider": "local", "local_model_path": str(model), "streaming": not args.batch},
                       "processing": {"mode": "clean"}, "notifications": False}
+            if args.startup_interrupt == "limit":
+                config["recording"] = {"max_seconds": 1}
             config_file = parent / "config.json"
             config_file.write_text(json.dumps(config))
             config_file.chmod(0o600)
@@ -71,6 +88,9 @@ def main():
                        SAYALL_TEST_SESSION_ROOT=str(scratch))
             env.pop("SAYALL_TEST_AUDIO_START_GATE", None)
             env.pop("SAYALL_TEST_CANCEL_LOCAL", None)
+            env.pop("SAYALL_TEST_STARTUP_INTERRUPT", None)
+            if args.startup_interrupt:
+                env["SAYALL_TEST_STARTUP_INTERRUPT"] = args.startup_interrupt
             if args.cancel:
                 env["SAYALL_TEST_CANCEL_LOCAL"] = "1"
             command = [str(executable), "--ignored", "--exact",
@@ -85,7 +105,9 @@ def main():
             timing = re.search(rb'SAYALL_LOCAL_TIMING (\{[^\n]+\})', result.stdout)
             if not timing:
                 raise RuntimeError("missing content-free test timing")
-            print("PASS:", "cancellation without delivery" if args.cancel else "Q8 lifecycle and exactly-one dummy delivery",
+            label = ("startup " + args.startup_interrupt) if args.startup_interrupt else (
+                "cancellation without delivery" if args.cancel else "Q8 lifecycle and exactly-one dummy delivery")
+            print("PASS:", label,
                   "with audio cleanup", json.loads(timing.group(1)))
     finally:
         sibling.unlink()
