@@ -17,6 +17,12 @@ import time
 import wave
 
 
+# Batch hashes the model before the native helper's inference watchdog starts.
+MODEL_SETUP_BUDGET = 120
+COMPLETION_BUDGET = 150
+CLI_BUDGET = MODEL_SETUP_BUDGET + COMPLETION_BUDGET
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--cli", type=Path, required=True)
@@ -38,7 +44,7 @@ def main():
         def run(audio=wav, artifact=model, raw=False, executable=cli):
             result = subprocess.run([str(executable), "transcribe", str(audio), "--local",
                                      "--model-path", str(artifact), "--json"] + (["--raw"] if raw else []),
-                                    env=env, capture_output=True, timeout=150)
+                                    env=env, capture_output=True, timeout=CLI_BUDGET)
             assert result.stderr == b"", "unexpected diagnostics (contents withheld)"
             value = json.loads(result.stdout)
             assert value["version"] == 4 and value["transport"] == "local"
@@ -106,7 +112,8 @@ def main():
                                         stderr=subprocess.DEVNULL, env={})
                 try:
                     proc.stdin.write(json.dumps(current).encode()); proc.stdin.close()
-                    deadline = time.monotonic() + 10
+                    proc.stdin = None  # communicate() must not flush the closed pipe
+                    deadline = time.monotonic() + MODEL_SETUP_BUDGET
                     helper = None
                     while time.monotonic() < deadline and proc.poll() is None:
                         children = Path(f"/proc/{proc.pid}/task/{proc.pid}/children").read_text().split()
@@ -116,7 +123,8 @@ def main():
                     assert helper is not None, "native helper did not start"
                     if kind == "cancel":
                         proc.kill(); proc.wait(timeout=5)
-                        while time.monotonic() < deadline:
+                        cleanup_deadline = time.monotonic() + 5
+                        while time.monotonic() < cleanup_deadline:
                             stat = Path(f"/proc/{helper}/stat")
                             if not stat.exists() or stat.read_text().split()[2] == "Z": break
                             time.sleep(0.02)
@@ -126,8 +134,8 @@ def main():
                             os.kill(helper, signal.SIGALRM)
                         else:
                             os.replace(wrong, pinned)  # Never modifies the source model inode.
-                        frame = json.loads(proc.stdout.read())
-                        proc.wait(timeout=5)
+                        output, _ = proc.communicate(timeout=COMPLETION_BUDGET)
+                        frame = json.loads(output)
                         if kind == "timeout":
                             assert frame["error"] == "local_timeout"
                         else:

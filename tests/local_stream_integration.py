@@ -92,7 +92,7 @@ def main():
             try:
                 proc.stdin.write(json.dumps(request).encode() + b"\n"); proc.stdin.flush()
                 if kind == "delayed_startup":
-                    deadline = time.monotonic() + 30
+                    deadline = time.monotonic() + STARTUP_FRAME_TIMEOUT
                     while time.monotonic() < deadline:
                         children = Path(f"/proc/{proc.pid}/task/{proc.pid}/children").read_text().split()
                         if children:
