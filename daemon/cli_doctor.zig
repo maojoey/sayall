@@ -38,7 +38,9 @@ pub fn run(arena: std.mem.Allocator, io: std.Io, env: *const std.process.Environ
     if (audit.safe) {
         if (config.loadReadOnly(arena, io, env)) |cfg| {
             if (std.mem.eql(u8, cfg.stt.provider, "local")) {
-                config_detail = "local configuration valid; credentials not required (Q8 readiness is checked before capture)";
+                const local = localModeDiagnostic(builtin.os.tag);
+                config_ok = local.supported;
+                config_detail = local.detail;
             } else if (cfg.stt.api_key.len == 0) {
                 config_ok = false;
                 config_detail = "Deepgram credentials are missing";
@@ -102,6 +104,24 @@ pub fn run(arena: std.mem.Allocator, io: std.Io, env: *const std.process.Environ
         try line(arena, io, "Result: {d} failure(s), {d} warning(s)", .{ failures, warnings });
     }
     return if (failures == 0) 0 else 1;
+}
+
+fn localModeDiagnostic(os: std.Target.Os.Tag) struct { supported: bool, detail: []const u8 } {
+    return switch (os) {
+        .linux => .{ .supported = true, .detail = "local configuration valid; credentials not required (Q8 readiness is checked before capture)" },
+        .macos => .{ .supported = false, .detail = "native local recording is unsupported on macOS; select Deepgram for live recording" },
+        else => .{ .supported = false, .detail = "native local recording is unsupported on this platform" },
+    };
+}
+
+test "doctor distinguishes Linux local configuration from unsupported native hosts" {
+    const linux = localModeDiagnostic(.linux);
+    try std.testing.expect(linux.supported);
+    try std.testing.expect(std.mem.indexOf(u8, linux.detail, "readiness is checked before capture") != null);
+    const macos = localModeDiagnostic(.macos);
+    try std.testing.expect(!macos.supported);
+    try std.testing.expectEqualStrings("native local recording is unsupported on macOS; select Deepgram for live recording", macos.detail);
+    try std.testing.expect(!localModeDiagnostic(.windows).supported);
 }
 
 fn auditConfig(arena: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map) !ConfigAudit {
