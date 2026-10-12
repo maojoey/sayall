@@ -120,8 +120,14 @@ int main(int argc, char **argv) {
             while (true) {
                 if (finished.load(std::memory_order_relaxed)) finishing = true;
                 if (fstat(STDIN_FILENO, &stat) != 0 || stat.st_size < 0 ||
-                    static_cast<uint64_t>(stat.st_size) > max_pcm || static_cast<uint64_t>(stat.st_size) < consumed) return 2;
-                const size_t remaining = static_cast<size_t>(stat.st_size) - consumed;
+                    static_cast<uint64_t>(stat.st_size) < consumed) return 2;
+                // The host stops capture on a timer and trims its final chunk
+                // in place before finish. Never feed beyond 300s while waiting
+                // for that stop; the final worker check still requires exact
+                // agreement between consumed bytes, the PCM inode and WAV.
+                const size_t available = std::min(static_cast<uint64_t>(stat.st_size),
+                                                  static_cast<uint64_t>(max_pcm));
+                const size_t remaining = available - consumed;
                 if (remaining < sizeof(bytes) && !finishing) {
                     std::this_thread::sleep_for(std::chrono::milliseconds(10));
                     continue;

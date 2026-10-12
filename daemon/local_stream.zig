@@ -78,11 +78,7 @@ fn execute(gpa: std.mem.Allocator, io: std.Io, r: stream.Request, input: *std.Io
     // Only acknowledge after the helper has installed its finish handler and
     // loaded the verified model. Capture already runs into the bounded PCM file.
     try write(gpa, io, protocol.Ready{ .streaming = true });
-    const finish_line = (try input.takeDelimiter('\n')) orelse return error.Cancelled;
-    const finish = try std.json.parseFromSlice(stream.Finish, gpa, finish_line, .{});
-    defer finish.deinit();
-    if (finish.value.version != protocol.version or !std.mem.eql(u8, finish.value.command, "finish") or
-        finish.value.force_rest) return error.InvalidRequest;
+    try validateFinish(gpa, input.takeDelimiter('\n') catch return error.InvalidRequest);
     const started = std.Io.Clock.now(.awake, io).toMilliseconds();
     if (std.os.linux.kill(child.id.?, .USR1) != 0) return error.LocalFailed;
     const deadline: std.Io.Timeout = .{ .deadline = .fromNow(io, .{ .clock = .awake, .raw = .fromSeconds(local.result_timeout_seconds) }) };
@@ -119,6 +115,23 @@ fn execute(gpa: std.mem.Allocator, io: std.Io, r: stream.Request, input: *std.Io
         timing.processing_total_ms = elapsed;
     }
     return result;
+}
+
+fn validateFinish(gpa: std.mem.Allocator, line: ?[]const u8) !void {
+    const finish = std.json.parseFromSlice(stream.Finish, gpa, line orelse return error.InvalidRequest, .{}) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        return error.InvalidRequest;
+    };
+    defer finish.deinit();
+    if (finish.value.version != protocol.version or
+        !std.mem.eql(u8, finish.value.command, "finish") or finish.value.force_rest)
+        return error.InvalidRequest;
+}
+
+test "local finish rejects missing or malformed frames as protocol errors" {
+    for ([_]?[]const u8{ null, "", "{", "{}", "{\"version\":4,\"command\":1}", "{\"version\":3,\"command\":\"finish\"}" }) |line|
+        try std.testing.expectError(error.InvalidRequest, validateFinish(std.testing.allocator, line));
+    try validateFinish(std.testing.allocator, "{\"version\":4,\"command\":\"finish\",\"force_rest\":false}");
 }
 
 const Transcript = struct { text: []const u8, pcm_bytes: usize };

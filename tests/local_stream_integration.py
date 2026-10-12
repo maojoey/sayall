@@ -58,6 +58,7 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--bundle", type=Path, required=True)
     p.add_argument("--slow", action="store_true", help="exercise startup and completion beyond the former 10s/40s deadlines")
+    p.add_argument("--long", action="store_true", help="exercise the 300s PCM boundary with synthetic silence")
     args = p.parse_args()
     bundle = args.bundle.resolve()
     worker = bundle / "sayall-process"
@@ -78,9 +79,11 @@ def main():
         request = {"version": 4, "stt_provider": "local", "local_model_path": str(model),
                    "wav_path": str(wav), "pcm_path": str(pcm), "deepgram_api_key": "",
                    "llm_api_key": "", "processing_profile": "clean"}
-        kinds = ["silence", "invalid_finish", "timeout", "parent_death", "parent_death_paused", "disconnect"]
+        kinds = ["silence", "invalid_finish", "malformed_finish", "timeout", "parent_death", "parent_death_paused", "disconnect"]
         if args.slow:
             kinds.extend(("delayed_startup", "delayed_finish"))
+        if args.long:
+            kinds.append("maximum_tail")
         for kind in kinds:
             proc = subprocess.Popen([str(worker), "--local-stream"], stdin=subprocess.PIPE,
                                     stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env={}, start_new_session=True)
@@ -116,20 +119,36 @@ def main():
                     proc.kill()
                 elif kind == "disconnect":
                     proc.stdin.close()
+                    result = frame(proc, RESULT_FRAME_TIMEOUT)
+                    assert result["transport"] == "local"
+                    assert result["status"] == "error" and result["error"] == "invalid_request"
                 else:
                     if kind == "delayed_finish":
                         os.kill(helper, signal.SIGSTOP)
                     if kind == "timeout":
                         os.kill(helper, signal.SIGALRM)
                         time.sleep(.05)
+                    if kind == "maximum_tail":
+                        # Simulate a recorder's final chunk crossing the 300s
+                        # cap before the host's next duration-limit poll.
+                        with pcm.open("r+b") as out:
+                            out.truncate(9_600_000 + 3200)
+                        time.sleep(.5)
+                        assert not gone(helper), "helper rejected capture timer overshoot"
+                        with pcm.open("r+b") as out:
+                            out.truncate(9_600_000)
+                        with wave.open(str(wav), "wb") as out:
+                            out.setnchannels(1); out.setsampwidth(2); out.setframerate(16000)
+                            out.writeframes(bytes(9_600_000))
                     finish = {"version": 4, "command": "finish", "force_rest": kind == "invalid_finish"}
-                    proc.stdin.write(json.dumps(finish).encode() + b"\n"); proc.stdin.flush()
+                    encoded_finish = b"{" if kind == "malformed_finish" else json.dumps(finish).encode()
+                    proc.stdin.write(encoded_finish + b"\n"); proc.stdin.flush()
                     if kind == "delayed_finish":
                         resume = threading.Timer(46, resume_helper, args=(helper,))
                         resume.start()
                     result = frame(proc, RESULT_FRAME_TIMEOUT)
                     assert result["transport"] == "local"
-                    if kind in ("silence", "delayed_startup", "delayed_finish"):
+                    if kind in ("silence", "delayed_startup", "delayed_finish", "maximum_tail"):
                         assert result["status"] == "no_speech"
                     else:
                         assert result["status"] == "error"

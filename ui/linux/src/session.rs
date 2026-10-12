@@ -699,8 +699,11 @@ where
         loaded_notifications = Some(cfg.notifications);
         let path = worker::resolve().map_err(|e| e.to_string())?;
         worker::local_readiness(&path, &cfg.provider)?;
-        let capture = capture::Capture::start(root, *generation, &cfg.recording.source)
+        let mut capture = capture::Capture::start(root, *generation, &cfg.recording.source)
             .map_err(|e| e.to_string())?;
+        if cfg.provider.local_model_path.is_some() {
+            capture.set_pcm_limit(16_000 * 2 * 300);
+        }
         publish(State::Starting, *generation, None, None, cfg.show_timer);
         let (pcm, wav) = capture.paths();
         let worker = worker::Worker::start_recording(

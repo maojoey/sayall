@@ -28,7 +28,11 @@ interruption nor completion failure invokes a cloud or batch fallback.
 The opt-in native smoke harness supports `--startup-interrupt cancel`, `limit`
 and `shutdown` to verify prompt capture shutdown, zero delivery and audio cleanup
 against a deliberately delayed worker. The stream integration harness's `--slow`
-mode separately checks delayed readiness and completion.
+mode separately checks delayed readiness and completion; `--long` checks the
+300-second PCM boundary using synthetic silence. The local helper feeds at most
+300 seconds while waiting for the host's stop. The host trims any final recorder
+chunk beyond that cap in place before building the WAV, keeping the held PCM
+inode and finalized WAV consistent. Cloud capture is not truncated by this rule.
 
 ## Local question endings
 
