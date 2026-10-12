@@ -41,9 +41,10 @@ def main():
         shutil.copyfile(wav, private)
         private.chmod(0o600)
 
-        def run(audio=wav, artifact=model, raw=False, executable=cli):
-            result = subprocess.run([str(executable), "transcribe", str(audio), "--local",
-                                     "--model-path", str(artifact), "--json"] + (["--raw"] if raw else []),
+        def run(audio=wav, artifact=model, raw=False, executable=cli, explicit_local=True):
+            local_args = ["--local", "--model-path", str(artifact)] if explicit_local else []
+            result = subprocess.run([str(executable), "transcribe", str(audio), "--json"] +
+                                    local_args + (["--raw"] if raw else []),
                                     env=env, capture_output=True, timeout=CLI_BUDGET)
             assert result.stderr == b"", "unexpected diagnostics (contents withheld)"
             value = json.loads(result.stdout)
@@ -56,6 +57,20 @@ def main():
             assert r["status"] == "success" and r["text"]
             assert r["processing_profile"] == profile
             assert "local_stt_ms" in r["timing"] and "rest_stt_ms" not in r["timing"]
+        # Configured local mode must use the same worker supervision and
+        # preserve the configured profile, without requiring --local.
+        config_path = root / "sayall/config.json"
+        config_path.parent.chmod(0o700)
+        config_path.chmod(0o600)
+        for profile in ("clean", "verbatim"):
+            config_path.write_text(json.dumps({
+                "stt": {"provider": "local", "local_model_path": str(model)},
+                "processing": {"mode": profile},
+            }))
+            r = run(explicit_local=False)
+            assert r["status"] == "success" and r["text"]
+            assert r["processing_profile"] == profile
+        config_path.write_text("invalid cloud configuration")
         assert run(artifact=root / "missing.gguf")["error"] == "local_model_missing"
         wrong = root / "wrong.gguf"
         wrong.write_bytes(b"not the pinned model")

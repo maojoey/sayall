@@ -154,7 +154,7 @@ pub fn run(
 
     var output_buffer: [4096]u8 = undefined;
     var output_reader = child.stdout.?.reader(io, &output_buffer);
-    const response = if (options.local) readLocalOutput(arena, io, child.stdout.?, .{
+    const response = if (local_mode) readLocalOutput(arena, io, child.stdout.?, .{
         .deadline = .fromNow(io, .{ .clock = .awake, .raw = .fromSeconds(270) }),
     }) catch |err| {
         // This deadline includes hashing before the native helper (and its
@@ -164,7 +164,7 @@ pub fn run(
             .version = worker_protocol.version,
             .status = .@"error",
             .@"error" = batch.mapLocalError(err),
-            .processing_profile = if (options.raw) .verbatim else .clean,
+            .processing_profile = request.processing_profile,
             .transport = .local,
         };
         if (options.json) {
