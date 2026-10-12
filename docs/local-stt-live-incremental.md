@@ -18,9 +18,13 @@ startup as well. Cancellation is scoped to the session generation, including
 the race where readiness arrives just as the user cancels.
 
 After normal recording stops, both local modes allow the native helper's
-120-second finish watchdog, a 125-second Zig result deadline and a 150-second
-host completion budget. These are upper bounds, not expected latency. Neither
-startup interruption nor completion failure invokes a cloud or batch fallback.
+120-second finish watchdog and a 125-second Zig result deadline. Streaming has
+already initialized the model and gets a 150-second host completion budget.
+Explicit batch mode starts model hashing only after capture stops, so its host
+budget is 270 seconds: a separate 120-second setup allowance plus the full
+150-second completion allowance. These are bounded total budgets, not expected
+latency or a guarantee for arbitrarily slow filesystems. Neither startup
+interruption nor completion failure invokes a cloud or batch fallback.
 The opt-in native smoke harness supports `--startup-interrupt cancel`, `limit`
 and `shutdown` to verify prompt capture shutdown, zero delivery and audio cleanup
 against a deliberately delayed worker. The stream integration harness's `--slow`

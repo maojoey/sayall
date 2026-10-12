@@ -345,25 +345,32 @@ pub fn local_readiness(path: &Path, cfg: &ProviderConfig) -> Result<(), String> 
     Ok(())
 }
 
+const LOCAL_STARTUP_BUDGET: Duration = Duration::from_secs(120);
+const LOCAL_FINISH_BUDGET: Duration = Duration::from_secs(150);
+
 fn startup_timeout(cfg: &ProviderConfig) -> Duration {
     // Local startup includes hashing the 731 MB model, then up to 90s for the
     // helper to load it. Keep cloud connection readiness at its existing 2s.
-    Duration::from_secs(if cfg.local_model_path.is_some() {
-        120
+    if cfg.local_model_path.is_some() {
+        LOCAL_STARTUP_BUDGET
     } else {
-        2
-    })
+        Duration::from_secs(2)
+    }
 }
 
 fn completion_timeout(cfg: &ProviderConfig) -> Duration {
-    // Local batch inference and streaming backlog draining each have a 120s
-    // helper watchdog / 125s reader deadline. Include setup and cleanup margin.
-    // Cloud processing keeps its existing budget.
-    Duration::from_secs(if cfg.local_model_path.is_some() {
-        150
+    if cfg.local_model_path.is_none() {
+        return Duration::from_secs(45);
+    }
+    // Streaming has already hashed and loaded the model. Batch starts only
+    // after capture stops, so reserve a separate startup allowance for hashing
+    // before the helper's 120s watchdog / 125s reader deadline begins.
+    // This is a bounded total allowance, not an unlimited filesystem wait.
+    if cfg.streaming {
+        LOCAL_FINISH_BUDGET
     } else {
-        45
-    })
+        LOCAL_STARTUP_BUDGET + LOCAL_FINISH_BUDGET
+    }
 }
 
 impl Worker {
@@ -1113,9 +1120,25 @@ mod tests {
             assert_eq!(completion_timeout(&cfg), Duration::from_secs(45));
             assert_eq!(startup_timeout(&cfg), Duration::from_secs(2));
             cfg.local_model_path = Some(PathBuf::from("/models/q8.gguf"));
-            assert_eq!(completion_timeout(&cfg), Duration::from_secs(150));
+            assert_eq!(
+                completion_timeout(&cfg),
+                Duration::from_secs(if streaming { 150 } else { 270 })
+            );
             assert_eq!(startup_timeout(&cfg), Duration::from_secs(120));
         }
+    }
+
+    #[test]
+    fn local_batch_reserves_startup_before_the_full_finish_budget() {
+        let mut batch = config(false);
+        batch.local_model_path = Some("/models/q8.gguf".into());
+        let mut streaming = batch.clone();
+        streaming.streaming = true;
+        // Even if hashing uses the entire setup allowance, batch retains the
+        // streaming completion budget, which outlasts the 125s Zig reader.
+        let remaining = completion_timeout(&batch) - startup_timeout(&batch);
+        assert_eq!(remaining, completion_timeout(&streaming));
+        assert!(remaining > Duration::from_secs(125));
     }
 
     fn shutdown() -> Arc<AtomicBool> {
@@ -1263,7 +1286,7 @@ printf '%s' '{{"version":4,"status":"success","text":"local result","processing_
         )
         .unwrap();
         assert!(worker.running.is_none());
-        assert_eq!(worker.completion_timeout, Duration::from_secs(150));
+        assert_eq!(worker.completion_timeout, Duration::from_secs(270));
         assert_eq!(
             worker.finish_session().unwrap(),
             Outcome::Transcript {

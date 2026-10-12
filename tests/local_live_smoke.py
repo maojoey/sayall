@@ -97,9 +97,11 @@ def main():
                        "session::tests::real_local_capture_pipeline_delivers_once_and_cleans_audio", "--test-threads=1", "--nocapture"]
             if args.network_isolated:
                 command = ["unshare", "--user", "--map-root-user", "--net"] + command
-            # 120s startup + at most 30s fixture + 150s completion, plus
-            # 30s for capture tail, delivery and shutdown/cleanup overhead.
-            result = subprocess.run(command, env=env, capture_output=True, timeout=330)
+            # Batch completion also reserves 120s for model hashing/setup.
+            # Bound the harness above startup + fixture + completion + cleanup.
+            completion_budget = 270 if args.batch else 150
+            session_budget = 120 + 30 + completion_budget + 30
+            result = subprocess.run(command, env=env, capture_output=True, timeout=session_budget)
             if result.returncode:
                 raise RuntimeError("native live pipeline check failed; output withheld to avoid content logging")
             timing = re.search(rb'SAYALL_LOCAL_TIMING (\{[^\n]+\})', result.stdout)
