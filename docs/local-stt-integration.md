@@ -1,141 +1,109 @@
-# Q8-only local transcription (development slice)
+# Local Q8 implementation and validation
 
-The first local mode uses **Parakeet Unified English 0.6B Q8_0**, automatically.
-There is no model picker, Q4 integration, translation, cloud fallback, or API-key
-requirement. Q4 selection is deferred to SAY-97. Existing cloud users are not automatically switched.
+Local mode is opt-in, English-only Parakeet Unified Q8, with Clean or Verbatim.
+It has no API-key requirement, implicit download, model/cloud fallback, Polished,
+translation or recognition keyterms. Existing cloud configurations are unchanged.
+Linux owns microphone capture, cancellation, HUD and final delivery. Zig owns
+validation, model identity, inference supervision and deterministic cleanup.
+Native macOS local recording is explicitly unsupported; compile checks do not
+qualify native inference on other platforms.
 
-Linux live dictation can now use Q8 with the existing microphone, HUD and
-at-most-once delivery path. `stt.streaming: true` enables incremental inference
-while recording; `false` retains batch after stop. See
-[Linux local testing](linux-local-testing.md) for isolated installation and rollback,
-and [incremental results](local-stt-incremental.md) for measurements. Model residency
-between recordings, installation UX and release packaging remain separate work. Parakeet distribution
-licensing and physical macOS qualification are still release gates.
+See [Linux setup](linux-local-testing.md) and [model preparation](own-q8-conversion.md).
+Standard release assembly does not yet include the optional model/helper.
 
-## Build and use
+## CLI and model boundary
 
-Normal Zig builds do not download models or build a third-party runtime. Build
-the CLI/worker, then explicitly prepare the pinned CPU runtime and Q8 helper:
+Use the matched bundle CLI, worker and helper:
 
 ```sh
-zig build -Doptimize=ReleaseFast
-zig build process -Doptimize=ReleaseFast
-python3 scripts/build-local-q8.py --prepare
-
-zig-out/bin/sayall transcribe /absolute/clip.wav --local \
-  --model-path "$PWD/dist/local-stt-benchmark/models/parakeet-unified-en-0.6b-Q8_0.gguf"
+/absolute/bundle/sayall transcribe /absolute/clip.wav --local \
+  --model-path /absolute/bundle/models/sayall-parakeet-unified-en-0.6b-Q8_0.gguf
 ```
 
-The script downloads **only Q8**, not Q4 or Whisper. If the benchmark runtime
-is already prepared, omit `--prepare` to verify its fingerprints and build just
-the new helper. It requires Python 3, Git, CMake, Ninja and a C++17 compiler.
-The development helper uses build-tree shared libraries and native CPU flags;
-it is **not a portable release artifact**. Do not copy it into release packages.
+Clean is the default; `--raw` selects Verbatim. `--json` emits the canonical
+result with `transport: "local"` and optional `timing.local_stt_ms`.
+Configured `stt.provider: "local"` also bypasses credential resolution.
+Without an explicit model path, lookup retains the compatibility filename
+`sayall/models/parakeet-unified-en-0.6b-Q8_0.gguf` under nonempty
+`XDG_DATA_HOME`, otherwise `$HOME/.local/share`. Nothing is downloaded.
 
-- `--local`: Q8, English, deterministic **Clean** by default.
-- `--raw`: **Verbatim** instead; no semantic/LLM cleanup.
-- `--json`: canonical worker result, including `transport: "local"` and
-  `timing.local_stt_ms`. Human output remains transcript-only.
-- `--model-path`: an absolute regular Q8 file path, not a model selector.
-  Symlinks and any other model revision/quantization are rejected.
-- Without `--model-path`, lookup is
-  `$XDG_DATA_HOME/sayall/models/parakeet-unified-en-0.6b-Q8_0.gguf`, or
-  `$HOME/.local/share/sayall/models/parakeet-unified-en-0.6b-Q8_0.gguf`.
-  This does not install/download anything.
+Audio must be mono s16le, 16 kHz, 0.3–300 seconds, WAV size at most 10 MiB.
+The CLI copies input to private scratch storage. Worker audio paths must be
+absolute, private regular files; unsafe permissions, symlinks and aliases are
+rejected. Model size and SHA-256 are checked on a held read-only handle that
+stays open during inference. Model updates must use immutable artifacts and
+atomic replacement, never in-place modification. The runtime retains recognition
+of the previous pinned Q8 artifact for compatibility; builders distribute only
+the direct NVIDIA-source artifact.
 
-Inputs retain the existing limit: mono 16-bit PCM WAV at 16 kHz, 0.3–300 seconds,
-up to 10 MiB. Arbitrary validated WAV chunk layouts are supported. Explicit `--local` mode
-bypasses cloud configuration. Configured `stt.provider: "local"` also selects
-Q8, without resolving provider credentials or loading legacy
-keyword stores. Cloud formatting fields are not forwarded. Polished/legacy processing,
-non-English language requests and provider formatting/keyterm options are
-rejected by the local worker path rather than silently ignored or sent online.
+Zig launches only the fixed sibling `sayall-local-q8`, with an empty environment,
+four CPU threads and no core dumps. The private helper receives the verified
+model handle on fd 2 (not stderr), suppresses native logs and emits a single
+bounded result. Cancellation, parent death, timeout and completion terminate
+and reap it. No model is retained between recordings.
 
-Missing models, checksum mismatches, missing runtime, native failures and
-native timeouts have distinct error codes. A missing model/runtime does not
-launch a browser, install dependencies, or fall back to Deepgram.
+## Protocol and lifecycle
 
-## Ownership and private boundary
+Worker protocol v4 must be updated together across Zig, Rust, Swift and fixtures;
+v3 is rejected. Host control remains v2, with legacy Linux control v1.
+Local requests contain empty credential fields, `stt_provider: "local"`,
+`local_model_path`, and local-compatible processing settings. Unknown fields
+and unsupported features fail closed.
 
-The public CLI copies audio into its existing private scratch directory and
-sends the bounded request to `sayall-process`. Zig owns validation, Q8 identity,
-provider selection, deterministic cleanup and canonical results. It launches
-only the fixed sibling `sayall-local-q8`, never an executable supplied by a
-request. Native UIs do not invoke the CLI or the native helper directly.
+With `stt.streaming: true`, the host starts `sayall-process --local-stream`
+with growing `pcm_path` and `wav_path`. The worker emits `ready` after model
+initialization. After capture is flushed, the host sends `finish` and receives
+one final result—never partial typing. Stream failure does not trigger batch
+fallback. Explicit `streaming: false` performs batch inference after capture.
 
-The worker validates Q8's exact 731,357,568-byte size and SHA-256
-`4b50b6dd862bf6e346929aaf4f5eaacec003bfa3f56462d6c874b41ef2f38795`.
-It keeps the verified read-only model handle open through inference, so an
-atomic pathname replacement cannot substitute another model between validation
-and loading. Do not modify model files in place while in use; a future installer
-must use immutable artifacts and atomic installation/removal rules.
+- Startup: 120-second host budget, including a 90-second helper initialization
+  budget. Generation-scoped cancellation also covers readiness races.
+- Recording limit during startup: freeze capture, preserve audio and finalize
+  after readiness. Explicit cancellation, capture failure and shutdown discard
+  audio without delivery.
+- Completion: 120-second helper finish watchdog, 125-second Zig result deadline,
+  150-second streaming host budget. Batch/CLI allow 270 seconds including setup.
+  Repeated finish signals do not extend the helper watchdog.
+- PCM is capped at 300 seconds. Native capture trims final recorder overshoot
+  in place before WAV generation, preserving the worker's held inode.
+- These are failure bounds, not expected latency. Cloud budgets are unchanged.
 
-The development native-helper protocol is private and deliberately minimal:
-
-- argv carries only the worker PID, to reject orphan startup even under a
-  subreaper; stdin carries validated bounded s16le/16kHz/mono PCM until EOF.
-- fd 2 carries the verified model handle, **not stderr**. The helper duplicates
-  it, redirects stderr to `/dev/null`, and loads through `/dev/fd/<handle>`.
-- stdout contains one bounded version-1 `{version,model,text}` result. Native
-  logging is disabled and third-party stdout is suppressed during inference.
-- The child environment is empty. CPU-only inference uses four threads.
-- A native 120-second alarm includes input reads/load/inference. A parent-death
-  watcher exits within roughly 100 ms after worker cancellation. Worker-side
-  output collection is also bounded and timed; all exits reap/kill the child.
-- Native core dumps are disabled. Session destruction and process exit release
-  weights/audio/decoder state; this slice is intentionally not warm/persistent.
-
-Local timing includes model hashing/loading and helper startup, unlike the warm
-benchmark numbers. Do not claim streaming latency or Deepgram parity from it.
-
-## Worker protocol v4
-
-The private worker contract is now **v4**, updated together in Zig, Rust, Swift,
-shared fixtures, and the provider benchmark harness. Host control remains v2;
-legacy Linux control remains v1.
-
-Batch requests add `stt_provider` (`deepgram` by default, or `local`) and
-`local_model_path`. Existing required key fields remain present but must be
-empty in local requests. All unknown fields/providers are rejected.
-Linux `sayall-process --local-stream` accepts a v4 local request with
-`local_model_path` and a growing `pcm_path` alongside `wav_path`. It emits
-`ready` after model initialization, accepts the host's `finish` frame after
-capture is flushed, and returns one finalized local result. It never falls
-back to cloud or batch on stream failure. See
-[the live-incremental contract](local-stt-live-incremental.md) for the native
-host lifecycle and complete request constraints.
-
-Results add closed transport `local`, optional `local_stt_ms`, and error codes
-`local_model_missing`, `local_model_invalid`, `local_unavailable`, `local_failed`,
-`local_timeout`, and `unsupported_features`. Local timing does not populate
-Deepgram connection/finalization or REST timing fields. Result readers reject
-v3; CLI/worker/native hosts must be updated together, never independently.
+Malformed frames/audio requests return `invalid_request`. Other local errors
+are `local_model_missing`, `local_model_invalid`, `local_unavailable`,
+`local_failed`, `local_timeout` and `unsupported_features`.
 
 ## Checks
 
 ```sh
-zig build test test-batch
-zig build check-darwin-core check-darwin-cli check-windows-core
+zig build test test-batch check-darwin-core check-darwin-cli check-windows-core
 cargo test --locked --manifest-path ui/linux/Cargo.toml
-python3 -m unittest discover -s tests/deepgram_benchmark -p 'test_*.py'
-
-# Explicit real-model tests: no downloads or transcript logging.
-python3 tests/local_stt_integration.py \
-  --cli zig-out/bin/sayall \
-  --model dist/local-stt-benchmark/models/parakeet-unified-en-0.6b-Q8_0.gguf \
-  --wav /absolute/consented-fixture.wav
+python3 tests/test_local_q8_licenses.py
+python3 tests/test_third_party_licenses.py
+python3 tests/test_convert_local_q8.py
 ```
 
-On Linux with user namespaces enabled, prefix the real-model test command with
-`unshare --user --map-root-user --net` to run without an external network.
-Set `TMPDIR="$PWD/dist"` before that command to exercise atomic model replacement
-on the same filesystem as the downloaded model (otherwise that check skips).
-This demonstrates offline operation, not an audit of every attempted syscall.
-The integration test covers both profiles despite malformed cloud configuration
-and synthetic provider keys, silence, bad/missing models, malformed audio,
-unsupported requests, v3 rejection, absent runtime, output overflow, and Linux
-worker cancellation/native timeout. A same-size sparse corrupt model exercises
-checksum rejection, and atomic pathname replacement exercises verified-handle
-loading. No private audio/transcript is logged.
-macOS cancellation, `/dev/fd` runtime loading and native inference require
-physical qualification; cross-compilation is not evidence of support.
+Real-model tests require explicitly prepared artifacts; no downloads or
+transcript logging occur:
+
+```sh
+python3 tests/local_stt_integration.py --cli /absolute/bundle/sayall \
+  --model /absolute/bundle/models/sayall-parakeet-unified-en-0.6b-Q8_0.gguf \
+  --wav /absolute/consented-fixture.wav
+unshare --user --map-root-user --net \
+  python3 tests/local_stream_integration.py --bundle /absolute/bundle
+python3 tests/local_live_smoke.py --network-isolated --bundle /absolute/bundle \
+  --fixture /absolute/consented-fixture.wav
+```
+
+File tests cover both profiles, configured mode, invalid cloud config isolation,
+model/input failures, protocol rejection, bounded output, cancellation and atomic
+model replacement. Set `TMPDIR` to a private location on the model filesystem
+to exercise the replacement case rather than skipping it.
+
+Stream tests cover protocol/audio-path failures and helper lifecycle; `--slow`
+checks delayed readiness/completion and `--long` the 300-second boundary.
+Controller tests use paced fixture capture and dummy delivery, not a microphone
+or clipboard. Add `--batch`, `--cancel`, or
+`--startup-interrupt {cancel,limit,shutdown,capture-exit}` for those paths.
+Network isolation proves offline operation, not absence of attempted networking.
+Real paste behavior and physical platform qualification require separate checks.

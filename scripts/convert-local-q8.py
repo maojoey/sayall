@@ -2,7 +2,7 @@
 """Explicit, offline NVIDIA -> F32 -> Q8 conversion; never switches installed models.
 
 Run in the isolated conversion environment. Fetch the source explicitly first
-using tests/local_stt_benchmark/prepare.download and nvidia-source.json.
+using the pins in scripts/local-q8/; see docs/own-q8-conversion.md.
 This wrapper replaces only the upstream NeMo archive loader: bounded extraction,
 weights_only=True, CPU mmap. Tensor mapping and quantization are upstream code.
 """
@@ -18,8 +18,9 @@ import sys
 import tarfile
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "tests/local_stt_benchmark"))
-from prepare import sha256
+from local_q8_licenses import sha256
+
+PINS = ROOT / "scripts/local-q8"
 
 
 def extract_member(archive, suffix, destination, maximum):
@@ -41,8 +42,8 @@ def main():
     p.add_argument("--output", type=Path, required=True)
     args = p.parse_args()
     source, runtime, quantizer, output = (x.resolve() for x in (args.source, args.runtime, args.quantizer, args.output))
-    pin = json.loads((ROOT / "tests/local_stt_benchmark/nvidia-source.json").read_text())
-    runtime_pin = json.loads((ROOT / "tests/local_stt_benchmark/candidates.json").read_text())["runtimes"]["transcribe"]
+    pin = json.loads((PINS / "nvidia-source.json").read_text())
+    runtime_pin = json.loads((PINS / "runtime.json").read_text())
     if source.is_symlink() or source.stat().st_size != pin["bytes"] or sha256(source) != pin["sha256"]:
         raise ValueError("source does not match pinned NVIDIA weights")
     revision = subprocess.check_output(["git", "-C", str(runtime), "rev-parse", "HEAD"], text=True).strip()

@@ -171,9 +171,20 @@ def main():
                 if not proc.stdin.closed:
                     proc.stdin.close()
                 proc.stdout.close()
-        # Unsupported/credential-bearing requests fail before starting helpers.
+        # Unsupported/credential-bearing and invalid audio requests fail before inference.
+        unsafe_pcm = root / "unsafe.pcm"
+        unsafe_pcm.write_bytes(bytes(32000)); unsafe_pcm.chmod(0o644)
+        linked_pcm = root / "linked.pcm"
+        linked_pcm.symlink_to(pcm)
+        alias_wav = root / "alias.wav"
+        os.link(pcm, alias_wav)
         for change in ({"deepgram_api_key": "synthetic"}, {"stt_provider": "deepgram"},
-                       {"processing_profile": "polished"}, {"version": 3}):
+                       {"processing_profile": "polished"}, {"version": 3},
+                       {"wav_path": "relative.wav"}, {"pcm_path": "relative.pcm"},
+                       {"wav_path": ""}, {"pcm_path": ""},
+                       {"wav_path": str(root / "missing.wav")},
+                       {"pcm_path": str(unsafe_pcm)}, {"pcm_path": str(linked_pcm)},
+                       {"wav_path": str(alias_wav)}):
             result = subprocess.run([str(worker), "--local-stream"], input=json.dumps(request | change).encode() + b"\n",
                                     capture_output=True, env={}, timeout=5)
             assert json.loads(result.stdout)["error"] == "invalid_request"

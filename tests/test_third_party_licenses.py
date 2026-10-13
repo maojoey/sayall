@@ -52,6 +52,22 @@ class NoticeTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             notices.license_files(self.package, self.overrides)
 
+    def test_checked_in_shared_snapshots_keep_per_crate_validation(self):
+        manifest = json.loads((notices.OVERRIDES / "manifest.json").read_text())
+        for key, record in manifest.items():
+            with self.subTest(crate=key):
+                name, version = key.rsplit("@", 1)
+                package = dict(self.package, name=name, version=version)
+                vcs = self.crate / ".cargo_vcs_info.json"
+                vcs.write_text(json.dumps({"git": {"sha1": record["source_revision"]}}))
+                self.assertEqual(notices.license_files(package),
+                                 [notices.OVERRIDES / record["file"]])
+                vcs.write_text(json.dumps({"git": {"sha1": "wrong"}}))
+                with self.assertRaises(RuntimeError):
+                    notices.license_files(package)
+        self.assertEqual(manifest["gl@0.14.0"]["file"],
+                         manifest["gl_generator@0.14.0"]["file"])
+
     def test_r_efi_preserves_own_authors_license(self):
         self.package.update(name="r-efi", version="6.0.0")
         authors = self.crate / "AUTHORS"

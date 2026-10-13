@@ -17,8 +17,6 @@ jobs:
         run: zig build test
       - name: Test acoustic transcript scoring
         run: python3 -m unittest discover -s tests/acoustic_e2e -p 'test_*.py'
-      - name: Test local model benchmark harness (no downloads or provider calls)
-        run: python3 -m unittest discover -s tests/local_stt_benchmark -p 'test_*.py'
       - name: Test Q8 license packet (no downloads)
         run: python3 tests/test_local_q8_licenses.py
       - name: Test dependency notice collection (no downloads)

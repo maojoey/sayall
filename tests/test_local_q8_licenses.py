@@ -14,64 +14,6 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import local_q8_licenses as licenses
 
 
-class LicenseTests(unittest.TestCase):
-    def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
-        self.packet = self.root / "packet"
-        shutil.copytree(licenses.PACKET, self.packet)
-        catalog = json.loads((ROOT / "tests/local_stt_benchmark/candidates.json").read_text())
-        self.model = next(m for m in catalog["models"] if m["id"] == "parakeet-unified-en-q8")
-
-    def test_install_retains_all_notices_and_unresolved_status(self):
-        out = self.root / "bundle"
-        status = licenses.install(self.model, out, self.packet)
-        self.assertEqual(status, "conversion-scope-clarification-required")
-        for name in (*licenses.REQUIRED, "manifest.json"):
-            self.assertEqual((out / "licenses/local-q8" / name).read_bytes(), (self.packet / name).read_bytes())
-        self.assertIn("Licensed by NVIDIA Corporation under the NVIDIA Open Model License", (out / "Notice.txt").read_text())
-
-    def test_missing_document_fails_before_creating_bundle(self):
-        (self.packet / "CC-BY-4.0.txt").unlink()
-        with self.assertRaises(ValueError):
-            licenses.install(self.model, self.root / "bundle", self.packet)
-        self.assertFalse((self.root / "bundle").exists())
-
-    def test_modified_document_fails(self):
-        (self.packet / "Notice.txt").write_text("incorrect attribution")
-        with self.assertRaises(ValueError):
-            licenses.validate(self.model, self.packet)
-
-    def test_symlink_document_fails(self):
-        p = self.packet / "Notice.txt"
-        p.unlink()
-        p.symlink_to(licenses.PACKET / "Notice.txt")
-        with self.assertRaises(ValueError):
-            licenses.validate(self.model, self.packet)
-
-    def test_wrong_artifact_or_revision_fails(self):
-        for field in ("sha256", "revision"):
-            model = copy.copy(self.model)
-            model[field] = "unexpected"
-            with self.assertRaises(ValueError):
-                licenses.validate(model, self.packet)
-
-    def test_manifest_cannot_omit_notices_or_escape_packet(self):
-        for name in ("Notice.txt", "../outside"):
-            path = self.packet / "manifest.json"
-            original = path.read_text()
-            manifest = json.loads(original)
-            if name in manifest["files"]:
-                del manifest["files"][name]
-            else:
-                manifest["files"][name] = {"sha256": "invalid"}
-            path.write_text(json.dumps(manifest))
-            with self.assertRaises(ValueError):
-                licenses.validate(self.model, self.packet)
-            path.write_text(original)
-
-
 class OwnLicenseTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -83,9 +25,9 @@ class OwnLicenseTests(unittest.TestCase):
         (self.runtime_source / "ggml").mkdir(parents=True)
         (self.runtime_source / "LICENSE").write_text("synthetic runtime license")
         (self.runtime_source / "ggml/LICENSE").write_text("synthetic ggml license")
-        self.model = json.loads((ROOT / "tests/local_stt_benchmark/own-q8.json").read_text())
-        self.source_pin = json.loads((ROOT / "tests/local_stt_benchmark/nvidia-source.json").read_text())
-        self.runtime = json.loads((ROOT / "tests/local_stt_benchmark/candidates.json").read_text())["runtimes"]["transcribe"]
+        self.model = json.loads((ROOT / "scripts/local-q8/own-q8.json").read_text())
+        self.source_pin = json.loads((ROOT / "scripts/local-q8/nvidia-source.json").read_text())
+        self.runtime = json.loads((ROOT / "scripts/local-q8/runtime.json").read_text())
         originals = {
             "NVIDIA-OPEN-MODEL-LICENSE.md": licenses.PACKET / "NVIDIA-OPEN-MODEL-LICENSE.md",
             "NVIDIA-TRUSTWORTHY-AI-TERMS.md": licenses.PACKET / "NVIDIA-TRUSTWORTHY-AI-TERMS.md",
@@ -133,6 +75,31 @@ class OwnLicenseTests(unittest.TestCase):
         self.save()
         with self.assertRaises(ValueError):
             self.validate()
+
+    def test_missing_or_symlinked_documents_fail_before_install(self):
+        for relative in (*self.provenance["licenses"], "Notice.txt"):
+            with self.subTest(document=relative):
+                path = self.conversion / relative
+                original = path.read_bytes()
+                path.unlink()
+                out = self.root / "rejected-bundle"
+                with self.assertRaises(ValueError):
+                    licenses.install_own(self.conversion, self.model, self.runtime,
+                                         self.source_pin, self.runtime_source, out)
+                self.assertFalse(out.exists())
+                target = self.root / "outside-document"
+                target.write_bytes(original)
+                path.symlink_to(target)
+                with self.assertRaises(ValueError):
+                    self.validate()
+                path.unlink()
+                path.write_bytes(original)
+
+    def test_streaming_hash_matches_artifact_digest(self):
+        artifact = self.root / "artifact"
+        data = b"synthetic artifact" * 100000
+        artifact.write_bytes(data)
+        self.assertEqual(licenses.sha256(artifact), hashlib.sha256(data).hexdigest())
 
     def test_wrong_artifact_and_source_are_rejected(self):
         original = copy.deepcopy(self.provenance)

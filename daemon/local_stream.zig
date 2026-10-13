@@ -47,15 +47,16 @@ fn validate(r: stream.Request) !void {
         r.deepgram_smart_format or r.deepgram_punctuate or r.deepgram_dictation or
         r.deepgram_numerals or r.deepgram_measurements or
         !std.fs.path.isAbsolute(r.local_model_path) or
+        !std.fs.path.isAbsolute(r.wav_path) or !std.fs.path.isAbsolute(r.pcm_path) or
         std.mem.eql(u8, r.wav_path, r.pcm_path)) return error.InvalidRequest;
 }
 
 fn execute(gpa: std.mem.Allocator, io: std.Io, r: stream.Request, input: *std.Io.Reader) !batch.Result {
     if (builtin.os.tag != .linux) return error.UnsupportedPlatform;
     try validate(r);
-    const pcm = try secure_audio.open(io, r.pcm_path, 9_600_000, .growing);
+    const pcm = secure_audio.open(io, r.pcm_path, 9_600_000, .growing) catch return error.InvalidRequest;
     defer pcm.file.close(io);
-    const wav = try secure_audio.open(io, r.wav_path, batch.max_audio_bytes, .nonempty);
+    const wav = secure_audio.open(io, r.wav_path, batch.max_audio_bytes, .nonempty) catch return error.InvalidRequest;
     defer wav.file.close(io);
     if (secure_audio.sameFile(pcm.identity, wav.identity)) return error.InvalidRequest;
     const model = try local.openModel(io, r.local_model_path);
@@ -172,4 +173,12 @@ test "local stream rejects cloud, credentials, formatting and unsupported profil
     invalid = valid;
     invalid.deepgram_keyterms = &.{"unsupported"};
     try std.testing.expectError(error.InvalidRequest, validate(invalid));
+    for ([_][]const u8{ "", "relative.wav" }) |path| {
+        invalid = valid;
+        invalid.wav_path = path;
+        try std.testing.expectError(error.InvalidRequest, validate(invalid));
+        invalid = valid;
+        invalid.pcm_path = path;
+        try std.testing.expectError(error.InvalidRequest, validate(invalid));
+    }
 }

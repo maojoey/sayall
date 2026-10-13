@@ -3,11 +3,13 @@
 import importlib.util
 import io
 from pathlib import Path
+import sys
 import tarfile
 import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "scripts"))
 spec = importlib.util.spec_from_file_location("convert_local_q8", ROOT / "scripts/convert-local-q8.py")
 converter = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(converter)

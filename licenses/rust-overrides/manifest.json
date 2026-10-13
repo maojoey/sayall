@@ -1,30 +1,30 @@
 {
   "gtk4-layer-shell@0.7.1": {
-    "file": "gtk4-layer-shell-0.7.1-LICENSE",
+    "file": "gtk4-layer-shell-LICENSE",
     "sha256": "4cc6d27d63d65b3bfe5a10c81fa65d58d6a1f36f2523bdb1f11bc1b4fe6931cb",
     "url": "https://raw.githubusercontent.com/pentamassiv/gtk4-layer-shell-gir/2f5ea2f2ec7a03c411d6054168f612b229a77a46/LICENSE",
     "source_revision": "2f5ea2f2ec7a03c411d6054168f612b229a77a46"
   },
   "gtk4-layer-shell-sys@0.5.2": {
-    "file": "gtk4-layer-shell-sys-0.5.2-LICENSE",
+    "file": "gtk4-layer-shell-LICENSE",
     "sha256": "4cc6d27d63d65b3bfe5a10c81fa65d58d6a1f36f2523bdb1f11bc1b4fe6931cb",
     "url": "https://raw.githubusercontent.com/pentamassiv/gtk4-layer-shell-gir/0cb04b34abadb1980052899814cbe18f21e5c696/LICENSE",
     "source_revision": "0cb04b34abadb1980052899814cbe18f21e5c696"
   },
   "gl@0.14.0": {
-    "file": "gl-0.14.0-LICENSE",
+    "file": "gl-rs-LICENSE",
     "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
     "url": "https://raw.githubusercontent.com/rust-windowing/gl-rs/ea503e8d5fb6d73c6030e6191ce738cd3bf3433e/LICENSE",
     "source_revision": "ea503e8d5fb6d73c6030e6191ce738cd3bf3433e"
   },
   "gl_generator@0.14.0": {
-    "file": "gl_generator-0.14.0-LICENSE",
+    "file": "gl-rs-LICENSE",
     "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
     "url": "https://raw.githubusercontent.com/rust-windowing/gl-rs/ea503e8d5fb6d73c6030e6191ce738cd3bf3433e/LICENSE",
     "source_revision": "ea503e8d5fb6d73c6030e6191ce738cd3bf3433e"
   },
   "khronos_api@3.1.0": {
-    "file": "khronos_api-3.1.0-LICENSE",
+    "file": "gl-rs-LICENSE",
     "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
     "url": "https://raw.githubusercontent.com/rust-windowing/gl-rs/f150967b1c44ae888e6676f93f639ebc82771bdc/LICENSE",
     "source_revision": "f150967b1c44ae888e6676f93f639ebc82771bdc"

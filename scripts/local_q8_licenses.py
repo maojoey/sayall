@@ -5,39 +5,12 @@ from pathlib import Path
 import shutil
 
 PACKET = Path(__file__).resolve().parents[1] / "licenses/local-q8"
-REQUIRED = frozenset({
-    "NVIDIA-OPEN-MODEL-LICENSE.md", "NVIDIA-TRUSTWORTHY-AI-TERMS.md",
-    "CC-BY-4.0.txt", "Notice.txt", "README.md",
-})
-
-
-def validate(model, packet=PACKET):
-    manifest = json.loads((packet / "manifest.json").read_text())
-    if (manifest.get("schema_version") != 1
-            or manifest.get("model_sha256") != model["sha256"]
-            or manifest.get("conversion_revision") != model["revision"]):
-        raise ValueError("Q8 license evidence does not match this artifact")
-    if manifest.get("status") != "conversion-scope-clarification-required":
-        raise ValueError("Q8 license status changed; review bundle policy")
-    if set(manifest["files"]) != REQUIRED:
-        raise ValueError("Incomplete or unexpected Q8 license packet")
-    for name, record in manifest["files"].items():
-        path = packet / name
-        if path.is_symlink() or not path.is_file():
-            raise ValueError("Missing or symlinked Q8 license document")
-        if hashlib.sha256(path.read_bytes()).hexdigest() != record["sha256"]:
-            raise ValueError("Q8 license document differs from reviewed snapshot")
-    return manifest
-
-
-def install(model, prefix, packet=PACKET):
-    manifest = validate(model, packet)
-    destination = prefix / "licenses/local-q8"
-    destination.mkdir(parents=True, exist_ok=False)
-    for name in (*sorted(REQUIRED), "manifest.json"):
-        shutil.copyfile(packet / name, destination / name)
-    shutil.copyfile(packet / "Notice.txt", prefix / "Notice.txt")
-    return manifest["status"]
+def sha256(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def validate_own(conversion, model, runtime, source_pin, runtime_source):

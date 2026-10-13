@@ -12,15 +12,16 @@ No Deepgram/Cerebras keys or cloud fallback are used. Clean is the local
 default; Verbatim is also supported. Polished, other models, non-English and
 keyterms are explicitly rejected. Existing cloud users/configs are unchanged.
 Native macOS local recording remains unsupported and is rejected before keyring
-lookup. Physical macOS and distribution licensing remain release gates.
+lookup. Portable Linux packaging and distribution approval remain release gates.
 
 ## Build
 
-First explicitly prepare Q8 using `scripts/build-local-q8.py --prepare` as
-explained in [local integration](local-stt-integration.md). Then:
+First prepare the pinned runtime and direct NVIDIA-source Q8 conversion as
+explained in [model preparation](own-q8-conversion.md). Then:
 
 ```sh
 python3 scripts/build-local-live-linux.py \
+  --cache dist/local-q8 --own-conversion dist/local-q8/conversion \
   --prefix "$HOME/.local/share/sayall/test-builds/local-q8-live"
 ```
 
@@ -44,7 +45,7 @@ Create `<bundle>/config/sayall/` with mode `0700` and a `config.json` with mode
   "stt": {
     "provider": "local",
     "streaming": true,
-    "local_model_path": "/absolute/test-bundle/models/parakeet-unified-en-0.6b-Q8_0.gguf"
+    "local_model_path": "/absolute/test-bundle/models/sayall-parakeet-unified-en-0.6b-Q8_0.gguf"
   },
   "processing": { "mode": "clean" },
   "recording": { "max_seconds": 300, "min_ms": 300, "stop_tail_ms": 10 },
@@ -84,6 +85,7 @@ ExecStart=/absolute/test-bundle/sayall-hud --autostart
 Environment=XDG_CONFIG_HOME=/absolute/test-bundle/config
 UnsetEnvironment=DEEPGRAM_API_KEY CEREBRAS_API_KEY GROQ_API_KEY SAYALL_STT_MODEL SAYALL_LLM_MODEL SAYALL_TEST_AUDIO_FIXTURE SAYALL_TEST_AUDIO_START_GATE SAYALL_TEST_AUDIO_EOF_PATH
 RestrictAddressFamilies=AF_UNIX AF_NETLINK
+LimitCORE=0
 ```
 
 The address-family restriction keeps PipeWire, Wayland and D-Bus available
@@ -117,8 +119,7 @@ scratch cleanup. It never records a physical microphone, types, or changes the
 clipboard, and logs no transcripts. Use a 0.3–30-second public/consented fixture.
 It refuses to replace an existing test-worker sibling.
 
-Normal CI remains model-free. Real-model and physical-device checks are opt-in.
-The initial test build was additionally verified in a network namespace and
-with the service's address-family restriction. Physical microphone quality,
-real target-application paste behavior, longer sessions and warmed/streaming
-latency remain manual qualification items.
+Normal CI remains model-free. See [implementation and validation](local-stt-integration.md)
+for explicit real-model and failure-path checks. Physical microphone quality,
+real target-application paste behavior, sustained resource use and portable
+release packaging remain qualification items.

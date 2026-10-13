@@ -2,7 +2,9 @@
 
 These texts are copied verbatim from each crate's upstream repository at the
 revision in its `.cargo_vcs_info.json`. `manifest.json` records package version,
-URL, revision and SHA-256. Normal release assembly reads these files offline;
+URL, revision and SHA-256. Byte-identical license texts share a snapshot;
+each crate retains its own source revision and provenance entry.
+Normal release assembly reads these files offline;
 it never downloads an unpinned license or substitutes another author's MIT
 copyright notice. License updates require a new reviewed snapshot when the
 locked crate version/revision changes.

@@ -8,6 +8,6 @@
   "runtime_revision": "135d744cbb87dcac8a04dbc9bab1bb25ada5d701",
   "f32_sha256": "369a057c0f2dd2085055f41f989cde07d5e4b299376e31ed5f636093c75b821a",
   "license": "NVIDIA Open Model License",
-  "status": "pinned local-test artifact; engine parity and Linux native lifecycle checks passed; release qualification incomplete",
+  "status": "pinned development artifact; release qualification incomplete",
   "documentation": "docs/own-q8-conversion.md"
 }
