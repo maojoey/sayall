@@ -10,6 +10,8 @@ const secure_audio = @import("secure_audio.zig");
 pub const Request = struct {
     version: u32,
     wav_path: []const u8,
+    stt_provider: provider.Kind = .deepgram,
+    local_model_path: []const u8 = "",
     pcm_path: []const u8,
     deepgram_api_key: []const u8,
     deepgram_model: []const u8 = "nova-3",
@@ -149,6 +151,7 @@ fn readLine(reader: *std.Io.Reader) !?[]const u8 {
 }
 
 fn validateAndOpenAudio(io: std.Io, request: Request) !std.Io.File {
+    if (request.stt_provider != .deepgram or request.local_model_path.len != 0) return error.InvalidRequest;
     if (request.version != worker_protocol.version or request.deepgram_api_key.len == 0) return error.InvalidRequest;
     if (request.deepgram_dictation and !request.deepgram_punctuate) return error.InvalidRequest;
     if (!std.fs.path.isAbsolute(request.wav_path) or !std.fs.path.isAbsolute(request.pcm_path)) return error.InvalidRequest;
@@ -170,10 +173,12 @@ fn validateAndOpenAudio(io: std.Io, request: Request) !std.Io.File {
     return pcm.file;
 }
 
-fn batchRequest(request: Request) batch.Request {
+pub fn batchRequest(request: Request) batch.Request {
     return .{
         .version = request.version,
         .wav_path = request.wav_path,
+        .stt_provider = request.stt_provider,
+        .local_model_path = request.local_model_path,
         .deepgram_api_key = request.deepgram_api_key,
         .deepgram_model = request.deepgram_model,
         .deepgram_language = request.deepgram_language,
@@ -236,12 +241,12 @@ fn writeLine(io: std.Io, bytes: []const u8) !void {
 }
 
 test "stream request is strict and preserves regional provider settings" {
-    const json = "{\"version\":3,\"wav_path\":\"/tmp/a.wav\",\"pcm_path\":\"/tmp/a.pcm\",\"deepgram_api_key\":\"d\",\"deepgram_model\":\"nova-3\",\"deepgram_language\":\"en-GB\",\"deepgram_region\":\"eu\",\"llm_api_key\":\"\",\"processing_profile\":\"clean\"}";
+    const json = "{\"version\":4,\"wav_path\":\"/tmp/a.wav\",\"pcm_path\":\"/tmp/a.pcm\",\"deepgram_api_key\":\"d\",\"deepgram_model\":\"nova-3\",\"deepgram_language\":\"en-GB\",\"deepgram_region\":\"eu\",\"llm_api_key\":\"\",\"processing_profile\":\"clean\"}";
     const parsed = try parseRequest(std.testing.allocator, json);
     defer parsed.deinit();
     try std.testing.expectEqualStrings("eu", parsed.value.deepgram_region);
     try std.testing.expectEqualStrings("en-GB", batchRequest(parsed.value).deepgram_language);
     try std.testing.expectEqual(processing.Profile.clean, batchRequest(parsed.value).processing_profile);
     try std.testing.expectError(error.InvalidRequest, parseRequest(std.testing.allocator, json[0 .. json.len - 1]));
-    try std.testing.expectError(error.InvalidRequest, parseRequest(std.testing.allocator, "{\"version\":3,\"wav_path\":\"/tmp/a.wav\",\"pcm_path\":\"/tmp/a.pcm\",\"deepgram_api_key\":\"d\",\"llm_api_key\":\"\"}"));
+    try std.testing.expectError(error.InvalidRequest, parseRequest(std.testing.allocator, "{\"version\":4,\"wav_path\":\"/tmp/a.wav\",\"pcm_path\":\"/tmp/a.pcm\",\"deepgram_api_key\":\"d\",\"llm_api_key\":\"\"}"));
 }

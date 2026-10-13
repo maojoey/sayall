@@ -1,0 +1,5 @@
+# NVIDIA Agreements | Trustworthy AI
+
+**Ethical Use.** NVIDIA is committed to safety, trust and transparency in AI development. NVIDIA encourages you to (a) ensure that the product or service you develop, use, offer as a service or distribute meets the legal and ethical requirements of the relevant industry or use case, (b) take reasonable measures to address unintended bias and to mitigate harm to others, including underrepresented or vulnerable groups, and (c) inform users of the nature and limitations of the product or service.
+
+**Prohibited Uses.** NVIDIA expressly prohibits the use of its products or services for any purpose in violation of applicable law or regulation, including but not limited to (a) illegal surveillance, (b) illegal collection or processing of biometric information without the consent of the subject where required under applicable law, or (c) illegal harassment, abuse, threatening or bullying of individuals or groups of individuals or intentionally misleading or deceiving others.

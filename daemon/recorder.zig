@@ -20,6 +20,11 @@ pub fn inspectWav(bytes: []const u8) error{InvalidWav}!WavInfo {
     return (try parseWav(bytes)).info;
 }
 
+/// Returns the validated PCM chunk without assuming a 44-byte header.
+pub fn pcmData(bytes: []const u8) error{InvalidWav}![]const u8 {
+    return (try parseWav(bytes)).data;
+}
+
 /// Measures the signal in a 16-bit PCM WAV. A peak of zero is digital silence.
 pub fn analyzeLevels(bytes: []const u8) error{InvalidWav}!Levels {
     const data = (try parseWav(bytes)).data;

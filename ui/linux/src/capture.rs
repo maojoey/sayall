@@ -19,6 +19,8 @@ pub struct Capture {
     pcm: PathBuf,
     wav: PathBuf,
     cleanup: bool,
+    pcm_limit: Option<u64>,
+    frozen_at: Option<Instant>,
 }
 enum CaptureSource {
     Process(Child),
@@ -124,6 +126,8 @@ impl Capture {
         startup_cleanup.0 = None;
         Ok(Self {
             source: CaptureSource::Process(child),
+            pcm_limit: None,
+            frozen_at: None,
             started_at,
             dir,
             pcm,
@@ -172,6 +176,8 @@ impl Capture {
             )
         });
         Ok(Self {
+            pcm_limit: None,
+            frozen_at: None,
             source: CaptureSource::Fixture {
                 stop,
                 thread: Some(thread),
@@ -183,6 +189,21 @@ impl Capture {
             cleanup: true,
         })
     }
+    pub fn set_pcm_limit(&mut self, bytes: u64) {
+        assert!(bytes > 0 && bytes % 2 == 0);
+        self.pcm_limit = Some(bytes);
+    }
+
+    pub fn is_frozen(&self) -> bool {
+        self.frozen_at.is_some()
+    }
+
+    pub fn captured_duration(&self) -> Duration {
+        self.frozen_at
+            .unwrap_or_else(Instant::now)
+            .duration_since(self.started_at)
+    }
+
     pub fn started_at(&self) -> Instant {
         self.started_at
     }
@@ -206,6 +227,9 @@ impl Capture {
     /// the shortcut boundary reaches both the stream worker and the final WAV.
     /// Shutdown must not wait for the tail or continue recording unnecessarily.
     pub fn wait_for_tail(&mut self, duration: Duration, shutdown: &AtomicBool) -> io::Result<()> {
+        if self.is_frozen() {
+            return Ok(());
+        }
         let deadline = Instant::now() + duration;
         loop {
             if shutdown.load(Ordering::Acquire) {
@@ -222,7 +246,12 @@ impl Capture {
         }
     }
 
-    pub fn stop(mut self) -> io::Result<PathBuf> {
+    /// Stop the microphone but retain both audio inodes until worker readiness.
+    pub fn freeze(&mut self) -> io::Result<()> {
+        if self.is_frozen() {
+            return Ok(());
+        }
+        let stopped_at = Instant::now();
         let process_result = self.terminate(Duration::from_secs(2));
         // pw-record 1.6 exits with status 1 after handling SIGINT even though
         // the recording completed normally. Only accept that status when this
@@ -233,12 +262,19 @@ impl Capture {
                 return Err(io::Error::other(format!("pw-record exited with {status}")));
             }
         }
+        self.frozen_at = Some(stopped_at);
+        Ok(())
+    }
+    pub fn stop(mut self) -> io::Result<PathBuf> {
+        self.freeze()?;
         self.finish_wav()?;
         self.cleanup = false;
         Ok(self.wav.clone())
     }
     pub fn cancel(mut self) {
-        let _ = self.terminate(Duration::from_millis(500));
+        if !self.is_frozen() {
+            let _ = self.terminate(Duration::from_millis(500));
+        }
         let _ = fs::remove_dir_all(&self.dir);
     }
     fn terminate(
@@ -276,8 +312,21 @@ impl Capture {
         Ok(Some((child.wait()?, false)))
     }
     fn finish_wav(&mut self) -> io::Result<()> {
+        // The recorder may append a final chunk after the duration-limit tick.
+        // Trim the same inode before WAV creation so the stream helper's held
+        // descriptor and batch WAV agree on the supported audio prefix.
+        let mut source = OpenOptions::new()
+            .read(true)
+            .write(self.pcm_limit.is_some())
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&self.pcm)?;
+        if let Some(limit) = self.pcm_limit {
+            if source.metadata()?.len() > limit {
+                source.set_len(limit)?;
+            }
+        }
         let mut pcm = Vec::new();
-        File::open(&self.pcm)?.read_to_end(&mut pcm)?;
+        source.read_to_end(&mut pcm)?;
         if pcm.len() % 2 != 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -826,6 +875,43 @@ mod tests {
         assert_eq!(fs::read(&wav).unwrap(), expected);
         assert!(!pcm.exists());
         assert_eq!(fs::metadata(&wav).unwrap().mode() & 0o777, 0o600);
+        cleanup(&wav);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn bounded_stop_trims_pcm_in_place_and_matches_the_wav_prefix() {
+        let root = private_root("bounded-stop");
+        let script = root.join("fake-pw-record");
+        fs::write(&script,
+            b"#!/bin/sh\nfor last do :; done\nprintf '\\001\\000\\377\\177\\000\\200' > \"$last\"\ntrap 'exit 0' INT TERM\n: > \"$last.ready\"\nwhile :; do /bin/sleep 1; done\n",
+        ).unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut capture = Capture::start_with_program(&root, 9, "", Ok(script)).unwrap();
+        capture.set_pcm_limit(4);
+        let pcm = root.join("session-9/audio.pcm");
+        let ready = root.join("session-9/audio.pcm.ready");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !ready.exists() {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let mut held = File::open(&pcm).unwrap();
+        assert_eq!(held.metadata().unwrap().len(), 6);
+        capture.freeze().unwrap();
+        assert!(pcm.exists()); // a not-yet-ready worker can still open it
+        let duration = capture.captured_duration();
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(capture.captured_duration(), duration);
+        let wav = capture.stop().unwrap();
+        assert_eq!(held.metadata().unwrap().len(), 4);
+        let mut actual = Vec::new();
+        held.read_to_end(&mut actual).unwrap();
+        assert_eq!(actual, [1, 0, 255, 127]);
+        let mut expected = Vec::new();
+        write_wav(&mut expected, &actual).unwrap();
+        assert_eq!(fs::read(&wav).unwrap(), expected);
+        assert!(!pcm.exists());
         cleanup(&wav);
         fs::remove_dir_all(root).unwrap();
     }

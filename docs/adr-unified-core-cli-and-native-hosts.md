@@ -76,8 +76,10 @@ native UI ─────────▶│ native app host     │
 
 ### Contracts
 
-The private processing worker uses bounded protocol version 2. Version 2 adds
-explicit Deepgram formatting flags to worker requests. Worker requests are strict: unknown or wrongly typed
+The private processing worker uses bounded protocol version 4. Version 2 added
+explicit Deepgram formatting flags, version 3 made processing profiles explicit,
+and version 4 adds the Q8-only local batch provider, local transport/timing and
+local failure codes. See [local file integration](local-stt-integration.md). Worker requests are strict: unknown or wrongly typed
 fields fail rather than silently changing provider behavior. Result readers
 validate required fields and ignore unknown additive object fields. Worker
 results distinguish `success`, `no_speech`, and `error`; error and warning codes
@@ -186,15 +188,21 @@ The cross-platform public surface currently consists of `help`, `version`,
 `doctor [--json]`, `update`, and:
 
 ```text
-sayall transcribe <WAV> [--raw] [--json]
+sayall transcribe <WAV> [--raw] [--json] [--local [--model-path <absolute-Q8-path>]]
 ```
 
 `transcribe` accepts one WAV file of at most 10 MiB. It copies the input to a
 private, bounded scratch file and sends credentials only through the private
 worker's stdin protocol. Human output is transcript-only; `--json` emits the
-canonical worker result for automation, and `--raw` disables optional LLM
-cleanup. Status diagnostics go to stderr and never include credentials or
-transcript text. The native UI does not invoke this command.
+canonical worker result for automation, and `--raw` selects Verbatim.
+The development `--local` path uses only pinned Parakeet Unified Q8, defaults
+to deterministic Clean, and does not load cloud configuration or credentials.
+It has no cloud fallback. Linux native live dictation separately supports opt-in
+local Q8 with explicitly provisioned model/runtime artifacts: incremental
+processing is the default, and `stt.streaming: false` selects batch processing.
+macOS native recording explicitly rejects local mode; its live-local support
+remains a later milestone. Status diagnostics go to stderr and never include
+credentials or transcript text. The native UI does not invoke this command.
 
 `doctor` performs read-only configuration, packaged-worker/protocol,
 executable, native-host status, and platform checks. Its bounded JSON output

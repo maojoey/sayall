@@ -40,6 +40,13 @@ test "shared worker fixtures preserve canonical outcomes" {
     try std.testing.expectEqualStrings("ready", ready.value.event);
     try std.testing.expect(ready.value.streaming);
 
+    try std.testing.expectError(error.IncompatibleVersion, batch.parseResult(std.testing.allocator, fixtures.worker_result_v3_rejected));
+    const local = try batch.parseResult(std.testing.allocator, fixtures.worker_result_local);
+    defer local.deinit();
+    try std.testing.expectEqual(batch.Transport.local, local.value.transport);
+    try std.testing.expectEqual(@as(?u64, 100), local.value.timing.?.local_stt_ms);
+    try std.testing.expect(local.value.timing.?.rest_stt_ms == null);
+
     const success = try parse(batch.Result, fixtures.worker_result_success);
     defer success.deinit();
     try std.testing.expectEqual(.success, success.value.status);

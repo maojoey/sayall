@@ -141,6 +141,11 @@ struct ConfigurationLoader {
     }
 
     private func settings(from document: Document) throws -> ProviderSettings {
+        // Live Q8 is currently Linux-only. Fail before resolving credentials;
+        // unsupported local mode must never become a cloud session.
+        guard (document.stt?.provider ?? "deepgram") == "deepgram" else {
+            throw ConfigurationError.invalidProvider
+        }
         let deepgram = resolve(document.stt?.apiKey, override: "DEEPGRAM_API_KEY")
         let legacyCloudConfig = document.llm?.provider == "groq" ||
             document.llm?.baseURL == "https://api.groq.com/openai/v1/chat/completions"

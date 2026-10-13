@@ -79,6 +79,7 @@ impl fmt::Display for ToggleError {
 }
 
 enum Command {
+    CancelStartup(u64),
     Toggle(State, mpsc::Sender<Result<Snapshot, ToggleError>>),
     RestartReady,
     Reload(mpsc::Sender<Result<Snapshot, ToggleError>>),
@@ -102,6 +103,7 @@ fn is_finish_admission(owner: u64) -> bool {
 }
 
 struct Inner {
+    startup_cancelled: Arc<AtomicU64>,
     tx: mpsc::Sender<Command>,
     snapshot: Arc<Mutex<Snapshot>>,
     admitted: Arc<AtomicU64>,
@@ -111,6 +113,7 @@ struct Inner {
     join: Mutex<Option<JoinHandle<()>>>,
 }
 struct RunSignals {
+    startup_cancelled: Arc<AtomicU64>,
     admitted: Arc<AtomicU64>,
     next_admission: Arc<AtomicU64>,
     restart_requested: Arc<AtomicU64>,
@@ -127,7 +130,9 @@ impl Controller {
         let next_admission = Arc::new(AtomicU64::new(FIRST_ADMISSION));
         let restart_requested = Arc::new(AtomicU64::new(0));
         let shutdown = Arc::new(AtomicBool::new(false));
+        let startup_cancelled = Arc::new(AtomicU64::new(0));
         let signals = RunSignals {
+            startup_cancelled: startup_cancelled.clone(),
             admitted: admitted.clone(),
             next_admission: next_admission.clone(),
             restart_requested: restart_requested.clone(),
@@ -136,6 +141,7 @@ impl Controller {
         let join =
             std::thread::spawn(move || run(rx, shared, signals, root, Box::new(delivery), updates));
         Self(Arc::new(Inner {
+            startup_cancelled,
             tx,
             snapshot,
             admitted,
@@ -150,6 +156,23 @@ impl Controller {
     }
     pub fn toggle(&self) -> Result<Snapshot, ToggleError> {
         let expected = self.status();
+        if expected.state == State::Starting {
+            let current = self.0.snapshot.lock().unwrap();
+            if current.state != State::Starting || current.generation != expected.generation {
+                return Err(ToggleError::Busy);
+            }
+            self.0
+                .startup_cancelled
+                .store(current.generation, Ordering::Release);
+            // Wake startup directly, rather than wait behind its admission.
+            // The queued command also covers readiness winning the race:
+            // it runs before any later Recording toggle can be admitted.
+            self.0
+                .tx
+                .send(Command::CancelStartup(current.generation))
+                .map_err(|_| ToggleError::Unavailable)?;
+            return Ok(current.clone());
+        }
         if matches!(
             expected.state,
             State::Stopping
@@ -451,6 +474,18 @@ fn run(
                 }
                 break;
             }
+            Ok(Command::CancelStartup(requested)) => {
+                if requested == generation {
+                    if let Some((c, w, _, _, _, show_timer, _)) = active.take() {
+                        w.cancel();
+                        c.cancel();
+                        publish(State::Cancelled, generation, None, None, show_timer);
+                    }
+                    if shared.lock().unwrap().state == State::Cancelled {
+                        terminal_until = Some(Instant::now() + Duration::from_secs(2));
+                    }
+                }
+            }
             Ok(Command::Reload(reply)) => {
                 let result = if shared.lock().unwrap().state != State::Idle || active.is_some() {
                     Err(ToggleError::Busy)
@@ -491,9 +526,10 @@ fn run(
                         &mut generation,
                         &root,
                         signals.shutdown.clone(),
+                        signals.startup_cancelled.clone(),
                         &publish,
                     );
-                    if result.is_err() {
+                    if active.is_none() {
                         terminal_until = Some(Instant::now() + Duration::from_secs(2));
                     }
                     result
@@ -526,7 +562,7 @@ fn run(
                     publish(State::Idle, generation, None, None, show_timer);
                 }
                 if let Some((c, _, started, cfg, _, show_timer, _)) = active.as_mut() {
-                    if !c.alive().unwrap_or(false) {
+                    if !c.is_frozen() && !c.alive().unwrap_or(false) {
                         let (c, w, _, _, _, show_timer, notifications) = active.take().unwrap();
                         w.cancel();
                         c.cancel();
@@ -619,15 +655,15 @@ fn run(
             terminal_until = None;
             let show_timer = shared.lock().unwrap().show_timer;
             publish(State::Idle, generation, None, None, show_timer);
-            if start_active(
+            let _ = start_active(
                 &mut active,
                 &mut generation,
                 &root,
                 signals.shutdown.clone(),
+                signals.startup_cancelled.clone(),
                 &publish,
-            )
-            .is_err()
-            {
+            );
+            if active.is_none() {
                 terminal_until = Some(Instant::now() + Duration::from_secs(2));
             }
             let _ = signals.restart_requested.compare_exchange(
@@ -651,6 +687,7 @@ fn start_active<F>(
     generation: &mut u64,
     root: &Path,
     shutdown: Arc<AtomicBool>,
+    startup_cancelled: Arc<AtomicU64>,
     publish: &F,
 ) -> Result<Snapshot, ToggleError>
 where
@@ -660,12 +697,42 @@ where
     let mut loaded_notifications = None;
     let started = config::load().map_err(|e| e.to_string()).and_then(|cfg| {
         loaded_notifications = Some(cfg.notifications);
-        let capture = capture::Capture::start(root, *generation, &cfg.recording.source)
+        let path = worker::resolve().map_err(|e| e.to_string())?;
+        worker::local_readiness(&path, &cfg.provider)?;
+        let mut capture = capture::Capture::start(root, *generation, &cfg.recording.source)
             .map_err(|e| e.to_string())?;
+        if cfg.provider.local_model_path.is_some() {
+            capture.set_pcm_limit(16_000 * 2 * 300);
+        }
         publish(State::Starting, *generation, None, None, cfg.show_timer);
         let (pcm, wav) = capture.paths();
-        let path = worker::resolve().map_err(|e| e.to_string())?;
-        let worker = worker::Worker::start(&path, wav, pcm, &cfg.provider, shutdown)?;
+        let (pcm, wav) = (pcm.to_owned(), wav.to_owned());
+        let capture_deadline =
+            capture.started_at() + Duration::from_secs(cfg.recording.max_seconds as u64);
+        let worker = worker::Worker::start_recording(
+            &path,
+            &wav,
+            &pcm,
+            &cfg.provider,
+            shutdown.clone(),
+            worker::Startup {
+                cancelled_generation: startup_cancelled.clone(),
+                generation: *generation,
+            },
+            || {
+                if !capture.is_frozen() {
+                    if !capture.alive().map_err(|e| e.to_string())? {
+                        return Err("capture process exited early during worker startup".into());
+                    }
+                    if Instant::now() >= capture_deadline {
+                        capture
+                            .freeze()
+                            .map_err(|e| format!("capture stop failed: {e}"))?;
+                    }
+                }
+                Ok(())
+            },
+        )?;
         Ok((
             capture,
             worker,
@@ -698,6 +765,11 @@ where
             ))
         }
         Err(error) => {
+            if startup_cancelled.load(Ordering::Acquire) == *generation
+                || shutdown.load(Ordering::Acquire)
+            {
+                return Ok(publish(State::Cancelled, *generation, None, None, true));
+            }
             let message = format!("capture failed: {error}");
             if let Some(enabled) = loaded_notifications {
                 desktop::notify(
@@ -758,7 +830,7 @@ where
     let (mut capture, worker, started, cfg, output, show_timer, notifications) =
         active.take().expect("active capture");
     let stop_requested = Instant::now();
-    let recorded = stop_requested.duration_since(started);
+    let recorded = capture.captured_duration();
     let tail_deadline = stop_requested + stop_tail_duration(recorded, &cfg, reason);
     publish(State::Stopping, generation, Some(started), None, show_timer);
     let outcome = (|| -> Result<DeliveryCompletion, String> {
@@ -791,7 +863,7 @@ where
             show_timer,
         );
         Ok(deliver_outcome(
-            worker.finish(Duration::from_secs(45))?,
+            worker.finish_session()?,
             delivery,
             &output,
             || {
@@ -935,6 +1007,151 @@ fn no_signal(path: &Path) -> bool {
 mod tests {
     use super::*;
     use std::sync::{Barrier, atomic::AtomicUsize};
+
+    #[test]
+    #[ignore = "requires consented fixture, Q8 bundle, and isolated local config; never records a microphone"]
+    fn real_local_capture_pipeline_delivers_once_and_cleans_audio() {
+        use std::os::unix::fs::PermissionsExt;
+        assert!(std::env::var_os("SAYALL_TEST_AUDIO_FIXTURE").is_some());
+        let eof = PathBuf::from(
+            std::env::var_os("SAYALL_TEST_AUDIO_EOF_PATH").expect("fixture EOF path"),
+        );
+        let root = PathBuf::from(
+            std::env::var_os("SAYALL_TEST_SESSION_ROOT").expect("private scratch root"),
+        );
+        assert_eq!(
+            std::fs::metadata(&root).unwrap().permissions().mode() & 0o077,
+            0
+        );
+        let cfg = config::load().unwrap();
+        assert!(cfg.provider.local_model_path.is_some());
+        assert!(
+            !cfg.notifications,
+            "test must not produce desktop notifications"
+        );
+        struct Sink(Arc<AtomicUsize>);
+        impl Delivery for Sink {
+            fn deliver(
+                &mut self,
+                text: &str,
+                _: &config::OutputConfig,
+            ) -> Result<desktop::DeliveryOutcome, String> {
+                assert!(!text.trim().is_empty());
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(desktop::DeliveryOutcome::Typed)
+            }
+        }
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (tx, rx) = mpsc::channel();
+        let controller = Controller::spawn(root.clone(), Sink(calls.clone()), tx);
+        struct Shutdown(Controller);
+        impl Drop for Shutdown {
+            fn drop(&mut self) {
+                self.0.shutdown_and_join();
+            }
+        }
+        let guard = Shutdown(controller.clone());
+        let start = Instant::now();
+        if let Ok(mode) = std::env::var("SAYALL_TEST_STARTUP_INTERRUPT") {
+            let starter = controller.clone();
+            let start_thread = std::thread::spawn(move || starter.toggle());
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while controller.status().state != State::Starting {
+                assert!(Instant::now() < deadline, "startup was not entered");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            if mode == "cancel" {
+                controller.toggle().unwrap();
+            } else if mode == "shutdown" {
+                controller.shutdown_and_join();
+            } else if mode == "limit" {
+                // The delayed worker is still loading, but recording must
+                // stop at its one-second limit without deleting the PCM.
+                std::thread::sleep(Duration::from_millis(1500));
+                let pcm = root.join("session-1/audio.pcm");
+                let size = std::fs::metadata(&pcm).unwrap().len();
+                assert!(size > 0 && size < 64_000);
+                std::thread::sleep(Duration::from_millis(200));
+                assert_eq!(std::fs::metadata(&pcm).unwrap().len(), size);
+            } else {
+                assert_eq!(mode, "capture-exit");
+            }
+            let result = start_thread.join().unwrap();
+            if mode == "limit" {
+                assert_eq!(result.unwrap().state, State::Recording);
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while !matches!(controller.status().state, State::Success | State::Error) {
+                    assert!(Instant::now() < deadline, "frozen capture did not finalize");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                assert_eq!(controller.status().state, State::Success);
+                assert!(calls.load(Ordering::SeqCst) <= 1);
+            } else {
+                assert!(start.elapsed() < Duration::from_secs(4));
+                if mode == "capture-exit" {
+                    assert!(result.is_err());
+                    assert!(
+                        controller
+                            .status()
+                            .message
+                            .unwrap()
+                            .contains("capture process exited")
+                    );
+                } else {
+                    assert_eq!(result.unwrap().state, State::Cancelled);
+                }
+                assert_eq!(calls.load(Ordering::SeqCst), 0);
+            }
+            drop(guard);
+            assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+            println!(
+                "SAYALL_LOCAL_TIMING {{\"startup_interrupt_ms\":{}}}",
+                start.elapsed().as_millis()
+            );
+            return;
+        }
+        assert_eq!(controller.toggle().unwrap().state, State::Recording);
+        let startup_ms = start.elapsed().as_millis();
+        if std::env::var_os("SAYALL_TEST_CANCEL_LOCAL").is_some() {
+            std::thread::sleep(Duration::from_millis(2500));
+            let cancel = Instant::now();
+            drop(guard);
+            assert!(cancel.elapsed() < Duration::from_secs(2));
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+            println!(
+                "SAYALL_LOCAL_TIMING {{\"startup_ms\":{startup_ms},\"cancel_ms\":{}}}",
+                cancel.elapsed().as_millis()
+            );
+            return;
+        }
+        let deadline = Instant::now() + Duration::from_secs(45);
+        while !eof.exists() {
+            assert!(Instant::now() < deadline, "fixture capture timed out");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let stop = Instant::now();
+        let result = controller.toggle().unwrap();
+        let stop_ms = stop.elapsed().as_millis();
+        assert_eq!(result.state, State::Success);
+        drop(guard);
+        println!(
+            "SAYALL_LOCAL_TIMING {{\"startup_ms\":{startup_ms},\"stop_to_dummy_delivery_ms\":{stop_ms},\"incremental\":{}}}",
+            cfg.provider.streaming
+        );
+        let states: Vec<_> = rx.try_iter().map(|s| s.state).collect();
+        for state in [
+            State::Recording,
+            State::Stopping,
+            State::Processing,
+            State::Delivering,
+            State::Success,
+        ] {
+            assert!(states.contains(&state), "missing session lifecycle state");
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+    }
 
     #[test]
     fn manual_stop_tail_defaults_to_ten_ms_bounded_by_recording_limit() {
@@ -1103,6 +1320,33 @@ mod tests {
     }
 
     #[test]
+    fn starting_stop_bypasses_start_admission_without_queueing_a_restart() {
+        let (tx, rx) = mpsc::channel();
+        let controller = Controller(Arc::new(Inner {
+            tx,
+            snapshot: Arc::new(Mutex::new(Snapshot {
+                state: State::Starting,
+                generation: 7,
+                ..Snapshot::default()
+            })),
+            admitted: Arc::new(AtomicU64::new(FIRST_ADMISSION)),
+            next_admission: Arc::new(AtomicU64::new(FIRST_ADMISSION + 2)),
+            restart_requested: Arc::new(AtomicU64::new(0)),
+            startup_cancelled: Arc::new(AtomicU64::new(0)),
+            shutdown: Arc::new(AtomicBool::new(false)),
+            join: Mutex::new(None),
+        }));
+        assert_eq!(controller.toggle().unwrap().state, State::Starting);
+        assert!(matches!(rx.recv().unwrap(), Command::CancelStartup(7)));
+        assert_eq!(controller.0.startup_cancelled.load(Ordering::Acquire), 7);
+        assert_eq!(
+            controller.0.admitted.load(Ordering::Acquire),
+            FIRST_ADMISSION
+        );
+        assert_eq!(controller.0.restart_requested.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
     fn concurrent_toggles_admit_exactly_one_mutation() {
         let (tx, rx) = mpsc::channel();
         let inner = Arc::new(Inner {
@@ -1112,6 +1356,7 @@ mod tests {
             next_admission: Arc::new(AtomicU64::new(FIRST_ADMISSION)),
             restart_requested: Arc::new(AtomicU64::new(0)),
             shutdown: Arc::new(AtomicBool::new(false)),
+            startup_cancelled: Arc::new(AtomicU64::new(0)),
             join: Mutex::new(None),
         });
         let controller = Controller(inner);
@@ -1167,6 +1412,7 @@ mod tests {
             next_admission: next_admission.clone(),
             restart_requested: restart_requested.clone(),
             shutdown: Arc::new(AtomicBool::new(false)),
+            startup_cancelled: Arc::new(AtomicU64::new(0)),
             join: Mutex::new(None),
         }));
         let (accepted_tx, accepted_rx) = mpsc::channel();
@@ -1257,6 +1503,7 @@ mod tests {
                 next_admission: Arc::new(AtomicU64::new(FIRST_ADMISSION + 2)),
                 restart_requested: restart_requested.clone(),
                 shutdown: Arc::new(AtomicBool::new(false)),
+                startup_cancelled: Arc::new(AtomicU64::new(0)),
                 join: Mutex::new(None),
             }));
 
@@ -1283,6 +1530,7 @@ mod tests {
             next_admission: Arc::new(AtomicU64::new(FIRST_ADMISSION + 2)),
             restart_requested: restart_requested.clone(),
             shutdown: Arc::new(AtomicBool::new(false)),
+            startup_cancelled: Arc::new(AtomicU64::new(0)),
             join: Mutex::new(None),
         }));
 
@@ -1316,6 +1564,7 @@ mod tests {
             next_admission: Arc::new(AtomicU64::new(FIRST_ADMISSION)),
             restart_requested: restart_requested.clone(),
             shutdown: Arc::new(AtomicBool::new(false)),
+            startup_cancelled: Arc::new(AtomicU64::new(0)),
             join: Mutex::new(None),
         }));
         let mut locked_snapshot = snapshot.lock().unwrap();
@@ -1357,6 +1606,7 @@ mod tests {
             next_admission: Arc::new(AtomicU64::new(FIRST_ADMISSION)),
             restart_requested: Arc::new(AtomicU64::new(0)),
             shutdown: Arc::new(AtomicBool::new(false)),
+            startup_cancelled: Arc::new(AtomicU64::new(0)),
             join: Mutex::new(None),
         });
         let controller = Controller(inner);
@@ -1370,7 +1620,7 @@ mod tests {
                 | Command::Reload(reply)
                 | Command::SetProcessingMode(_, reply)
                 | Command::SetOutputMethod(_, reply) => reply,
-                Command::RestartReady | Command::Shutdown => panic!(),
+                Command::RestartReady | Command::Shutdown | Command::CancelStartup(_) => panic!(),
             };
             count.fetch_add(1, Ordering::SeqCst);
             accepted_tx.send(()).unwrap();
@@ -1420,6 +1670,7 @@ mod tests {
             next_admission: Arc::new(AtomicU64::new(FIRST_ADMISSION)),
             restart_requested: Arc::new(AtomicU64::new(0)),
             shutdown: Arc::new(AtomicBool::new(false)),
+            startup_cancelled: Arc::new(AtomicU64::new(0)),
             join: Mutex::new(None),
         }));
 
@@ -1439,6 +1690,7 @@ mod tests {
             next_admission: Arc::new(AtomicU64::new(FIRST_ADMISSION)),
             restart_requested: Arc::new(AtomicU64::new(0)),
             shutdown: Arc::new(AtomicBool::new(false)),
+            startup_cancelled: Arc::new(AtomicU64::new(0)),
             join: Mutex::new(None),
         }));
 
@@ -1461,6 +1713,7 @@ mod tests {
             next_admission: Arc::new(AtomicU64::new(FIRST_ADMISSION)),
             restart_requested: Arc::new(AtomicU64::new(0)),
             shutdown: Arc::new(AtomicBool::new(false)),
+            startup_cancelled: Arc::new(AtomicU64::new(0)),
             join: Mutex::new(None),
         }));
 

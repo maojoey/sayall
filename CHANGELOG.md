@@ -13,6 +13,23 @@ follows [Semantic Versioning](https://semver.org/).
   Control or Command (or a bare F1–F20 key) so chords never capture typing, applies changes to the running app
   immediately, and keeps the previous shortcut when the new one is reserved by
   a macOS keyboard shortcut or macOS reports it as registered by another app. The menu shows the active shortcut and any conflict.
+- Added opt-in English local Q8 file transcription and Linux incremental
+  dictation using explicitly provisioned, hash-verified model/runtime artifacts.
+  Local mode requires no provider key and never falls back to cloud processing.
+  Existing cloud configuration is unchanged; macOS local recording is rejected.
+- Added a direct NVIDIA-source Q8 conversion path with pinned source and
+  artifact identities, recorded provenance, and model-license attribution.
+
+### Changed
+
+- Improved local Clean question endings and missing final periods using bounded
+  English rules. Verbatim and cloud Clean are unchanged; ambiguous structures
+  may still need correction.
+- Updated the private matched host/worker protocol to v4. Public control
+  protocols are unchanged; legacy worker frames are rejected.
+- Included model, runtime, application and Rust notices in local bundles.
+  Missing dependency license texts now require verified upstream snapshots
+  rather than substituting an unrelated crate's copyright notice.
 
 ## [0.3.3] - 2026-10-06
 

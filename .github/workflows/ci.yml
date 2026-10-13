@@ -17,6 +17,12 @@ jobs:
         run: zig build test
       - name: Test acoustic transcript scoring
         run: python3 -m unittest discover -s tests/acoustic_e2e -p 'test_*.py'
+      - name: Test Q8 license packet (no downloads)
+        run: python3 tests/test_local_q8_licenses.py
+      - name: Test dependency notice collection (no downloads)
+        run: python3 tests/test_third_party_licenses.py
+      - name: Test own Q8 archive conversion boundaries (no downloads)
+        run: python3 tests/test_convert_local_q8.py
       - name: Compile readiness / unsupported runtime — Darwin core
         run: zig build check-darwin-core
       - name: Compile canonical Zig CLI frontend — Darwin

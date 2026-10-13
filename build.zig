@@ -94,6 +94,15 @@ pub fn build(b: *std.Build) void {
     const stream_tests = b.addTest(.{ .root_module = stream_tests_module });
     if (target.query.isNative()) batch_step.dependOn(&b.addRunArtifact(stream_tests).step) else batch_step.dependOn(&stream_tests.step);
 
+    const local_stream_tests_module = b.createModule(.{
+        .root_source_file = b.path("daemon/local_stream.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    local_stream_tests_module.addImport("websocket", websocket_dep.module("websocket"));
+    const local_stream_tests = b.addTest(.{ .root_module = local_stream_tests_module });
+    if (target.query.isNative()) batch_step.dependOn(&b.addRunArtifact(local_stream_tests).step) else batch_step.dependOn(&local_stream_tests.step);
+
     const backend_contract_tests_module = b.createModule(.{
         .root_source_file = b.path("daemon/backend_contract_test.zig"),
         .target = target,

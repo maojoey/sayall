@@ -21,12 +21,12 @@ pub fn main(init: std.process.Init) u8 {
 fn run(init: std.process.Init) !u8 {
     const argv = init.minimal.args.vector;
     if (argv.len >= 2 and std.mem.eql(u8, std.mem.span(argv[1]), "transcribe")) {
-        try ensureConfigHome(init.environ_map);
-        var values: [3][]const u8 = undefined;
-        if (argv.len < 3 or argv.len > 5) return writePresentation(init.io, cli.invalid_presentation);
+        var values: [cli_transcribe.max_args][]const u8 = undefined;
+        if (argv.len < 3 or argv.len > cli_transcribe.max_args + 2) return writePresentation(init.io, cli.invalid_presentation);
         for (argv[2..], 0..) |arg, i| values[i] = std.mem.span(arg);
         const options = cli_transcribe.parse(values[0 .. argv.len - 2]) catch
             return writePresentation(init.io, cli.invalid_presentation);
+        if (!options.local) try ensureConfigHome(init.environ_map);
         return cli_transcribe.run(init.gpa, init.arena.allocator(), init.io, init.environ_map, options);
     }
     if (argv.len >= 2 and std.mem.eql(u8, std.mem.span(argv[1]), "shortcut")) {

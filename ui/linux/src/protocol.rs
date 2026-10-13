@@ -564,20 +564,20 @@ mod tests {
         let info: WorkerInfoFixture = serde_json::from_str(WORKER_INFO).unwrap();
         assert_eq!(
             (info.protocol_version, info.build_version.as_str()),
-            (3, "0.1.8")
+            (4, "0.1.8")
         );
         let ready: WorkerReadyFixture = serde_json::from_str(WORKER_READY_REST).unwrap();
         assert_eq!(
             (ready.version, ready.event.as_str(), ready.streaming),
-            (3, "ready", false)
+            (4, "ready", false)
         );
         let finish: WorkerFinishFixture = serde_json::from_str(WORKER_FINISH).unwrap();
         assert_eq!(
             (finish.version, finish.command.as_str(), finish.force_rest),
-            (3, "finish", false)
+            (4, "finish", false)
         );
         let success: WorkerResultFixture = serde_json::from_str(WORKER_SUCCESS).unwrap();
-        assert_eq!(success.version, 3);
+        assert_eq!(success.version, 4);
         assert_eq!(success.status, "success");
         assert_eq!(success.text.as_deref(), Some("Hello, world."));
         assert_eq!(success.processing_profile, "legacy_v1");

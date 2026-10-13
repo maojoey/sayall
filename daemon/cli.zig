@@ -11,7 +11,7 @@ pub const help =
     \\  sayall reload         reload configuration
     \\  sayall config init    securely create the default configuration
     \\  sayall config validate [--json]
-    \\  sayall transcribe <WAV> [--raw] [--json]
+    \\  sayall transcribe <WAV> [--raw] [--json] [--local [--model-path <absolute-Q8-path>]]
     \\  sayall doctor [--json]
     \\  sayall shortcut [show|reset|disable]
     \\  sayall shortcut set <CHORD>  e.g. CTRL+SLASH, CMD+SHIFT+SPACE, F9

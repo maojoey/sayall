@@ -201,6 +201,314 @@ pub fn clean(gpa: Allocator, transcript: []const u8, glossary: []const []const u
     return renderClean(gpa, transcript, tokens, deleted, spelling);
 }
 
+const ending_question_words = [_][]const u8{ "what", "what's", "when", "when's", "where", "where's", "which", "who", "who's", "whom", "whose", "why", "why's", "how", "how's" };
+const ending_auxiliaries = [_][]const u8{ "am", "is", "are", "was", "were", "do", "does", "did", "have", "has", "had", "can", "could", "will", "would", "shall", "should", "may", "might", "must" };
+const ending_pronoun_subjects = [_][]const u8{ "i", "you", "we", "he", "she", "they", "it", "there", "this", "that", "these", "those", "anyone", "anybody", "someone", "somebody", "everyone", "everybody", "nobody" };
+// Bare "do" is also imperative. Exclude object/demonstrative readings such
+// as "do it/this/that"; these subjects alone are not a general grammar proof.
+const do_question_subjects = [_][]const u8{ "i", "you", "we", "he", "she", "they" };
+const ending_reporting_verbs = [_][]const u8{ "said", "asked", "replied", "answered", "wondered", "inquired", "repeated", "added", "continued" };
+const ending_max_words = 32;
+
+fn anyWord(word: []const u8, candidates: []const []const u8) bool {
+    for (candidates) |candidate| if (endingWordEqual(word, candidate)) return true;
+    return false;
+}
+
+// Compare without rewriting source bytes: curly and straight apostrophes
+// have the same grammatical meaning, but the user's spelling stays intact.
+fn endingWordEqual(word: []const u8, candidate: []const u8) bool {
+    var i: usize = 0;
+    for (candidate) |c| {
+        if (i == word.len) return false;
+        if (c == '\'' and std.mem.startsWith(u8, word[i..], "’")) {
+            i += "’".len;
+        } else {
+            if (std.ascii.toLower(word[i]) != c) return false;
+            i += 1;
+        }
+    }
+    return i == word.len;
+}
+
+fn endingWordByte(c: u8) bool {
+    return std.ascii.isAlphabetic(c) or c == '\'' or c >= 0x80;
+}
+
+fn properSubject(word: []const u8) bool {
+    return word.len > 1 and std.ascii.isUpper(word[0]) and !allUppercaseAscii(word);
+}
+
+fn endingSubject(word: []const u8) bool {
+    return anyWord(word, &ending_pronoun_subjects) or properSubject(word);
+}
+
+const QuestionEnding = struct { at: usize, replace: bool };
+
+/// Conservative English question-pattern repair for local Clean, not a parser
+/// or an intonation classifier. Replaces terminal commas/periods, or inserts
+/// '?' at an unpunctuated line/recording end. Never infers internal boundaries
+/// from capitalization alone. Source words and spacing remain unchanged.
+pub fn normalizeQuestionEndings(gpa: Allocator, transcript: []const u8) error{OutOfMemory}![]u8 {
+    var positions: std.ArrayList(QuestionEnding) = .empty;
+    defer positions.deinit(gpa);
+    var start: usize = 0;
+    var i: usize = 0;
+    while (i < transcript.len) {
+        const c = transcript[i];
+        if (c == '.' or c == '!' or c == '?') {
+            var j = i + 1;
+            while (j < transcript.len and isSentenceCloser(transcript[j])) j += 1;
+            if (j >= transcript.len or std.ascii.isWhitespace(transcript[j])) {
+                considerEnding(transcript, start, j, &positions, gpa) catch return error.OutOfMemory;
+                start = j;
+                i = j;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        if (c == '\n') {
+            considerEnding(transcript, start, i, &positions, gpa) catch return error.OutOfMemory;
+            start = i + 1;
+            i += 1;
+            continue;
+        }
+        i += 1;
+    }
+    considerEnding(transcript, start, transcript.len, &positions, gpa) catch return error.OutOfMemory;
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    var cursor: usize = 0;
+    for (positions.items) |ending| {
+        try out.appendSlice(gpa, transcript[cursor..ending.at]);
+        try out.append(gpa, '?');
+        cursor = ending.at + @intFromBool(ending.replace);
+    }
+    try out.appendSlice(gpa, transcript[cursor..]);
+    return out.toOwnedSlice(gpa);
+}
+
+/// Local Clean only: repair recognized questions first, then add a period to
+/// a recognized final declarative clause. This is deliberately not a parser;
+/// unknown/fragments/technical text are left alone. Never inserts boundaries
+/// inside an unpunctuated sentence or adds periods to every line.
+pub fn normalizeLocalEndings(gpa: Allocator, transcript: []const u8) error{OutOfMemory}![]u8 {
+    const questions = try normalizeQuestionEndings(gpa, transcript);
+    errdefer gpa.free(questions);
+    const at = finalStatementEnd(questions) orelse return questions;
+    const out = try gpa.alloc(u8, questions.len + 1);
+    @memcpy(out[0..at], questions[0..at]);
+    out[at] = '.';
+    @memcpy(out[at + 1 ..], questions[at..]);
+    gpa.free(questions);
+    return out;
+}
+
+fn finalStatementEnd(text: []const u8) ?usize {
+    var end = text.len;
+    while (end > 0 and std.ascii.isWhitespace(text[end - 1])) end -= 1;
+    if (end == 0 or !std.ascii.isAlphanumeric(text[end - 1])) return null;
+    var line_start = if (std.mem.lastIndexOfScalar(u8, text[0..end], '\n')) |at| at + 1 else 0;
+    while (line_start < end and std.ascii.isWhitespace(text[line_start])) line_start += 1;
+    if (line_start == end or !std.ascii.isAlphabetic(text[line_start])) return null;
+    var start: usize = line_start;
+    for (text[line_start..end], line_start..) |c, i| {
+        if (c == '\n' or ((c == '.' or c == '?' or c == '!') and
+            i + 1 < end and std.ascii.isWhitespace(text[i + 1]))) start = i + 1;
+    }
+    while (start < end and std.ascii.isWhitespace(text[start])) start += 1;
+    const sentence = text[start..end];
+    // No markup, URLs, addresses, code, quoted literals or list-item prefixes.
+    if (sentence.len == 0 or !std.ascii.isAlphabetic(sentence[0])) return null;
+    for (sentence) |c| {
+        if (std.mem.indexOfScalar(u8, "`\"/\\@_:=<>|{}[]()#*+;", c) != null) return null;
+    }
+    if (std.mem.indexOf(u8, sentence, "“") != null or std.mem.indexOf(u8, sentence, "”") != null or
+        std.mem.indexOf(u8, sentence, "..") != null) return null;
+    var words: [ending_max_words][]const u8 = undefined;
+    const count = sentenceWords(sentence, &words);
+    if (count < 2) return null;
+    // Classify the bounded opening, but inspect the actual tail rather than
+    // mistaking the final word of a truncated prefix for the recording end.
+    var tail_end = sentence.len;
+    while (tail_end > 0 and !endingWordByte(sentence[tail_end - 1])) tail_end -= 1;
+    var tail_start = tail_end;
+    while (tail_start > 0 and endingWordByte(sentence[tail_start - 1])) tail_start -= 1;
+    const last = sentence[tail_start..tail_end];
+    const body = questionBody(words[0..count]);
+    if (body.len > 0 and body.len != count and
+        (endingQuestionAuxiliary(body[0]) or anyWord(body[0], &ending_question_words))) return null;
+    if (anyWord(last, &.{ "a", "an", "the", "to", "of", "for", "with", "without", "at", "by", "from", "in", "on", "and", "or", "but", "because", "if", "when", "while", "although", "what", "which", "who", "where", "how", "why", "not", "been", "being", "have", "has", "had", "am", "is", "are", "was", "were", "can", "could", "will", "would", "should", "must" })) return null;
+    return if (declarativeOpening(words[0..count])) end else null;
+}
+
+fn declarativePredicate(words: []const []const u8) bool {
+    if (words.len == 0) return false;
+    if (words.len == 1) return anyWord(words[0], &.{ "works", "worked", "failed", "passed", "finished", "stopped", "arrived", "agree", "agreed" });
+    return anyWord(words[0], &.{ "am", "is", "are", "was", "were", "have", "has", "had", "need", "needs", "want", "wants", "think", "thinks", "mean", "means", "know", "knows", "like", "likes", "prefer", "prefers", "work", "works", "worked", "recorded", "missed", "said", "noticed", "found", "finished", "tested", "checked", "sent", "received", "understand", "understands", "agree", "agrees", "feel", "feels", "see", "sees", "went", "ran", "forgot", "used", "added" });
+}
+
+fn declarativeOpening(words: []const []const u8) bool {
+    const subjects = [_][]const u8{ "i", "you", "we", "he", "she", "they", "it", "this", "that", "these", "those", "there" };
+    // A narrow free-relative pattern, rather than guessing all wh-clauses.
+    if (words.len >= 5 and asciiEq(words[0], "what") and anyWord(words[1], &subjects) and
+        anyWord(words[2], &.{ "need", "needs", "want", "wants" }) and
+        anyWord(words[3], &.{ "is", "was" })) return true;
+    if (anyWord(words[0], &.{ "i'm", "you're", "we're", "they're", "he's", "she's", "it's", "that's", "there's", "i've", "we've", "they've", "you've" })) return true;
+    if (anyWord(words[0], &subjects) and declarativePredicate(words[1..])) return true;
+    // Simple determiner + noun + predicate. Do not scan through relative or
+    // subordinate clauses looking for a verb.
+    if (words.len >= 3 and anyWord(words[0], &.{ "the", "my", "your", "our", "his", "her", "their", "this", "that", "these", "those" }) and
+        !anyWord(words[1], &.{ "who", "which", "that" })) return declarativePredicate(words[2..]);
+    return false;
+}
+
+fn isSentenceCloser(c: u8) bool {
+    return c == '"' or c == '\'' or c == ')' or c == ']' or c == '}';
+}
+
+fn isSentenceOpener(c: u8) bool {
+    return c == '"' or c == '\'' or c == '(' or c == '[' or c == '{';
+}
+
+/// `end` is exclusive. Whitespace is preserved, and leading quoted/bracketed
+/// content is deliberately excluded rather than guessing whether it is literal.
+fn considerEnding(transcript: []const u8, start: usize, end: usize, positions: *std.ArrayList(QuestionEnding), gpa: Allocator) !void {
+    var s = start;
+    var e = end;
+    while (s < e and std.ascii.isWhitespace(transcript[s])) s += 1;
+    while (e > s and std.ascii.isWhitespace(transcript[e - 1])) e -= 1;
+    if (e <= s) return;
+    if (isSentenceOpener(transcript[s]) or std.mem.startsWith(u8, transcript[s..e], "“") or
+        std.mem.startsWith(u8, transcript[s..e], "‘")) return;
+    const terminal = transcript[e - 1];
+    const replace = terminal == ',' or terminal == '.';
+    // Only ASCII alphanumeric final bytes are safe insertion sites in this
+    // English-only pass. Do not append after quotes, brackets, dashes or ':' .
+    if (!replace and !std.ascii.isAlphanumeric(terminal)) return;
+    if (terminal == '.' and e >= s + 2 and transcript[e - 2] == '.') return;
+    if (reportingAttribution(transcript[s..e])) return;
+    var words: [ending_max_words][]const u8 = undefined;
+    const count = sentenceWords(transcript[s..e], &words);
+    const body = questionBody(words[0..count]);
+    // Direct auxiliary inversion can be recognized from an opening prefix.
+    // Long wh/free-relative and conditional-compatible openings still need
+    // more structure than this bounded pass can establish: abstain there.
+    if (count == ending_max_words and (body.len == 0 or !endingQuestionAuxiliary(body[0]) or
+        anyWord(body[0], &.{ "had", "were", "should" }))) return;
+    if (!interrogativeOpening(body)) return;
+    try positions.append(gpa, .{ .at = if (replace) e - 1 else e, .replace = replace });
+}
+
+fn sentenceWords(text: []const u8, out: *[ending_max_words][]const u8) usize {
+    var count: usize = 0;
+    var i: usize = 0;
+    while (i < text.len and count < ending_max_words) {
+        if (!endingWordByte(text[i])) {
+            i += 1;
+            continue;
+        }
+        const begin = i;
+        while (i < text.len and endingWordByte(text[i])) i += 1;
+        out[count] = text[begin..i];
+        count += 1;
+    }
+    return count;
+}
+
+// Strip only bounded discourse markers for classification, never source text.
+// Do not skip arbitrary words/letters: "Or D is ready" may be a statement.
+fn questionBody(words: []const []const u8) []const []const u8 {
+    var i: usize = 0;
+    var connectors: usize = 0;
+    while (i < words.len and i < 4) {
+        if (anyWord(words[i], &.{ "mm", "hmm", "um", "uh" })) {
+            i += 1;
+        } else if (connectors == 0 and anyWord(words[i], &.{ "and", "or", "but", "so" })) {
+            connectors += 1;
+            i += 1;
+        } else if (i + 1 < words.len and asciiEq(words[i], "i") and asciiEq(words[i + 1], "mean")) {
+            i += 2;
+        } else break;
+    }
+    return words[i..];
+}
+
+fn endingQuestionAuxiliary(word: []const u8) bool {
+    return anyWord(word, &ending_auxiliaries) or anyWord(word, &.{ "isn't", "aren't", "wasn't", "weren't", "don't", "doesn't", "didn't", "hasn't", "haven't", "hadn't", "can't", "couldn't", "won't", "wouldn't", "shouldn't", "mustn't" });
+}
+
+fn invertedSubject(words: []const []const u8) bool {
+    if (words.len < 2) return false; // subject plus predicate/complement
+    if (endingSubject(words[0])) return true;
+    return words.len >= 3 and anyWord(words[0], &.{ "the", "a", "an", "my", "your", "our", "his", "her", "their", "its" });
+}
+
+fn interrogativeOpening(words: []const []const u8) bool {
+    if (words.len < 2) return false;
+    const first = words[0];
+    const second = words[1];
+    // A second copula often signals a free-relative subject: "what is
+    // missing IS this". Do/have can instead be main verbs ("what did you do").
+    // Prefer false negatives to altering statements.
+    for (words[2..]) |word| if (anyWord(word, &.{ "am", "is", "are", "was", "were" })) {
+        // The one inversion verb in "what time IS it" is handled below.
+        if (endingQuestionAuxiliary(second) or
+            anyWord(first, &.{ "what's", "who's", "where's", "when's", "why's", "how's" })) return false;
+    };
+    if (anyWord(first, &ending_question_words)) {
+        // Short subject questions need no auxiliary. Keep the initial lexicon
+        // intentionally narrow; extra clauses such as "what happened was ..."
+        // must not be treated as direct questions.
+        if (anyWord(first, &.{ "what", "who" }) and anyWord(second, &.{ "happened", "called" })) {
+            return words.len == 2 or (words.len == 3 and anyWord(words[2], &.{ "today", "yesterday", "here", "there" }));
+        }
+        // Contracted openers ("what's", "where's", ...) embed the auxiliary;
+        // there is no separate inversion word to find.
+        if (std.mem.indexOfScalar(u8, first, '\'') != null or std.mem.indexOf(u8, first, "’") != null) return true;
+        if (anyWord(second, &ending_pronoun_subjects) or properSubject(second)) return false;
+        if (asciiEq(second, "to")) return false; // "how to ..." heading
+        if (asciiEq(second, "about") or asciiEq(second, "if")) return words.len >= 3;
+        if (endingQuestionAuxiliary(second)) return words.len >= 3;
+        // Bounded wh-phrase + inversion; never scan across an arbitrary
+        // subject clause ("what I need is this").
+        if (!anyWord(second, &.{ "time", "day", "year", "number", "color", "colour", "long", "far", "old", "often", "many", "much" })) return false;
+        if (words.len >= 4 and anyWord(words[2], &ending_auxiliaries) and endingSubject(words[3])) return true;
+        return false;
+    }
+    if (endingQuestionAuxiliary(first)) {
+        if (!invertedSubject(words[1..])) return false;
+        // Inverted conditional statements share an auxiliary-first opening.
+        if (anyWord(first, &.{ "had", "were", "should" })) {
+            for (words[2..]) |word| if (anyWord(word, &.{ "would", "could", "please" })) return false;
+        }
+        if (asciiEq(first, "do") and !anyWord(second, &do_question_subjects)) {
+            if (words.len < 4 or !anyWord(words[3], &.{ "pass", "work", "run", "need", "require", "include", "support", "exist", "match" })) return false;
+        }
+        if (asciiEq(first, "have") and !anyWord(second, &do_question_subjects)) {
+            if (words.len < 4 or !anyWord(words[3], &.{ "finished", "passed", "failed", "started", "stopped", "arrived", "changed", "been" })) return false;
+        }
+        return true;
+    }
+    return false;
+}
+
+/// Guards "What is the question, he asked." attribution tails: a short
+/// comma-separated trailing clause containing a reporting verb.
+fn reportingAttribution(segment: []const u8) bool {
+    var last_comma: ?usize = null;
+    for (segment, 0..) |c, index| {
+        if (c == ',') last_comma = index;
+    }
+    const split = last_comma orelse return false;
+    var words: [ending_max_words][]const u8 = undefined;
+    const count = sentenceWords(segment[split + 1 ..], &words);
+    if (count == 0 or count > 4) return false;
+    for (words[0..count]) |word| if (anyWord(word, &ending_reporting_verbs)) return true;
+    return false;
+}
+
 /// Parse, validate and render v2. Malformed or unsafe plans are rejected so
 /// the pipeline owner can apply raw fallback and record a transformation failure.
 pub fn polishedFromJson(gpa: Allocator, transcript: []const u8, glossary: []const []const u8, json: []const u8) Error![]u8 {
@@ -1679,6 +1987,239 @@ test "polished rejects overlaps changed proofs injection and all deletion" {
         const source = try std.fmt.allocPrint(std.testing.allocator, "Ship to {s}", .{case.source});
         defer std.testing.allocator.free(source);
         try expectInvalidPlan(source, &.{}, .{ .version = 2, .deletions = &.{}, .corrections = &uppercase_case, .punctuation = &.{}, .paragraph_breaks = &.{}, .lists = &.{} });
+    }
+}
+
+fn expectEnding(input: []const u8, expected: []const u8) !void {
+    const out = try normalizeQuestionEndings(std.testing.allocator, input);
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings(expected, out);
+    const again = try normalizeQuestionEndings(std.testing.allocator, out);
+    defer std.testing.allocator.free(again);
+    try std.testing.expectEqualStrings(out, again);
+}
+
+test "question endings convert terminal commas and periods of direct questions" {
+    try expectEnding("what is the question,", "what is the question?");
+    try expectEnding("What is the question.", "What is the question?");
+    try expectEnding("What's the time.", "What's the time?");
+    try expectEnding("What time is it.", "What time is it?");
+    try expectEnding("Could you send the file, please.", "Could you send the file, please?");
+    try expectEnding("Do you know the time.", "Do you know the time?");
+    try expectEnding("Is Deepgram down.", "Is Deepgram down?");
+    try expectEnding("How about lunch.", "How about lunch?");
+    try expectEnding("What if we skip the tests.", "What if we skip the tests?");
+    try expectEnding("What is this. That is fine.", "What is this? That is fine.");
+    try expectEnding("What is the question,\nWhy does it matter.\n", "What is the question?\nWhy does it matter?\n");
+    try expectEnding("\"What is this,\"", "\"What is this,\"");
+    try expectEnding("What is the question, and why does it matter.", "What is the question, and why does it matter?");
+}
+
+test "question endings leave statements attributions and headings untouched" {
+    try expectEnding("This is a statement.", "This is a statement.");
+    try expectEnding("What is the question?", "What is the question?");
+    try expectEnding("What is this!", "What is this!");
+    try expectEnding("What is this...", "What is this...");
+    try expectEnding("I asked what the time is.", "I asked what the time is.");
+    try expectEnding("What I need is a pen and a paper.", "What I need is a pen and a paper.");
+    try expectEnding("What is the question, he asked.", "What is the question, he asked.");
+    try expectEnding("How to install the app.", "How to install the app.");
+    try expectEnding("Do the dishes.", "Do the dishes.");
+    try expectEnding("Do John's task first.", "Do John's task first.");
+    try expectEnding("Do it.", "Do it.");
+    try expectEnding("Could you tell me what she said.", "Could you tell me what she said?");
+    try expectEnding("What is the question", "What is the question?");
+    try expectEnding("", "");
+    try expectEnding("The answer is 3.14, exactly.", "The answer is 3.14, exactly.");
+}
+
+test "local question structures do not depend on model terminal punctuation" {
+    const questions = [_][]const u8{
+        "What is your name",           "What's your name",
+        "What’s your name",
+        "What happened",               "Mm, what happened",
+        "Who called",                  "Who called yesterday",
+        "What did you do",             "What do you think",
+        "Um, could you send the file", "How long is it",
+        "What time is it",             "Did it work",
+        "How’s it going",
+        "What's this",
+    };
+    for (questions) |question| {
+        const expected = try std.fmt.allocPrint(std.testing.allocator, "{s}?", .{question});
+        defer std.testing.allocator.free(expected);
+        for ([_][]const u8{ "", ".", ",", "?" }) |ending| {
+            const input = try std.fmt.allocPrint(std.testing.allocator, "{s}{s}", .{ question, ending });
+            defer std.testing.allocator.free(input);
+            try expectEnding(input, expected);
+        }
+    }
+    try expectEnding("What is your name  \nWho called\r\n", "What is your name?  \nWho called?\r\n");
+    try expectEnding("What happened. Who called", "What happened? Who called?");
+}
+
+test "local question repair preserves statements ambiguous fragments and literal quotations" {
+    const unchanged = [_][]const u8{
+        "What I need is this",                        "What I need is this.",                                        "What she wants is that.",
+        "What John needs is this.",                   "What happened was unexpected.",                               "Who called is irrelevant.",
+        "What's missing is this.",
+        "What’s missing is this.",
+        "What is missing is this.",                   "You called",                                                  "Your name",
+        "What",                                       "Who",                                                         "Do this",
+        "Do that",                                    "Do it now",                                                   "Have someone call me.",
+        "I wonder who called.",                       "Tell me what happened.",                                      "Mm, what I need is this.",
+        "What is the question, she asked yesterday.", "What is the question about the upcoming release, she asked.", "\"What is your name\"",
+        "“What is your name.”",
+        "(What is your name.)",                       "What is your name!",                                          "What is your name...",
+        "What is your name:",                         "What is your name What happened?",                            "How to change your name",
+        "What is",                                    "Could you",                                                   "What about",
+        "What if",                                    "Mm,",                                                         "What is this this this this this this this this this this this this this this this this this this this this this this this this this this this this this this this.",
+    };
+    for (unchanged) |input| try expectEnding(input, input);
+}
+
+fn questionEndingAllocationCase(gpa: Allocator) !void {
+    const out = try normalizeQuestionEndings(gpa, "What is your name\nWho called.");
+    defer gpa.free(out);
+    try std.testing.expectEqualStrings("What is your name?\nWho called?", out);
+}
+
+test "local question repair handles allocation failures" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, questionEndingAllocationCase, .{});
+}
+
+fn expectLocalEnding(input: []const u8, expected: []const u8) !void {
+    const out = try normalizeLocalEndings(std.testing.allocator, input);
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings(expected, out);
+    const again = try normalizeLocalEndings(std.testing.allocator, out);
+    defer std.testing.allocator.free(again);
+    try std.testing.expectEqualStrings(out, again);
+}
+
+test "local Clean adds final periods to recognized declarative clauses" {
+    const statements = [_][]const u8{
+        "It missed the sentence boundary because I recorded it as two separate recordings",
+        "I recorded this in two separate recordings",
+        "What I need is this",
+        "This is working",
+        "It works",
+        "The model works",
+        "The build passed",
+        "My name is Alice",
+        "I have finished testing",
+        "I'm ready",
+        "I’m ready",
+        "This is version 2.0",
+        "I have 3 files",
+        "That is fine",
+    };
+    for (statements) |input| {
+        const expected = try std.fmt.allocPrint(std.testing.allocator, "{s}.", .{input});
+        defer std.testing.allocator.free(expected);
+        try expectLocalEnding(input, expected);
+    }
+    try expectLocalEnding("  I am ready  \r\n", "  I am ready.  \r\n");
+    try expectLocalEnding("That is fine. I am ready", "That is fine. I am ready.");
+    try expectLocalEnding("Notes\nI am ready", "Notes\nI am ready.");
+    try expectLocalEnding("Who called? It works", "Who called? It works.");
+    try expectLocalEnding("I am ready\nI have finished", "I am ready\nI have finished.");
+    try expectLocalEnding("I have been", "I have been");
+}
+
+test "local final punctuation retains questions fragments and existing punctuation" {
+    for ([_][]const u8{ "Who called", "What's your name", "What’s your name", "Mm, what happened", "What is your name" }) |input| {
+        const expected = try std.fmt.allocPrint(std.testing.allocator, "{s}?", .{input});
+        defer std.testing.allocator.free(expected);
+        try expectLocalEnding(input, expected);
+    }
+    const unchanged = [_][]const u8{
+        "",                      " \n",                       "Alice",               "two separate recordings",      "the sentence boundary",
+        "Meeting notes",         "You called",                "I am",                "I have",                       "I want to",
+        "I am ready because",    "I have a",                  "That's what",         "How to install",               "Who arrived",
+        "Do it",                 "This is working.",          "This is working!",    "This is working?",             "This is working...",
+        "This is working,",      "This is working:",          "This is working;",
+        "This is working —",
+        "\"I am ready\"",
+        "“I am ready”",
+        "I said \"I am ready\"", "(I am ready)",              "I said 'I am ready'", "My email is user@example.com", "This is https://example.com",
+        "My file is /tmp/test",  "This is `some_code`",       "This is key=value",   "- I am ready",                 "1. I am ready",
+        "# I am ready",          "I have finished [testing]",
+    };
+    for (unchanged) |input| try expectLocalEnding(input, input);
+}
+
+fn localEndingAllocationCase(gpa: Allocator) !void {
+    const out = try normalizeLocalEndings(gpa, "Who called. I am ready");
+    defer gpa.free(out);
+    try std.testing.expectEqualStrings("Who called? I am ready.", out);
+}
+
+test "local final punctuation handles allocation failures" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, localEndingAllocationCase, .{});
+}
+
+test "local question regression matrix covers auxiliary inversion and discourse prefixes" {
+    const questions = [_][]const u8{
+        "Is this working",           "Is it ready",                                                                      "Is there anything remaining",
+        "Is the model working",      "Is my recording saved",                                                            "Is the local model ready",
+        "Is this where the file is", "Is this what you meant",                                                           "Are we ready",
+        "Are the tests passing",     "Am I correct",                                                                     "Was it successful",
+        "Were you recording",        "Do you agree",                                                                     "Do the tests pass",
+        "Does the model work",       "Did it finish",                                                                    "Have you finished",
+        "Have the tests finished",   "Has it stopped",                                                                   "Had you seen this before",
+        "Can you hear me",           "Could we release this",                                                            "Will it work",
+        "Would you recommend this",  "Shall we continue",                                                                "Should we release this",
+        "May I proceed",             "Might it fail",                                                                    "Must we wait",
+        "Isn't this ready",
+        "Isn’t this ready",
+        "Aren't we done",            "Doesn't it work",                                                                  "Don't you agree",
+        "Didn’t it finish",
+        "Haven't you finished",      "Can't we proceed",
+        "Won’t it work",
+        "Why isn't it ready",        "What do you think about licensing issues now",                                     "Or is there anything remaining",
+        "And is the model ready",    "But are we finished",                                                              "So can we proceed",
+        "Um, is this working",       "Or, um, is it ready",                                                              "I mean is this working",
+        "Or I mean is it ready",     "Or is there something remaining and what do you think about licensing issues now",
+    };
+    for (questions) |input| {
+        const expected = try std.fmt.allocPrint(std.testing.allocator, "{s}?", .{input});
+        defer std.testing.allocator.free(expected);
+        for ([_][]const u8{ "", ".", ",", "?" }) |ending| {
+            const punctuated = try std.fmt.allocPrint(std.testing.allocator, "{s}{s}", .{ input, ending });
+            defer std.testing.allocator.free(punctuated);
+            try expectLocalEnding(punctuated, expected);
+        }
+    }
+    try expectLocalEnding("Is it ready. Are we done. Can we proceed", "Is it ready? Are we done? Can we proceed?");
+}
+
+test "auxiliary question expansion does not turn statement lookalikes into questions" {
+    const unchanged = [_][]const u8{
+        "It is working.",                       "This is where the file is.",        "I wonder if it is ready.",
+        "Whether it is ready remains unclear.", "What is missing is this.",          "And it is ready.",
+        "Or D is ready.",                       "Or d is there something remaining", "Do the dishes.",
+        "Do the tests again.",                  "Have the team test this.",          "Have someone call me.",
+        "Had I known I would have waited.",     "Were I ready I would leave.",       "Should you need help please call me.",
+        "Is",                                   "Is the model",                      "Or is",
+        "Or",                                   "Can you",                           "Is it ready!",
+    };
+    for (unchanged) |input| try expectLocalEnding(input, input);
+}
+
+test "long statements use actual recording tail instead of truncated prefix" {
+    const statement = "I mean questions can start with is as well and other letters or words as well maybe we can make we should make this work more rigorously and add some questions which start with is in different words in our testing as well";
+    const expected = try std.fmt.allocPrint(std.testing.allocator, "{s}.", .{statement});
+    defer std.testing.allocator.free(expected);
+    try expectLocalEnding(statement, expected);
+    const long_question = "Is this model still working correctly when we dictate a much longer question that contains more than thirty two words and several additional phrases about our recording settings and the way we want the final punctuation to appear";
+    const question_expected = try std.fmt.allocPrint(std.testing.allocator, "{s}?", .{long_question});
+    defer std.testing.allocator.free(question_expected);
+    try expectLocalEnding(long_question, question_expected);
+    for ([_][]const u8{ " and", " because", " to", " if", " but" }) |tail| {
+        const incomplete = try std.fmt.allocPrint(std.testing.allocator, "{s}{s}", .{ statement, tail });
+        defer std.testing.allocator.free(incomplete);
+        try expectLocalEnding(incomplete, incomplete);
     }
 }
 
