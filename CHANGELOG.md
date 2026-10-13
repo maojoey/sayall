@@ -17,8 +17,8 @@ follows [Semantic Versioning](https://semver.org/).
   dictation using explicitly provisioned, hash-verified model/runtime artifacts.
   Local mode requires no provider key and never falls back to cloud processing.
   Existing cloud configuration is unchanged; macOS local recording is rejected.
-- Added a reproducible direct NVIDIA-source Q8 conversion path with pinned
-  provenance, model-license attribution, and offline comparison tooling.
+- Added a direct NVIDIA-source Q8 conversion path with pinned source and
+  artifact identities, recorded provenance, and model-license attribution.
 
 ### Changed
 
