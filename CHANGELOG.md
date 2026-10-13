@@ -5,6 +5,8 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-13
+
 ### Added
 
 - Made the macOS global shortcut configurable with the same `sayall shortcut`
@@ -30,6 +32,13 @@ follows [Semantic Versioning](https://semver.org/).
 - Included model, runtime, application and Rust notices in local bundles.
   Missing dependency license texts now require verified upstream snapshots
   rather than substituting an unrelated crate's copyright notice.
+
+### Known limitations
+
+- Local Q8 requires a separately provisioned model and native helper. Standard
+  release archives do not bundle or download these artifacts; see
+  [local setup](docs/linux-local-testing.md). Native macOS local recording
+  remains unsupported. Existing cloud dictation does not require these artifacts.
 
 ## [0.3.3] - 2026-10-06
 
@@ -484,7 +493,8 @@ Initial release, tested and supported on x86-64 Arch Linux with Omarchy.
 - Persistent privacy-safe transcription metrics and microphone diagnostics.
 - systemd user services and Hyprland hotkey integration.
 
-[Unreleased]: https://github.com/saiemsaeed/sayall/compare/v0.3.3...HEAD
+[Unreleased]: https://github.com/saiemsaeed/sayall/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/saiemsaeed/sayall/compare/v0.3.3...v0.4.0
 [0.3.3]: https://github.com/saiemsaeed/sayall/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/saiemsaeed/sayall/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/saiemsaeed/sayall/compare/v0.3.0...v0.3.1
