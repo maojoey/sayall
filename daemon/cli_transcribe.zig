@@ -236,7 +236,7 @@ test "local CLI output wait is bounded before any helper is started" {
     try std.testing.expectEqual(batch.ErrorCode.local_timeout, batch.mapLocalError(error.Timeout));
 }
 
-fn defaultLocalModel(gpa: std.mem.Allocator, env: *const std.process.Environ.Map) ![]const u8 {
+pub fn defaultLocalModel(gpa: std.mem.Allocator, env: *const std.process.Environ.Map) ![]const u8 {
     const filename = @import("stt/local.zig").model_filename;
     if (env.get("XDG_DATA_HOME")) |root| {
         if (root.len != 0) {

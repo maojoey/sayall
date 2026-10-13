@@ -33,6 +33,7 @@ pub fn run(arena: std.mem.Allocator, io: std.Io, env: *const std.process.Environ
     const executable = std.process.executablePathAlloc(io, arena) catch "unavailable";
     var config_detail: []const u8 = "valid and credentials configured";
     var config_ok = true;
+    var local_model_path: ?[]const u8 = null;
     var warnings: u8 = 0;
     const audit = auditConfig(arena, io, env) catch |err| ConfigAudit{ .safe = false, .detail = @errorName(err) };
     if (audit.safe) {
@@ -41,6 +42,13 @@ pub fn run(arena: std.mem.Allocator, io: std.Io, env: *const std.process.Environ
                 const local = localModeDiagnostic(builtin.os.tag);
                 config_ok = local.supported;
                 config_detail = local.detail;
+                if (local.supported) {
+                    local_model_path = if (cfg.stt.local_model_path.len != 0) cfg.stt.local_model_path else @import("cli_transcribe.zig").defaultLocalModel(arena, env) catch null;
+                    if (local_model_path == null) {
+                        config_ok = false;
+                        config_detail = "local model path is unavailable; configure stt.local_model_path or an absolute data home";
+                    }
+                }
             } else if (cfg.stt.api_key.len == 0) {
                 config_ok = false;
                 config_detail = "Deepgram credentials are missing";
@@ -60,12 +68,20 @@ pub fn run(arena: std.mem.Allocator, io: std.Io, env: *const std.process.Environ
     const permissions_detail = audit.detail;
     const worker = findWorker(arena, io, executable);
     const worker_ok = if (worker) |path| protocolCompatible(arena, io, path, version) else false;
+    if (local_model_path) |model| {
+        const readiness = if (worker_ok) localReadiness(arena, io, worker.?, model) else LocalReadiness{
+            .ready = false,
+            .detail = "local readiness unavailable: packaged worker is missing or incompatible",
+        };
+        config_ok = readiness.ready;
+        config_detail = readiness.detail;
+    }
     const host_result = host.status(); // Status is deliberately nonmutating and never launches the host.
     const host_ok = switch (host_result) {
         .idle, .starting, .recording, .stopping, .processing, .delivering, .success, .host_error, .cancelled => true,
         else => false,
     };
-    var failures: u8 = @intFromBool(!config_ok) + @intFromBool(!permissions_ok) + @intFromBool(!worker_ok) + @intFromBool(!host_ok);
+    var failures = checkFailures(.{ config_ok, permissions_ok, worker_ok, host_ok });
     for (platform) |item| switch (item.status) {
         .fail => failures += 1,
         .warn => warnings += 1,
@@ -106,6 +122,22 @@ pub fn run(arena: std.mem.Allocator, io: std.Io, env: *const std.process.Environ
     return if (failures == 0) 0 else 1;
 }
 
+fn checkFailures(checks: [4]bool) u8 {
+    // Sum in u8, not @intFromBool's u1: multiple failures must not wrap away
+    // in ReleaseFast (or trap in checked builds).
+    var failures: u8 = 0;
+    for (checks) |ok| {
+        if (!ok) failures += 1;
+    }
+    return failures;
+}
+
+test "doctor counts simultaneous failures without one-bit overflow" {
+    try std.testing.expectEqual(@as(u8, 0), checkFailures(.{ true, true, true, true }));
+    try std.testing.expectEqual(@as(u8, 2), checkFailures(.{ false, true, true, false }));
+    try std.testing.expectEqual(@as(u8, 4), checkFailures(.{ false, false, false, false }));
+}
+
 fn localModeDiagnostic(os: std.Target.Os.Tag) struct { supported: bool, detail: []const u8 } {
     return switch (os) {
         .linux => .{ .supported = true, .detail = "local configuration valid; credentials not required (Q8 readiness is checked before capture)" },
@@ -122,6 +154,68 @@ test "doctor distinguishes Linux local configuration from unsupported native hos
     try std.testing.expect(!macos.supported);
     try std.testing.expectEqualStrings("native local recording is unsupported on macOS; select Deepgram for live recording", macos.detail);
     try std.testing.expect(!localModeDiagnostic(.windows).supported);
+}
+
+const LocalReadiness = struct {
+    ready: bool = false,
+    detail: []const u8 = "local readiness probe failed or timed out",
+};
+
+fn localReadiness(arena: std.mem.Allocator, io: std.Io, worker: []const u8, model: []const u8) LocalReadiness {
+    var empty_env = std.process.Environ.Map.init(arena);
+    defer empty_env.deinit();
+    const result = std.process.run(arena, io, .{
+        .argv = &.{ worker, "--local-readiness", model },
+        .environ_map = &empty_env,
+        .stdout_limit = .limited(worker_protocol.max_ready_bytes),
+        .stderr_limit = .limited(worker_protocol.max_ready_bytes),
+        .timeout = .{ .duration = .{ .clock = .awake, .raw = .fromSeconds(2) } },
+    }) catch return .{};
+    defer arena.free(result.stdout);
+    defer arena.free(result.stderr);
+    if (result.term != .exited or result.term.exited != 0) return .{};
+    return parseLocalReadiness(arena, result.stdout);
+}
+
+fn parseLocalReadiness(arena: std.mem.Allocator, bytes: []const u8) LocalReadiness {
+    if (bytes.len > worker_protocol.max_ready_bytes) return .{};
+    const Frame = struct { version: u32, ready: bool, @"error": ?[]const u8 = null };
+    const parsed = std.json.parseFromSlice(Frame, arena, bytes, .{ .ignore_unknown_fields = true }) catch return .{};
+    defer parsed.deinit();
+    if (parsed.value.version != worker_protocol.version) return .{};
+    if (parsed.value.@"error") |code| {
+        if (std.mem.eql(u8, code, "local_model_missing"))
+            return .{ .detail = "local Q8 model is missing; check stt.local_model_path" };
+        if (std.mem.eql(u8, code, "local_model_invalid"))
+            return .{ .detail = "local Q8 model is invalid or unreadable; reinstall the pinned model" };
+        if (std.mem.eql(u8, code, "local_unavailable"))
+            return .{ .detail = "local Q8 helper is missing or not executable" };
+        return .{};
+    }
+    if (!parsed.value.ready) return .{};
+    return .{ .ready = true, .detail = "local artifacts present; credentials not required (integrity is checked before inference)" };
+}
+
+test "doctor local readiness fails closed without echoing worker payloads" {
+    const gpa = std.testing.allocator;
+    try std.testing.expect(parseLocalReadiness(gpa, "{\"version\":4,\"ready\":true}").ready);
+    for ([_][]const u8{
+        "",                                "{}",                                 "{\"version\":3,\"ready\":true}",
+        "{\"version\":4,\"ready\":false}", "{\"version\":4,\"ready\":\"true\"}", "{\"version\":4,\"ready\":true,\"error\":\"private payload\"}",
+    }) |invalid| {
+        const result = parseLocalReadiness(gpa, invalid);
+        try std.testing.expect(!result.ready);
+        try std.testing.expectEqualStrings("local readiness probe failed or timed out", result.detail);
+    }
+    const oversized = [_]u8{' '} ** (worker_protocol.max_ready_bytes + 1);
+    try std.testing.expect(!parseLocalReadiness(gpa, &oversized).ready);
+    for ([_][]const u8{ "local_model_missing", "local_model_invalid", "local_unavailable" }) |code| {
+        const frame = try std.fmt.allocPrint(gpa, "{{\"version\":4,\"ready\":false,\"error\":\"{s}\"}}", .{code});
+        defer gpa.free(frame);
+        const result = parseLocalReadiness(gpa, frame);
+        try std.testing.expect(!result.ready);
+        try std.testing.expect(!std.mem.eql(u8, result.detail, "local readiness probe failed or timed out"));
+    }
 }
 
 fn auditConfig(arena: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map) !ConfigAudit {

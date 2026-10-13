@@ -68,7 +68,9 @@ XDG_CONFIG_HOME="<bundle>/config" <bundle>/sayall config validate --json
 
 The readiness operation returns bounded v4 `{version,ready,error?}` JSON. It
 checks model presence/size/readability and helper presence **before microphone
-capture**, not full integrity. SHA-256 verification still happens on the held
+capture**, not full integrity. `sayall doctor` performs the same bounded probe
+for local configurations and reports missing/unavailable artifacts as failures.
+SHA-256 verification still happens on the held
 model handle before inference. Missing/incompatible artifacts do not start a
 cloud session or trigger downloads.
 
