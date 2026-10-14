@@ -175,7 +175,7 @@ def parse_profiles(value: str) -> tuple[str, ...]:
     return profiles
 
 def request(clip, wav_path, pcm_path, key, args, profile):
-    return {"version": 4, "wav_path": str(wav_path), "pcm_path": str(pcm_path),
+    return {"version": 5, "wav_path": str(wav_path), "pcm_path": str(pcm_path),
             "deepgram_api_key": key, "deepgram_model": args.model, "deepgram_language": clip["language"],
             "deepgram_region": args.region, "deepgram_keyterms": [], "stream_finalize_timeout_ms": 5000,
             "llm_api_key": "", "processing_profile": profile}
@@ -198,16 +198,16 @@ def read_line(proc, timeout):
                 except (json.JSONDecodeError, UnicodeError) as error: raise ProtocolError("invalid worker JSON") from error
 
 def validate_ready(frame):
-    if (not isinstance(frame, dict) or frame.get("version") != 4 or frame.get("event") != "ready"
+    if (not isinstance(frame, dict) or frame.get("version") != 5 or frame.get("event") != "ready"
             or not isinstance(frame.get("streaming"), bool)):
         raise ProtocolError("invalid worker ready frame")
 
 def validate_result(frame):
     if not isinstance(frame, dict): raise ProtocolError("worker result is not an object")
     status = frame.get("status")
-    if frame.get("version") != 4 or status not in ("success", "no_speech", "error"):
+    if frame.get("version") != 5 or status not in ("success", "no_speech", "error"):
         raise ProtocolError("invalid worker result frame")
-    if frame.get("processing_profile") not in ("verbatim", "clean", "polished", "legacy_v1"):
+    if frame.get("processing_profile") not in ("verbatim", "clean", "llm", "legacy_v1"):
         raise ProtocolError("worker result omitted effective processing profile")
     if frame.get("transport") not in ("rest", "stream"):
         raise ProtocolError("worker result omitted authoritative transport")
@@ -256,7 +256,7 @@ def run_worker(worker, mode, req, pcm, timeout):
             with pcm_path.open("ab", buffering=0) as out:
                 for offset in range(0, len(pcm), 3200): out.write(pcm[offset:offset+3200]); time.sleep(0.1)
             feed_finished = time.monotonic()
-            proc.stdin.write(b'{"version":4,"command":"finish","force_rest":false}\n'); proc.stdin.flush()
+            proc.stdin.write(b'{"version":5,"command":"finish","force_rest":false}\n'); proc.stdin.flush()
             finish_sent = time.monotonic()
             result = read_line(proc, timeout)
             validate_result(result)
@@ -282,7 +282,7 @@ def worker_identity(worker):
     try: frame = json.loads(p.stdout)
     except (json.JSONDecodeError, UnicodeError) as error: raise ProtocolError("invalid worker identity JSON") from error
     if (not isinstance(frame, dict) or type(frame.get("protocol_version")) is not int
-            or frame["protocol_version"] != 4
+            or frame["protocol_version"] != 5
             or not isinstance(frame.get("build_version"), str)
             or not frame["build_version"] or len(frame["build_version"]) > 128
             or any(character.isspace() for character in frame["build_version"])):

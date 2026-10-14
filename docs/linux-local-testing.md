@@ -9,7 +9,7 @@ and delivers only final text. `stt.streaming: false` retains explicit batch-afte
 stop behavior. The model is not yet retained between recordings.
 
 No Deepgram/Cerebras keys or cloud fallback are used. Clean is the local
-default; Verbatim is also supported. Polished, other models, non-English and
+default; Verbatim is also supported. LLM, other models, non-English and
 keyterms are explicitly rejected. Existing cloud users/configs are unchanged.
 Native macOS local recording remains unsupported and is rejected before keyring
 lookup. Portable Linux packaging and distribution approval remain release gates.
@@ -57,7 +57,7 @@ Create `<bundle>/config/sayall/` with mode `0700` and a `config.json` with mode
 `model` field can be omitted. Copy only desired recording/output/HUD preferences
 from the existing config, not credentials. Cloud credentials and formatting
 values are not forwarded. The `streaming` flag now selects the local incremental
-path rather than opening a cloud connection. A switch to Polished fails before saving or recording.
+path rather than opening a cloud connection. A switch to LLM fails before saving or recording.
 
 Validate with the bundle-matched CLI/worker:
 

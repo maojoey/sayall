@@ -48,7 +48,7 @@ def main():
                                     env=env, capture_output=True, timeout=CLI_BUDGET)
             assert result.stderr == b"", "unexpected diagnostics (contents withheld)"
             value = json.loads(result.stdout)
-            assert value["version"] == 4 and value["transport"] == "local"
+            assert value["version"] == 5 and value["transport"] == "local"
             assert result.returncode == (1 if value["status"] == "error" else 0)
             return value
 
@@ -89,10 +89,10 @@ def main():
         assert run(audio=silence)["status"] == "no_speech"
 
         worker = cli.with_name("sayall-process")
-        request = {"version": 4, "wav_path": str(private), "stt_provider": "local",
+        request = {"version": 5, "wav_path": str(private), "stt_provider": "local",
                    "local_model_path": str(model), "deepgram_api_key": "", "llm_api_key": "",
                    "processing_profile": "verbatim"}
-        for change, expected in (({"processing_profile": "polished"}, "unsupported_features"),
+        for change, expected in (({"processing_profile": "llm"}, "unsupported_features"),
                                  ({"version": 3}, "incompatible_version"),
                                  ({"deepgram_api_key": "must-not-use"}, "invalid_request")):
             proc = subprocess.run([str(worker)], input=json.dumps(request | change).encode(),

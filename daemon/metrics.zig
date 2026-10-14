@@ -778,12 +778,12 @@ test "store persists outcomes and rotates detailed history" {
             .stop_to_final_ms = if (outcome == .success) 300 else null,
             .word_count = if (outcome == .success) 4 else null,
             .character_count = if (outcome == .success) 20 else null,
-            .processing_profile = if (outcome == .success) .polished else null,
+            .processing_profile = if (outcome == .success) .llm else null,
             .transformation_outcome = if (outcome == .success) .changed else .not_requested,
             .planner_latency_ms = if (outcome == .success) 41 else null,
         });
         if (outcome == .success) try store.annotateProcessing(std.testing.allocator, std.testing.io, id, .{
-            .processing_profile = .polished,
+            .processing_profile = .llm,
             .transformation_outcome = .no_change,
             .planner_latency_ms = 42,
         });
@@ -804,9 +804,30 @@ test "store persists outcomes and rotates detailed history" {
     const persisted = try std.json.parseFromSlice(State, std.testing.allocator, bytes, .{});
     defer persisted.deinit();
     const latest = persisted.value.history[persisted.value.history.len - 1];
-    try std.testing.expectEqual(processing.Profile.polished, latest.processing_profile.?);
+    try std.testing.expectEqual(processing.Profile.llm, latest.processing_profile.?);
     try std.testing.expectEqual(processing.TransformationOutcome.no_change, latest.transformation_outcome);
     try std.testing.expectEqual(@as(?u64, 42), latest.planner_latency_ms);
+}
+
+test "removed processing profile rejects metrics updates without overwriting history" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metrics-v2.json", .{tmp.sub_path});
+    defer std.testing.allocator.free(path);
+    const bytes =
+        \\{"version":2,"history":[{"attempt_id":"old","started_at_unix_ms":0,"source":"test","provider":"deepgram","model":"nova-3","language":"en","audio_ms":1000,"latency_ms":200,"outcome":"success","processing_profile":"polished"}]}
+    ;
+    const file = try Io.Dir.cwd().createFile(std.testing.io, path, .{});
+    try file.writeStreamingAll(std.testing.io, bytes);
+    file.close(std.testing.io);
+    const store = Store.init(path, 1000);
+    try std.testing.expectError(error.InvalidEnumTag, store.annotateProcessing(std.testing.allocator, std.testing.io, "old", .{
+        .processing_profile = .llm,
+        .transformation_outcome = .changed,
+    }));
+    const unchanged = try Io.Dir.cwd().readFileAlloc(std.testing.io, path, std.testing.allocator, .limited(4096));
+    defer std.testing.allocator.free(unchanged);
+    try std.testing.expectEqualStrings(bytes, unchanged);
 }
 
 test "metrics processing metadata is backward-compatible and serializable" {

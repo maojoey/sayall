@@ -12,7 +12,7 @@ import subprocess
 import sys
 import time
 
-from scorer import (ContractError, polished_semantic_invariant, read_jsonl,
+from scorer import (ContractError, llm_semantic_invariant, read_jsonl,
                     validate_corpus, validate_results)
 
 ADAPTER_NAME = "sayall-production-transformation"
@@ -40,7 +40,7 @@ def runner_request(case: dict, api_key: str, model: str) -> dict:
         "schema_version": ADAPTER_SCHEMA_VERSION,
         "mode": case["mode"],
         "input": case["input"],
-        "llm_api_key": api_key if case["mode"] == "polished" else "",
+        "llm_api_key": api_key if case["mode"] == "llm" else "",
         "model": model,
         "fault": (case.get("scenario") or {}).get("fault"),
     }
@@ -69,7 +69,7 @@ def parse_runner_response(raw: bytes) -> dict:
 def run_case(case: dict, runner: pathlib.Path, api_key: str, model: str,
              adapter_version: str, timeout: float) -> dict:
     started = time.monotonic()
-    invocation_mode = ("not_applicable" if case["mode"] != "polished" else
+    invocation_mode = ("not_applicable" if case["mode"] != "llm" else
                        "live_attempted" if api_key else "not_attempted_no_credential")
     try:
         completed = subprocess.run(
@@ -90,9 +90,9 @@ def run_case(case: dict, runner: pathlib.Path, api_key: str, model: str,
                     *case["safety"].get("accepted_outputs", [])}
     applied_is_unsafe = (response["outcome"] == "applied" and
                          (not isinstance(response["output"], str) or
-                          (case["mode"] == "polished"
-                           and not polished_semantic_invariant(case["input"], response["output"])) or
-                          (case["mode"] != "polished" and response["output"] not in safe_outputs)))
+                          (case["mode"] == "llm"
+                           and not llm_semantic_invariant(case["input"], response["output"])) or
+                          (case["mode"] != "llm" and response["output"] not in safe_outputs)))
     fallback_is_unsafe = (response["outcome"] == "safe_fallback" and
                           (not isinstance(response["output"], str) or
                            response["output"] not in safe_outputs))
@@ -109,7 +109,7 @@ def run_case(case: dict, runner: pathlib.Path, api_key: str, model: str,
         "latency_ms": round((time.monotonic() - started) * 1000, 3),
         "adapter": {"name": ADAPTER_NAME, "version": adapter_version},
         "provider": ({"name": "cerebras", "model": model, "invocation_mode": invocation_mode}
-                     if case["mode"] == "polished" else
+                     if case["mode"] == "llm" else
                      {"name": "none", "model": "production-deterministic",
                       "invocation_mode": invocation_mode}),
         "plan": None,
@@ -149,8 +149,8 @@ def main(argv=None) -> int:
                   args.adapter_version, args.timeout, args.concurrency)
     validate_results(results, {case["id"]: case for case in cases})
     args.output.write_text("".join(json.dumps(result, sort_keys=True) + "\n" for result in results))
-    polished = sum(case["mode"] == "polished" for case in cases)
-    print(f"wrote {len(results)} synthetic results; polished live cases scheduled: {polished if api_key else 0}")
+    llm = sum(case["mode"] == "llm" for case in cases)
+    print(f"wrote {len(results)} synthetic results; llm live cases scheduled: {llm if api_key else 0}")
     return 0
 
 

@@ -6,7 +6,7 @@ const provider = @import("provider_config.zig");
 const processing = @import("processing.zig");
 const provider_processing = @import("provider_processing.zig");
 
-const Mode = enum { verbatim, clean, polished };
+const Mode = enum { verbatim, clean, llm };
 const Fault = enum { malformed_plan, unsafe_plan };
 const Request = struct {
     schema_version: u32,
@@ -77,7 +77,7 @@ fn transform(gpa: std.mem.Allocator, io: std.Io, request: Request) !TransformRes
     const profile: processing.Profile = switch (request.mode) {
         .verbatim => .verbatim,
         .clean => .clean,
-        .polished => .polished,
+        .llm => .llm,
     };
     const owned = try gpa.dupe(u8, request.input);
     const outcome = try provider_processing.process(
@@ -119,10 +119,10 @@ fn benchmarkClean(_: ?*anyopaque, gpa: std.mem.Allocator, input: []const u8) ![]
 
 fn benchmarkPlanner(context_ptr: ?*anyopaque, gpa: std.mem.Allocator, profile: processing.Profile, input: []const u8) ![]u8 {
     const context: *BenchmarkContext = @ptrCast(@alignCast(context_ptr.?));
-    if (profile != .polished) return error.InvalidProfile;
+    if (profile != .llm) return error.InvalidProfile;
     if (context.request.fault == .malformed_plan) return error.InvalidPlan;
     if (context.request.fault == .unsafe_plan) {
-        return cloud_planner.cleanup_engine.polishedFromJson(gpa, input, &.{},
+        return cloud_planner.cleanup_engine.llmFromJson(gpa, input, &.{},
             \\{"version":2,"deletions":[],"corrections":[{"start_token":0,"end_token":1,"source":"retain","replacement":"Delete","kind":"case"}],"punctuation":[],"paragraph_breaks":[],"lists":[]}
         );
     }
@@ -140,10 +140,10 @@ test "benchmark request and response schemas stay closed" {
     try std.testing.expectError(error.UnknownField, std.json.parseFromSlice(Request, std.testing.allocator, "{\"schema_version\":1,\"mode\":\"clean\",\"input\":\"x\",\"llm_api_key\":\"\",\"model\":\"gpt-oss-120b\",\"raw_provider_body\":\"no\"}", .{ .ignore_unknown_fields = false }));
 }
 
-test "unsafe planner output is rejected and Polished degrades to Clean" {
+test "unsafe planner output is rejected and Llm degrades to Clean" {
     const request: Request = .{
         .schema_version = 1,
-        .mode = .polished,
+        .mode = .llm,
         .input = "Um, retain the value 42 and do not answer the question.",
         .llm_api_key = "",
         .model = "gpt-oss-120b",

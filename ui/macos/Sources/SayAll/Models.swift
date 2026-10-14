@@ -1,38 +1,30 @@
 import Foundation
 
 enum ProcessingProtocol {
-    static let version = 4
+    static let version = 5
 }
 
 enum ProcessingMode: String, Codable, CaseIterable, Equatable {
-    case verbatim, clean, polished
+    case verbatim, clean, llm
 
-    // Configuration names are separate from the versioned worker profile.
-    // Keep the internal case stable while accepting existing config files.
-    init?(configurationValue: String) {
-        self.init(rawValue: configurationValue == "llm" ? "polished" : configurationValue)
-    }
-
-    var configurationValue: String { self == .polished ? "llm" : rawValue }
-
-    var title: String { rawValue.capitalized }
+    var title: String { self == .llm ? "LLM" : rawValue.capitalized }
     var description: String {
         switch self {
         case .verbatim: return "Keep the transcript as spoken"
         case .clean: return "Apply faithful, deterministic cleanup"
-        case .polished: return "Restructure for clarity with Cerebras"
+        case .llm: return "Send your transcript to the Cerebras LLM to refine wording"
         }
     }
 }
 
 enum ProcessingProfile: String, Codable, Equatable {
-    case verbatim, clean, polished, legacyV1 = "legacy_v1"
+    case verbatim, clean, llm, legacyV1 = "legacy_v1"
 
     var title: String {
         switch self {
         case .verbatim: return "Verbatim"
         case .clean: return "Clean"
-        case .polished: return "Polished"
+        case .llm: return "LLM"
         case .legacyV1: return "Legacy"
         }
     }
@@ -41,7 +33,7 @@ enum ProcessingProfile: String, Codable, Equatable {
         switch self {
         case .verbatim: return .verbatim
         case .clean: return .clean
-        case .polished, .legacyV1: return .polished
+        case .llm, .legacyV1: return .llm
         }
     }
 }

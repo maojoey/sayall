@@ -30,7 +30,7 @@ pub const Punctuation = struct { after_token: usize, mark: PunctuationMark };
 pub const ListKind = enum { bullet, numbered };
 pub const ListAnchor = struct { start_token: usize };
 pub const List = struct { start_token: usize, end_token: usize, items: []const ListAnchor, kind: ListKind };
-pub const PolishedPlan = struct {
+pub const LlmPlan = struct {
     version: u32,
     deletions: []const Deletion,
     corrections: []const Correction,
@@ -511,16 +511,16 @@ fn reportingAttribution(segment: []const u8) bool {
 
 /// Parse, validate and render v2. Malformed or unsafe plans are rejected so
 /// the pipeline owner can apply raw fallback and record a transformation failure.
-pub fn polishedFromJson(gpa: Allocator, transcript: []const u8, glossary: []const []const u8, json: []const u8) Error![]u8 {
-    const parsed = std.json.parseFromSlice(PolishedPlan, gpa, json, .{ .ignore_unknown_fields = false }) catch |e| switch (e) {
+pub fn llmFromJson(gpa: Allocator, transcript: []const u8, glossary: []const []const u8, json: []const u8) Error![]u8 {
+    const parsed = std.json.parseFromSlice(LlmPlan, gpa, json, .{ .ignore_unknown_fields = false }) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.InvalidPlan,
     };
     defer parsed.deinit();
-    return polished(gpa, transcript, glossary, parsed.value);
+    return llm(gpa, transcript, glossary, parsed.value);
 }
 
-pub fn polished(gpa: Allocator, transcript: []const u8, glossary: []const []const u8, plan: PolishedPlan) Error![]u8 {
+pub fn llm(gpa: Allocator, transcript: []const u8, glossary: []const []const u8, plan: LlmPlan) Error![]u8 {
     const tokens = try tokenize(gpa, transcript);
     defer gpa.free(tokens);
     if (tokens.len == 0 or tokens.len > max_tokens) return error.InvalidPlan;
@@ -593,7 +593,7 @@ pub fn polished(gpa: Allocator, transcript: []const u8, glossary: []const []cons
         for (plan.corrections) |c| if (list.end_token > c.start_token and list.end_token < c.end_token) return error.InvalidPlan;
     }
 
-    return renderPolished(gpa, transcript, tokens, deleted, plan);
+    return renderLlm(gpa, transcript, tokens, deleted, plan);
 }
 
 fn punctuationSplitsClause(tokens: []const Token, after: usize) bool {
@@ -684,7 +684,7 @@ fn renderClean(gpa: Allocator, source: []const u8, tokens: []const Token, delete
     if (!deleted_after) try out.appendSlice(gpa, source[tokenChunkEnd(source, tokens[previous])..]);
     return out.toOwnedSlice(gpa);
 }
-fn renderPolished(gpa: Allocator, source: []const u8, tokens: []const Token, deleted: []const bool, plan: PolishedPlan) ![]u8 {
+fn renderLlm(gpa: Allocator, source: []const u8, tokens: []const Token, deleted: []const bool, plan: LlmPlan) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(gpa);
     var ci: usize = 0;
@@ -756,7 +756,7 @@ fn listItem(lists: []const List, token: usize) ?ListItemInfo {
     for (lists) |l| for (l.items, 0..) |item, i| if (item.start_token == token) return .{ .kind = l.kind, .number = i + 1 };
     return null;
 }
-fn layoutAt(plan: PolishedPlan, token: usize) u2 {
+fn layoutAt(plan: LlmPlan, token: usize) u2 {
     for (plan.paragraph_breaks) |x| if (x == token) return 2;
     if (listItem(plan.lists, token) != null) return 1;
     for (plan.lists) |l| if (l.end_token == token) return 1;
@@ -1276,8 +1276,8 @@ test "single repeats and ambiguous actually survive" {
     defer a.free(x);
     try std.testing.expectEqualStrings("no no I actually agree", x);
 }
-test "invalid polished JSON surfaces InvalidPlan" {
-    try std.testing.expectError(error.InvalidPlan, polishedFromJson(std.testing.allocator, "do not go", &.{}, "{}"));
+test "invalid llm JSON surfaces InvalidPlan" {
+    try std.testing.expectError(error.InvalidPlan, llmFromJson(std.testing.allocator, "do not go", &.{}, "{}"));
 }
 
 fn expectClean(source: []const u8, expected: []const u8, glossary: []const []const u8) !void {
@@ -1286,10 +1286,10 @@ fn expectClean(source: []const u8, expected: []const u8, glossary: []const []con
     try std.testing.expectEqualStrings(expected, out);
 }
 
-fn expectInvalidPlan(source: []const u8, glossary: []const []const u8, plan: PolishedPlan) !void {
+fn expectInvalidPlan(source: []const u8, glossary: []const []const u8, plan: LlmPlan) !void {
     const json = try std.json.Stringify.valueAlloc(std.testing.allocator, plan, .{});
     defer std.testing.allocator.free(json);
-    try std.testing.expectError(error.InvalidPlan, polishedFromJson(std.testing.allocator, source, glossary, json));
+    try std.testing.expectError(error.InvalidPlan, llmFromJson(std.testing.allocator, source, glossary, json));
 }
 
 test "clean removes only the four unambiguous fillers" {
@@ -1735,14 +1735,14 @@ test "clean accepts only locally provable scalar backtracks" {
     try expectClean("You cannot pay 10 actually 12", "You cannot pay 10 actually 12", &.{});
 }
 
-test "polished compiles corrections punctuation paragraphs and numbered lists" {
+test "llm compiles corrections punctuation paragraphs and numbered lists" {
     const source = "hello world first tea second coffee end";
     const corrections = [_]Correction{.{ .start_token = 0, .end_token = 1, .source = "hello", .replacement = "Hello", .kind = .case }};
     const punctuation_marks = [_]Punctuation{.{ .after_token = 1, .mark = .period }};
     const paragraphs = [_]usize{2};
     const items = [_]ListAnchor{ .{ .start_token = 2 }, .{ .start_token = 4 } };
     const lists = [_]List{.{ .start_token = 2, .end_token = 6, .items = &items, .kind = .numbered }};
-    const out = try polished(std.testing.allocator, source, &.{}, .{
+    const out = try llm(std.testing.allocator, source, &.{}, .{
         .version = 2,
         .deletions = &.{},
         .corrections = &corrections,
@@ -1754,11 +1754,11 @@ test "polished compiles corrections punctuation paragraphs and numbered lists" {
     try std.testing.expectEqualStrings("Hello world.\n\n1. first tea\n2. second coffee\nend", out);
 }
 
-test "polished never infers punctuation from a case correction" {
+test "llm never infers punctuation from a case correction" {
     const source = "This fixture is synthetic it contains no user data";
     const corrections = [_]Correction{.{ .start_token = 4, .end_token = 5, .source = "it", .replacement = "It", .kind = .case }};
     const punctuation_marks = [_]Punctuation{.{ .after_token = 8, .mark = .period }};
-    const out = try polished(std.testing.allocator, source, &.{}, .{
+    const out = try llm(std.testing.allocator, source, &.{}, .{
         .version = 2,
         .deletions = &.{},
         .corrections = &corrections,
@@ -1770,7 +1770,7 @@ test "polished never infers punctuation from a case correction" {
     try std.testing.expectEqualStrings("This fixture is synthetic It contains no user data.", out);
 }
 
-test "polished renders discourse-marker conditional punctuation exactly as planned" {
+test "llm renders discourse-marker conditional punctuation exactly as planned" {
     const source = "okay if i have good salary in germany can i avail wbs in germany";
     const corrections = [_]Correction{
         .{ .start_token = 0, .end_token = 1, .source = "okay", .replacement = "Okay", .kind = .case },
@@ -1785,7 +1785,7 @@ test "polished renders discourse-marker conditional punctuation exactly as plann
         .{ .after_token = 7, .mark = .comma },
         .{ .after_token = 13, .mark = .question },
     };
-    const out = try polished(std.testing.allocator, source, &.{}, .{
+    const out = try llm(std.testing.allocator, source, &.{}, .{
         .version = 2,
         .deletions = &.{},
         .corrections = &corrections,
@@ -1797,36 +1797,36 @@ test "polished renders discourse-marker conditional punctuation exactly as plann
     try std.testing.expectEqualStrings("Okay, if I have good salary in Germany, can I avail WBS in Germany?", out);
 }
 
-test "polished rejects lists introduced as reported or quoted content" {
+test "llm rejects lists introduced as reported or quoted content" {
     const source = "The button says quotation marks start first second third quotation mark end";
     const items = [_]ListAnchor{ .{ .start_token = 6 }, .{ .start_token = 7 }, .{ .start_token = 8 } };
     const lists = [_]List{.{ .start_token = 6, .end_token = 9, .items = &items, .kind = .bullet }};
     try expectInvalidPlan(source, &.{}, .{ .version = 2, .deletions = &.{}, .corrections = &.{}, .punctuation = &.{}, .paragraph_breaks = &.{}, .lists = &lists });
 }
 
-test "polished rejects a conjunction as a counted list item" {
+test "llm rejects a conjunction as a counted list item" {
     const source = "Can you bring me these four items apple banana and pears";
     const items = [_]ListAnchor{ .{ .start_token = 7 }, .{ .start_token = 8 }, .{ .start_token = 9 }, .{ .start_token = 10 } };
     const lists = [_]List{.{ .start_token = 7, .end_token = 11, .items = &items, .kind = .bullet }};
     try expectInvalidPlan(source, &.{}, .{ .version = 2, .deletions = &.{}, .corrections = &.{}, .punctuation = &.{}, .paragraph_breaks = &.{}, .lists = &lists });
 }
 
-test "polished accepts a counted list after an explicit bridge" {
+test "llm accepts a counted list after an explicit bridge" {
     const source = "I have three rules in my life commitment focus and passion";
     const punctuation_marks = [_]Punctuation{ .{ .after_token = 6, .mark = .colon }, .{ .after_token = 10, .mark = .period } };
     const items = [_]ListAnchor{ .{ .start_token = 7 }, .{ .start_token = 8 }, .{ .start_token = 9 } };
     const lists = [_]List{.{ .start_token = 7, .end_token = 11, .items = &items, .kind = .bullet }};
-    const out = try polished(std.testing.allocator, source, &.{}, .{ .version = 2, .deletions = &.{}, .corrections = &.{}, .punctuation = &punctuation_marks, .paragraph_breaks = &.{}, .lists = &lists });
+    const out = try llm(std.testing.allocator, source, &.{}, .{ .version = 2, .deletions = &.{}, .corrections = &.{}, .punctuation = &punctuation_marks, .paragraph_breaks = &.{}, .lists = &lists });
     defer std.testing.allocator.free(out);
     try std.testing.expectEqualStrings("I have three rules in my life:\n- commitment\n- focus\n- and passion.", out);
 }
 
-test "polished accepts a demonstrative list without a spoken count" {
+test "llm accepts a demonstrative list without a spoken count" {
     const source = "Can you bring me these things apple banana and pears";
     const punctuation_marks = [_]Punctuation{ .{ .after_token = 5, .mark = .colon }, .{ .after_token = 9, .mark = .question } };
     const items = [_]ListAnchor{ .{ .start_token = 6 }, .{ .start_token = 7 }, .{ .start_token = 8 } };
     const lists = [_]List{.{ .start_token = 6, .end_token = 10, .items = &items, .kind = .bullet }};
-    const out = try polished(std.testing.allocator, source, &.{}, .{ .version = 2, .deletions = &.{}, .corrections = &.{}, .punctuation = &punctuation_marks, .paragraph_breaks = &.{}, .lists = &lists });
+    const out = try llm(std.testing.allocator, source, &.{}, .{ .version = 2, .deletions = &.{}, .corrections = &.{}, .punctuation = &punctuation_marks, .paragraph_breaks = &.{}, .lists = &lists });
     defer std.testing.allocator.free(out);
     try std.testing.expectEqualStrings("Can you bring me these things:\n- apple\n- banana\n- and pears?", out);
 
@@ -1834,22 +1834,22 @@ test "polished accepts a demonstrative list without a spoken count" {
     const bridged_punctuation = [_]Punctuation{ .{ .after_token = 6, .mark = .colon }, .{ .after_token = 10, .mark = .period } };
     const bridged_items = [_]ListAnchor{ .{ .start_token = 7 }, .{ .start_token = 8 }, .{ .start_token = 9 } };
     const bridged_lists = [_]List{.{ .start_token = 7, .end_token = 11, .items = &bridged_items, .kind = .bullet }};
-    const bridged = try polished(std.testing.allocator, bridged_source, &.{}, .{ .version = 2, .deletions = &.{}, .corrections = &.{}, .punctuation = &bridged_punctuation, .paragraph_breaks = &.{}, .lists = &bridged_lists });
+    const bridged = try llm(std.testing.allocator, bridged_source, &.{}, .{ .version = 2, .deletions = &.{}, .corrections = &.{}, .punctuation = &bridged_punctuation, .paragraph_breaks = &.{}, .lists = &bridged_lists });
     defer std.testing.allocator.free(bridged);
     try std.testing.expectEqualStrings("I have these rules in my life:\n- commitment\n- focus\n- and passion.", bridged);
 }
 
-test "polished accepts counted repeated-label multi-token items" {
+test "llm accepts counted repeated-label multi-token items" {
     const source = "We have four problems problem one problem two problem three problem four";
     const punctuation_marks = [_]Punctuation{ .{ .after_token = 3, .mark = .colon }, .{ .after_token = 11, .mark = .period } };
     const items = [_]ListAnchor{ .{ .start_token = 4 }, .{ .start_token = 6 }, .{ .start_token = 8 }, .{ .start_token = 10 } };
     const lists = [_]List{.{ .start_token = 4, .end_token = 12, .items = &items, .kind = .bullet }};
-    const out = try polished(std.testing.allocator, source, &.{}, .{ .version = 2, .deletions = &.{}, .corrections = &.{}, .punctuation = &punctuation_marks, .paragraph_breaks = &.{}, .lists = &lists });
+    const out = try llm(std.testing.allocator, source, &.{}, .{ .version = 2, .deletions = &.{}, .corrections = &.{}, .punctuation = &punctuation_marks, .paragraph_breaks = &.{}, .lists = &lists });
     defer std.testing.allocator.free(out);
     try std.testing.expectEqualStrings("We have four problems:\n- problem one\n- problem two\n- problem three\n- problem four.", out);
 }
 
-test "polished rejects punctuation that splits a conditional question" {
+test "llm rejects punctuation that splits a conditional question" {
     const source = "If I have income can I qualify";
     const after_if = [_]Punctuation{.{ .after_token = 0, .mark = .period }};
     try expectInvalidPlan(source, &.{}, .{ .version = 2, .deletions = &.{}, .corrections = &.{}, .punctuation = &after_if, .paragraph_breaks = &.{}, .lists = &.{} });
@@ -1857,7 +1857,7 @@ test "polished rejects punctuation that splits a conditional question" {
     try expectInvalidPlan(source, &.{}, .{ .version = 2, .deletions = &.{}, .corrections = &.{}, .punctuation = &after_auxiliary, .paragraph_breaks = &.{}, .lists = &.{} });
 }
 
-test "polished rejects provider deletion plans" {
+test "llm rejects provider deletion plans" {
     const deletion = [_]Deletion{.{ .start_token = 0, .end_token = 1, .source = "um", .kind = .filler, .proof_start_token = 0, .proof_end_token = 1, .cue = "um", .category = null }};
     const items = [_]ListAnchor{ .{ .start_token = 1 }, .{ .start_token = 3 } };
     const lists = [_]List{.{ .start_token = 1, .end_token = 5, .items = &items, .kind = .bullet }};
@@ -1871,7 +1871,7 @@ test "polished rejects provider deletion plans" {
     });
 }
 
-test "polished rejects cleanup deletions and validates glossary proofs" {
+test "llm rejects cleanup deletions and validates glossary proofs" {
     const repetition = [_]Deletion{.{ .start_token = 2, .end_token = 4, .source = "go now", .kind = .repetition, .proof_start_token = 0, .proof_end_token = 2, .cue = "adjacent", .category = null }};
     try expectInvalidPlan("go now go now please", &.{}, .{ .version = 2, .deletions = &repetition, .corrections = &.{}, .punctuation = &.{}, .paragraph_breaks = &.{}, .lists = &.{} });
 
@@ -1879,24 +1879,24 @@ test "polished rejects cleanup deletions and validates glossary proofs" {
     try expectInvalidPlan("meet Tuesday actually Wednesday", &.{}, .{ .version = 2, .deletions = &backtrack, .corrections = &.{}, .punctuation = &.{}, .paragraph_breaks = &.{}, .lists = &.{} });
 
     const correction = [_]Correction{.{ .start_token = 0, .end_token = 1, .source = "sayall", .replacement = "SayAll", .kind = .glossary }};
-    const corrected = try polished(std.testing.allocator, "sayall works", &.{"SayAll"}, .{ .version = 2, .deletions = &.{}, .corrections = &correction, .punctuation = &.{}, .paragraph_breaks = &.{}, .lists = &.{} });
+    const corrected = try llm(std.testing.allocator, "sayall works", &.{"SayAll"}, .{ .version = 2, .deletions = &.{}, .corrections = &correction, .punctuation = &.{}, .paragraph_breaks = &.{}, .lists = &.{} });
     defer std.testing.allocator.free(corrected);
     try std.testing.expectEqualStrings("SayAll works", corrected);
 }
 
-test "polished empty plan preserves source slices and protected anchors reject" {
-    const empty: PolishedPlan = .{ .version = 2, .deletions = &.{}, .corrections = &.{}, .punctuation = &.{}, .paragraph_breaks = &.{}, .lists = &.{} };
+test "llm empty plan preserves source slices and protected anchors reject" {
+    const empty: LlmPlan = .{ .version = 2, .deletions = &.{}, .corrections = &.{}, .punctuation = &.{}, .paragraph_breaks = &.{}, .lists = &.{} };
     const exact_source = "He\tsaid  \" hello \"\n\nnext";
-    const exact = try polished(std.testing.allocator, exact_source, &.{}, empty);
+    const exact = try llm(std.testing.allocator, exact_source, &.{}, empty);
     defer std.testing.allocator.free(exact);
     try std.testing.expectEqualStrings(exact_source, exact);
     const decoration_source = "keep ()\t exact";
-    const decorated = try polished(std.testing.allocator, decoration_source, &.{}, empty);
+    const decorated = try llm(std.testing.allocator, decoration_source, &.{}, empty);
     defer std.testing.allocator.free(decorated);
     try std.testing.expectEqualStrings(decoration_source, decorated);
     const case = [_]Correction{.{ .start_token = 0, .end_token = 1, .source = "hello", .replacement = "Hello", .kind = .case }};
     const period = [_]Punctuation{.{ .after_token = 1, .mark = .period }};
-    const sliced = try polished(std.testing.allocator, "hello\tworld  tail\n", &.{}, .{ .version = 2, .deletions = &.{}, .corrections = &case, .punctuation = &period, .paragraph_breaks = &.{}, .lists = &.{} });
+    const sliced = try llm(std.testing.allocator, "hello\tworld  tail\n", &.{}, .{ .version = 2, .deletions = &.{}, .corrections = &case, .punctuation = &period, .paragraph_breaks = &.{}, .lists = &.{} });
     defer std.testing.allocator.free(sliced);
     try std.testing.expectEqualStrings("Hello\tworld.  tail\n", sliced);
     try expectClean("He said \" hello \"", "He said \" hello \"", &.{});
@@ -1909,15 +1909,15 @@ test "polished empty plan preserves source slices and protected anchors reject" 
     try expectInvalidPlan("1. tea 2. coffee", &.{}, .{ .version = 2, .deletions = &.{}, .corrections = &.{}, .punctuation = &.{}, .paragraph_breaks = &.{}, .lists = &numbered });
 
     const technical_punctuation = [_]Punctuation{.{ .after_token = 1, .mark = .period }};
-    const technical_output = try polished(std.testing.allocator, "visit https://example.com now", &.{}, .{ .version = 2, .deletions = &.{}, .corrections = &.{}, .punctuation = &technical_punctuation, .paragraph_breaks = &.{}, .lists = &.{} });
+    const technical_output = try llm(std.testing.allocator, "visit https://example.com now", &.{}, .{ .version = 2, .deletions = &.{}, .corrections = &.{}, .punctuation = &technical_punctuation, .paragraph_breaks = &.{}, .lists = &.{} });
     defer std.testing.allocator.free(technical_output);
     try std.testing.expectEqualStrings("visit https://example.com. now", technical_output);
     const technical_comma = [_]Punctuation{.{ .after_token = 1, .mark = .comma }};
-    const comma_output = try polished(std.testing.allocator, "visit https://example.com then continue", &.{}, .{ .version = 2, .deletions = &.{}, .corrections = &.{}, .punctuation = &technical_comma, .paragraph_breaks = &.{}, .lists = &.{} });
+    const comma_output = try llm(std.testing.allocator, "visit https://example.com then continue", &.{}, .{ .version = 2, .deletions = &.{}, .corrections = &.{}, .punctuation = &technical_comma, .paragraph_breaks = &.{}, .lists = &.{} });
     defer std.testing.allocator.free(comma_output);
     try std.testing.expectEqualStrings("visit https://example.com, then continue", comma_output);
     const terminal_technical_punctuation = [_]Punctuation{.{ .after_token = 1, .mark = .period }};
-    const terminal_output = try polished(std.testing.allocator, "email user@example.com", &.{}, .{ .version = 2, .deletions = &.{}, .corrections = &.{}, .punctuation = &terminal_technical_punctuation, .paragraph_breaks = &.{}, .lists = &.{} });
+    const terminal_output = try llm(std.testing.allocator, "email user@example.com", &.{}, .{ .version = 2, .deletions = &.{}, .corrections = &.{}, .punctuation = &terminal_technical_punctuation, .paragraph_breaks = &.{}, .lists = &.{} });
     defer std.testing.allocator.free(terminal_output);
     try std.testing.expectEqualStrings("email user@example.com.", terminal_output);
     try expectInvalidPlan("visit https://example.com/search?", &.{}, .{ .version = 2, .deletions = &.{}, .corrections = &.{}, .punctuation = &terminal_technical_punctuation, .paragraph_breaks = &.{}, .lists = &.{} });
@@ -1937,7 +1937,7 @@ test "polished empty plan preserves source slices and protected anchors reject" 
     try expectInvalidPlan("Say All next", &.{"Say All"}, .{ .version = 2, .deletions = &.{}, .corrections = &.{}, .punctuation = &.{}, .paragraph_breaks = &after_glossary_paragraph, .lists = &.{} });
 }
 
-test "polished rejects overlaps changed proofs injection and all deletion" {
+test "llm rejects overlaps changed proofs injection and all deletion" {
     const overlap = [_]Deletion{
         .{ .start_token = 0, .end_token = 1, .source = "um", .kind = .filler, .proof_start_token = 0, .proof_end_token = 1, .cue = "um", .category = null },
         .{ .start_token = 0, .end_token = 1, .source = "um", .kind = .filler, .proof_start_token = 0, .proof_end_token = 1, .cue = "um", .category = null },
@@ -2223,7 +2223,7 @@ test "long statements use actual recording tail instead of truncated prefix" {
     }
 }
 
-test "clean and polished bounds fail back raw" {
+test "clean and llm bounds fail back raw" {
     var large: std.ArrayList(u8) = .empty;
     defer large.deinit(std.testing.allocator);
     for (0..max_tokens + 1) |i| {

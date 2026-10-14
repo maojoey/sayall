@@ -13,7 +13,7 @@ import sys
 from collections import Counter, defaultdict
 
 SCORER_VERSION = "1.2.1"
-MODES = {"verbatim", "clean", "polished"}
+MODES = {"verbatim", "clean", "llm"}
 OUTCOMES = {"applied", "safe_fallback", "unsafe_plan", "adapter_error"}
 INVOCATION_MODES = {"not_applicable", "not_attempted_no_credential", "live_attempted"}
 DETERMINISTIC_TRANSFORMATION_GATES = {"clean-filler-um", "clean-url-path"}
@@ -132,7 +132,7 @@ def normalized_output_units(output: str, preserve_markers: bool = False) -> list
     return units
 
 
-def polished_semantic_invariant(source: str, output: str) -> bool:
+def llm_semantic_invariant(source: str, output: str) -> bool:
     source_has_markers = any(LIST_ITEM.match(line) for line in source.splitlines())
     return normalized_source_units(source) == normalized_output_units(output, preserve_markers=source_has_markers)
 
@@ -173,7 +173,7 @@ def validate_results(results: list[dict], cases_by_id: dict[str, dict]) -> dict[
                 or provider["invocation_mode"] not in INVOCATION_MODES):
             raise ContractError(f"invalid closed provider evidence: {case_id}")
         case = cases_by_id[case_id]
-        if ((case["mode"] == "polished") != (provider["invocation_mode"] != "not_applicable")):
+        if ((case["mode"] == "llm") != (provider["invocation_mode"] != "not_applicable")):
             raise ContractError(f"provider invocation mode does not match case mode: {case_id}")
         if result["outcome"] == "safe_fallback" and result.get("fallback_reason") not in {
                 "malformed_plan", "unsafe_plan", "provider_error", "adapter_rejection",
@@ -189,7 +189,7 @@ def validate_results(results: list[dict], cases_by_id: dict[str, dict]) -> dict[
             missing_key_fallback = (result["outcome"] == "safe_fallback"
                                     and result.get("fallback_reason") == "missing_credential")
             if not deterministic_applied and not missing_key_fallback:
-                raise ContractError(f"uncredentialed Polished case has wrong fallback: {case_id}")
+                raise ContractError(f"uncredentialed Llm case has wrong fallback: {case_id}")
         indexed[case_id] = result
     return indexed
 
@@ -255,8 +255,8 @@ def score(cases: list[dict], results: list[dict], corpus_sha256: str,
                 violations.append("fallback_changed_source")
         if output is not None:
             if outcome == "applied":
-                if case["mode"] == "polished":
-                    if not polished_semantic_invariant(case["input"], output):
+                if case["mode"] == "llm":
+                    if not llm_semantic_invariant(case["input"], output):
                         violations.append("semantic_units_changed")
                 elif output not in safe_outputs:
                     violations.append("unsafe_output")
@@ -294,8 +294,8 @@ def score(cases: list[dict], results: list[dict], corpus_sha256: str,
                        "scenario": case.get("scenario"),
                        "source": case["input"], "expected_output": case["expected_output"],
                        "actual_output": output if (output in safe_outputs or (
-                           case["mode"] == "polished" and isinstance(output, str)
-                           and polished_semantic_invariant(case["input"], output))) else None,
+                           case["mode"] == "llm" and isinstance(output, str)
+                           and llm_semantic_invariant(case["input"], output))) else None,
                        "outcome": outcome, "safety_pass": safety_pass,
                        "hard_violations": violations, "expected_match": expected_match,
                        "fallback_reason": None if result is None else result.get("fallback_reason"),
@@ -310,11 +310,11 @@ def score(cases: list[dict], results: list[dict], corpus_sha256: str,
                        },
                        "plan": None if result is None else result.get("plan")})
     identity = (cases[0]["schema_version"], cases[0]["corpus_id"])
-    polished = [item for item in scored if item["mode"] == "polished"]
-    live_polished = [item for item in polished
+    llm = [item for item in scored if item["mode"] == "llm"]
+    live_llm = [item for item in llm
                      if item.get("provider", {}).get("invocation_mode") == "live_attempted"]
-    live_latencies = [item["latency_ms"] for item in live_polished if item["latency_ms"] is not None]
-    invocation_counts = Counter(item.get("provider", {}).get("invocation_mode") for item in polished)
+    live_latencies = [item["latency_ms"] for item in live_llm if item["latency_ms"] is not None]
+    invocation_counts = Counter(item.get("provider", {}).get("invocation_mode") for item in llm)
     fallback_counts = Counter(item["fallback_reason"] for item in scored if item["fallback_reason"])
     summary = {
         "cases": len(cases), "results": len(results), "hard_safety_violations": hard_violations,
@@ -325,14 +325,14 @@ def score(cases: list[dict], results: list[dict], corpus_sha256: str,
                                      "rate": rate(positive_hits, positive_total)},
         "latency_ms": {f"p{p}": percentile(latencies, p) for p in (50, 95, 99)},
         "fallback_reasons": dict(sorted(fallback_counts.items())),
-        "polished_live": {
-            "cases": len(polished),
+        "llm_live": {
+            "cases": len(llm),
             "live_attempted": invocation_counts["live_attempted"],
             "not_attempted_no_credential": invocation_counts["not_attempted_no_credential"],
-            "applied": sum(item["outcome"] == "applied" for item in live_polished),
-            "safe_fallback": sum(item["outcome"] == "safe_fallback" for item in live_polished),
+            "applied": sum(item["outcome"] == "applied" for item in live_llm),
+            "safe_fallback": sum(item["outcome"] == "safe_fallback" for item in live_llm),
             "hard_errors": sum(item["outcome"] in {"unsafe_plan", "adapter_error"}
-                               for item in live_polished),
+                               for item in live_llm),
             "latency_ms": {f"p{p}": percentile(live_latencies, p) for p in (50, 95, 99)},
         },
     }
@@ -346,18 +346,18 @@ def score(cases: list[dict], results: list[dict], corpus_sha256: str,
                              "passed": counts["negative_passed"], "total": counts["negative_total"],
                              "rate": rate(counts["negative_passed"], counts["negative_total"])}}
                   for name, counts in sorted(category_counts.items())}
-    polished_provider = {
-        "invocation_modes": sorted({item.get("provider", {}).get("invocation_mode") for item in polished}),
-        "models": sorted({item.get("provider", {}).get("model") for item in polished}),
+    llm_provider = {
+        "invocation_modes": sorted({item.get("provider", {}).get("invocation_mode") for item in llm}),
+        "models": sorted({item.get("provider", {}).get("model") for item in llm}),
     }
     report = {"report_schema_version": 2, "scorer_version": SCORER_VERSION,
               "generated_at_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
               "corpus": {"schema_version": identity[0], "id": identity[1],
                          "sha256": corpus_sha256},
-              "polished_provider": polished_provider,
+              "llm_provider": llm_provider,
               "summary": summary, "categories": categories, "cases": scored}
     deterministic = [item for item in scored if item["case_id"] in DETERMINISTIC_TRANSFORMATION_GATES]
-    deterministic_cases = [item for item in scored if item["mode"] != "polished" or item["scenario"]]
+    deterministic_cases = [item for item in scored if item["mode"] != "llm" or item["scenario"]]
     report["deterministic_qualification"] = {
         "cases": len(deterministic_cases),
         "hard_safety": all(item["safety_pass"] for item in deterministic_cases),
@@ -396,8 +396,8 @@ def compare_baseline(current: dict, baseline: dict | None) -> dict:
             reasons.append(f"corpus.{field} differs")
     if current["report_schema_version"] != baseline.get("report_schema_version"):
         reasons.append("report_schema_version differs")
-    if current.get("polished_provider") != baseline.get("polished_provider"):
-        reasons.append("Polished invocation mode or model differs")
+    if current.get("llm_provider") != baseline.get("llm_provider"):
+        reasons.append("Llm invocation mode or model differs")
     if reasons:
         return {"comparable": False, "reasons": reasons, "deltas": {}}
     if (not valid_baseline_metrics(baseline)
@@ -410,9 +410,9 @@ def compare_baseline(current: dict, baseline: dict | None) -> dict:
         "positive_transformation_rate": now["positive_transformations"]["rate"] - before["positive_transformations"]["rate"],
     }
     for key in ("p50", "p95", "p99"):
-        current_value = now["polished_live"]["latency_ms"][key]
-        previous_value = before["polished_live"]["latency_ms"][key]
-        deltas[f"polished_live_latency_{key}_ms"] = (
+        current_value = now["llm_live"]["latency_ms"][key]
+        previous_value = before["llm_live"]["latency_ms"][key]
+        deltas[f"llm_live_latency_{key}_ms"] = (
             current_value - previous_value
             if current_value is not None and previous_value is not None else None
         )
@@ -436,7 +436,7 @@ def valid_baseline_metrics(baseline: dict) -> bool:
         quality_rates = [summary["negative_preservation"]["rate"],
                          summary["positive_transformations"]["rate"]]
         latencies = [summary["latency_ms"][key] for key in ("p50", "p95", "p99")]
-        live_latencies = [summary["polished_live"]["latency_ms"][key]
+        live_latencies = [summary["llm_live"]["latency_ms"][key]
                           for key in ("p50", "p95", "p99")]
         categories = baseline["categories"]
         if (type(hard) is not int or hard < 0
@@ -464,7 +464,7 @@ def valid_baseline_metrics(baseline: dict) -> bool:
 
 def markdown_report(report: dict) -> str:
     summary = report["summary"]
-    live = summary["polished_live"]
+    live = summary["llm_live"]
     def percent(value):
         return "—" if value is None else f"{value * 100:.2f}%"
     lines = ["# SayAll transformation benchmark", "",
@@ -477,14 +477,14 @@ def markdown_report(report: dict) -> str:
              f"| Negative preservation | {summary['negative_preservation']['passed']}/{summary['negative_preservation']['total']} ({percent(summary['negative_preservation']['rate'])}) |",
              f"| Positive transformations | {summary['positive_transformations']['passed']}/{summary['positive_transformations']['total']} ({percent(summary['positive_transformations']['rate'])}) |",
              f"| Adapter latency p50 / p95 / p99 | {summary['latency_ms']['p50']} / {summary['latency_ms']['p95']} / {summary['latency_ms']['p99']} ms |",
-             f"| Polished live attempts | {live['live_attempted']}/{live['cases']} |",
-             f"| Polished not attempted (no credential) | {live['not_attempted_no_credential']} |",
-             f"| Polished live applied / fallback / hard error | {live['applied']} / {live['safe_fallback']} / {live['hard_errors']} |",
-             f"| Polished live latency p50 / p95 / p99 | {live['latency_ms']['p50']} / {live['latency_ms']['p95']} / {live['latency_ms']['p99']} ms |",
+             f"| Llm live attempts | {live['live_attempted']}/{live['cases']} |",
+             f"| Llm not attempted (no credential) | {live['not_attempted_no_credential']} |",
+             f"| Llm live applied / fallback / hard error | {live['applied']} / {live['safe_fallback']} / {live['hard_errors']} |",
+             f"| Llm live latency p50 / p95 / p99 | {live['latency_ms']['p50']} / {live['latency_ms']['p95']} / {live['latency_ms']['p99']} ms |",
              f"| Fallback reasons | `{json.dumps(summary['fallback_reasons'], sort_keys=True)}` |",
              f"| Deterministic qualification | {'PASS' if report['deterministic_qualification']['passed'] else 'FAIL'} |",
              f"| Initial hard-gate qualification | {'PASS' if report['qualification']['passed'] else 'FAIL'} |",
-             "", "> Positive Polished quality and latency thresholds are not yet ratified and are reported as evidence only. Releases currently block on adapter integrity, hard safety, exact negative preservation, and deterministic Clean transformations.",
+             "", "> Positive Llm quality and latency thresholds are not yet ratified and are reported as evidence only. Releases currently block on adapter integrity, hard safety, exact negative preservation, and deterministic Clean transformations.",
              "", "## Categories", "", "| Category | Cases | Safety | Expected match |",
              "| --- | ---: | ---: | ---: |"]
     for name, values in report["categories"].items():

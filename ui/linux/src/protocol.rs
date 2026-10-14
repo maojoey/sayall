@@ -564,20 +564,20 @@ mod tests {
         let info: WorkerInfoFixture = serde_json::from_str(WORKER_INFO).unwrap();
         assert_eq!(
             (info.protocol_version, info.build_version.as_str()),
-            (4, "0.1.8")
+            (5, "0.1.8")
         );
         let ready: WorkerReadyFixture = serde_json::from_str(WORKER_READY_REST).unwrap();
         assert_eq!(
             (ready.version, ready.event.as_str(), ready.streaming),
-            (4, "ready", false)
+            (5, "ready", false)
         );
         let finish: WorkerFinishFixture = serde_json::from_str(WORKER_FINISH).unwrap();
         assert_eq!(
             (finish.version, finish.command.as_str(), finish.force_rest),
-            (4, "finish", false)
+            (5, "finish", false)
         );
         let success: WorkerResultFixture = serde_json::from_str(WORKER_SUCCESS).unwrap();
-        assert_eq!(success.version, 4);
+        assert_eq!(success.version, 5);
         assert_eq!(success.status, "success");
         assert_eq!(success.text.as_deref(), Some("Hello, world."));
         assert_eq!(success.processing_profile, "legacy_v1");
@@ -586,7 +586,7 @@ mod tests {
         let warning: WorkerResultFixture = serde_json::from_str(WORKER_WARNING).unwrap();
         assert_eq!(warning.warning.as_deref(), Some("transformation_failed"));
         assert_eq!(warning.text.as_deref(), Some("raw transcript"));
-        assert_eq!(warning.processing_profile, "polished");
+        assert_eq!(warning.processing_profile, "llm");
         assert_eq!(warning.transport, "stream");
 
         let request: HostRequestFixture = serde_json::from_str(HOST_STATUS_REQUEST).unwrap();

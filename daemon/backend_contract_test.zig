@@ -41,6 +41,10 @@ test "shared worker fixtures preserve canonical outcomes" {
     try std.testing.expect(ready.value.streaming);
 
     try std.testing.expectError(error.IncompatibleVersion, batch.parseResult(std.testing.allocator, fixtures.worker_result_v3_rejected));
+    try std.testing.expectError(error.IncompatibleVersion, batch.parseResult(
+        std.testing.allocator,
+        "{\"version\":4,\"status\":\"no_speech\",\"processing_profile\":\"clean\",\"transport\":\"rest\"}",
+    ));
     const local = try batch.parseResult(std.testing.allocator, fixtures.worker_result_local);
     defer local.deinit();
     try std.testing.expectEqual(batch.Transport.local, local.value.transport);
@@ -55,7 +59,7 @@ test "shared worker fixtures preserve canonical outcomes" {
     const warning = try parse(batch.Result, fixtures.worker_result_transformation_warning);
     defer warning.deinit();
     try std.testing.expectEqual(batch.Warning.transformation_failed, warning.value.warning.?);
-    try std.testing.expectEqual(.polished, warning.value.processing_profile);
+    try std.testing.expectEqual(.llm, warning.value.processing_profile);
     try std.testing.expectEqual(.stream, warning.value.transport);
     try std.testing.expectEqualStrings("raw transcript", warning.value.text.?);
 

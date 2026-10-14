@@ -112,7 +112,7 @@ struct ConfigurationLoader {
         } else {
             processing = [:]
         }
-        processing["mode"] = mode.configurationValue
+        processing["mode"] = mode.rawValue
         updated["processing"] = processing
         guard JSONSerialization.isValidJSONObject(updated),
               let data = try? JSONSerialization.data(withJSONObject: updated, options: [.prettyPrinted, .sortedKeys]),
@@ -164,7 +164,7 @@ struct ConfigurationLoader {
             document.llm?.baseURL ?? "https://api.cerebras.ai/v1/chat/completions"
         let configuredMode: ProcessingMode?
         if let rawMode = document.processing?.mode {
-            guard let mode = ProcessingMode(configurationValue: rawMode) else { throw ConfigurationError.invalidProcessingMode }
+            guard let mode = ProcessingMode(rawValue: rawMode) else { throw ConfigurationError.invalidProcessingMode }
             configuredMode = mode
         } else {
             configuredMode = nil
@@ -187,7 +187,7 @@ struct ConfigurationLoader {
         guard Self.supportedPlannerModels.contains(llmModel) else {
             throw ConfigurationError.unsupportedPlannerModel
         }
-        if configuredMode == .polished {
+        if configuredMode == .llm {
             guard !cerebras.isEmpty else { throw ConfigurationError.missingCerebrasKey }
         }
         guard (document.stt?.provider ?? "deepgram") == "deepgram",

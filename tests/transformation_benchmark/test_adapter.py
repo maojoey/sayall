@@ -12,13 +12,13 @@ from scorer import ContractError
 
 CASE = {
     "id": "synthetic",
-    "mode": "polished",
+    "mode": "llm",
     "input": "Synthetic input",
     "expected_output": "Synthetic output",
     "safety": {"accepted_outputs": []},
     "scenario": {"fault": "malformed_plan"},
 }
-POLISHED_CASE = {key: value for key, value in CASE.items() if key != "scenario"}
+LLM_CASE = {key: value for key, value in CASE.items() if key != "scenario"}
 
 
 class AdapterTests(unittest.TestCase):
@@ -49,10 +49,10 @@ class AdapterTests(unittest.TestCase):
         self.assertNotIn("private-key", json.dumps(result))
         self.assertNotIn("provider body", json.dumps(result))
 
-    def test_polished_timeout_is_content_free_adapter_error(self):
+    def test_llm_timeout_is_content_free_adapter_error(self):
         expired = subprocess.TimeoutExpired("runner", 1, output=b"provider body", stderr=b"private")
         with mock.patch("adapter.subprocess.run", side_effect=expired):
-            result = run_case(POLISHED_CASE, pathlib.Path("runner"), "private-key",
+            result = run_case(LLM_CASE, pathlib.Path("runner"), "private-key",
                               "model", "version", 1)
         self.assertEqual(result["outcome"], "adapter_error")
         self.assertIsNone(result["output"])
@@ -65,7 +65,7 @@ class AdapterTests(unittest.TestCase):
                     "output": "Synthetic input", "fallback_reason": "missing_credential"}
         completed = subprocess.CompletedProcess([], 0, stdout=json.dumps(response).encode())
         with mock.patch("adapter.subprocess.run", return_value=completed) as subprocess_run:
-            result = run_case(POLISHED_CASE, pathlib.Path("runner"), "", "model", "version", 1)
+            result = run_case(LLM_CASE, pathlib.Path("runner"), "", "model", "version", 1)
         subprocess_run.assert_called_once()
         self.assertEqual(result["outcome"], "safe_fallback")
         self.assertEqual(result["fallback_reason"], "missing_credential")
@@ -84,7 +84,7 @@ class AdapterTests(unittest.TestCase):
     def test_deterministic_timeouts_are_hard_adapter_errors(self):
         expired = subprocess.TimeoutExpired("runner", 1)
         for mode in ("verbatim", "clean"):
-            deterministic = {**POLISHED_CASE, "mode": mode}
+            deterministic = {**LLM_CASE, "mode": mode}
             with self.subTest(mode=mode), mock.patch("adapter.subprocess.run", side_effect=expired):
                 result = run_case(deterministic, pathlib.Path("runner"), "", "model", "version", 1)
                 self.assertEqual(result["outcome"], "adapter_error")
@@ -114,19 +114,19 @@ class AdapterTests(unittest.TestCase):
         self.assertIsNone(result["output"])
         self.assertNotIn(private, serialized)
 
-    def test_polished_nonexact_formatting_variant_is_retained(self):
+    def test_llm_nonexact_formatting_variant_is_retained(self):
         response = {"schema_version": 1, "outcome": "applied", "output": "Synthetic, input!",
                     "fallback_reason": None}
         completed = subprocess.CompletedProcess([], 0, stdout=json.dumps(response).encode())
         with mock.patch("adapter.subprocess.run", return_value=completed):
-            result = run_case(POLISHED_CASE, pathlib.Path("runner"), "private-key",
+            result = run_case(LLM_CASE, pathlib.Path("runner"), "private-key",
                               "model", "version", 1)
         self.assertEqual(result["outcome"], "applied")
         self.assertEqual(result["output"], "Synthetic, input!")
 
     def test_production_numbered_list_marker_and_spoken_ordinal_are_retained(self):
         case = {
-            **POLISHED_CASE,
+            **LLM_CASE,
             "input": "First validate second run",
             "expected_output": "1. Validate\n2. Run",
         }
@@ -140,7 +140,7 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(result["output"], production_output)
 
     def test_introduced_numeric_sign_is_rejected_before_persistence(self):
-        case = {**POLISHED_CASE, "input": "Distance 14.2 kilometers"}
+        case = {**LLM_CASE, "input": "Distance 14.2 kilometers"}
         response = {"schema_version": 1, "outcome": "applied",
                     "output": "Distance -14.2 kilometers", "fallback_reason": None}
         completed = subprocess.CompletedProcess([], 0, stdout=json.dumps(response).encode())
@@ -150,7 +150,7 @@ class AdapterTests(unittest.TestCase):
         self.assertIsNone(result["output"])
 
     def test_lost_operator_is_rejected_before_persistence(self):
-        case = {**POLISHED_CASE, "input": "Compute 6 / 3"}
+        case = {**LLM_CASE, "input": "Compute 6 / 3"}
         response = {"schema_version": 1, "outcome": "applied", "output": "Compute 6 3",
                     "fallback_reason": None}
         completed = subprocess.CompletedProcess([], 0, stdout=json.dumps(response).encode())

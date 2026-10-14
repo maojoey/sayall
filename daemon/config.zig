@@ -205,7 +205,7 @@ fn applyEnvironment(cfg: *Config, env: *const std.process.Environ.Map) void {
         return;
     }
     // One-cycle upgrade bridge: never reinterpret the legacy credential as a
-    // Cerebras key. Only migrate provider metadata in memory so Polished can
+    // Cerebras key. Only migrate provider metadata in memory so Llm can
     // surface the normal missing-Cerebras-key guidance.
     if (std.mem.eql(u8, cfg.llm.provider, "groq") or
         std.mem.eql(u8, cfg.llm.base_url, "https://api.groq.com/openai/v1/chat/completions"))
@@ -322,7 +322,7 @@ pub fn validate(cfg: *const Config) ValidationError!void {
         if (cfg.stt.local_model_path.len > 0 and !std.fs.path.isAbsolute(cfg.stt.local_model_path))
             return invalid("local model path must be absolute");
         if (effectiveProcessingProfile(cfg).usesPlanner())
-            return invalid("local mode supports Verbatim or Clean, not Polished");
+            return invalid("local mode supports Verbatim or Clean, not Llm");
         if (cfg.recording.max_seconds > 300)
             return invalid("local recording limit must not exceed 300 seconds");
     }
@@ -501,8 +501,7 @@ test "processing migration matrix and explicit mode precedence" {
         .{ .json = "{\"llm\":{\"enabled\":true}}", .expected = .legacy_v1 },
         .{ .json = "{\"processing\":{\"mode\":\"verbatim\"},\"llm\":{\"enabled\":true}}", .expected = .verbatim },
         .{ .json = "{\"processing\":{\"mode\":\"clean\"},\"llm\":{\"enabled\":true}}", .expected = .clean },
-        .{ .json = "{\"processing\":{\"mode\":\"polished\"},\"llm\":{\"enabled\":false}}", .expected = .polished },
-        .{ .json = "{\"processing\":{\"mode\":\"llm\"},\"llm\":{\"enabled\":false}}", .expected = .polished },
+        .{ .json = "{\"processing\":{\"mode\":\"llm\"},\"llm\":{\"enabled\":false}}", .expected = .llm },
     }) |case| {
         const parsed = try std.json.parseFromSlice(Config, std.testing.allocator, case.json, .{});
         defer parsed.deinit();
@@ -650,7 +649,7 @@ test "local configuration defaults to Q8 Clean without any credential lookup" {
     try std.testing.expectEqualStrings("", cfg.llm.api_key);
     try std.testing.expect(!cfg.stt.streaming);
     try std.testing.expectEqual(processing.Profile.clean, effectiveProcessingProfile(&cfg));
-    for ([_]processing.Mode{ .polished, .llm }) |mode| {
+    for ([_]processing.Mode{.llm}) |mode| {
         cfg.processing.mode = mode;
         try std.testing.expectError(error.InvalidConfig, validate(&cfg));
     }

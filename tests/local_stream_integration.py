@@ -76,7 +76,7 @@ def main():
             out.setnchannels(1); out.setsampwidth(2); out.setframerate(16000)
             out.writeframes(bytes(32000))
         wav.chmod(0o600)
-        request = {"version": 4, "stt_provider": "local", "local_model_path": str(model),
+        request = {"version": 5, "stt_provider": "local", "local_model_path": str(model),
                    "wav_path": str(wav), "pcm_path": str(pcm), "deepgram_api_key": "",
                    "llm_api_key": "", "processing_profile": "clean"}
         kinds = ["silence", "invalid_finish", "malformed_finish", "timeout", "parent_death", "parent_death_paused", "disconnect"]
@@ -109,7 +109,7 @@ def main():
                     resume = threading.Timer(16, resume_helper, args=(helper,))
                     resume.start()
                 ready = frame(proc, STARTUP_FRAME_TIMEOUT)
-                assert ready == {"version": 4, "event": "ready", "streaming": True}
+                assert ready == {"version": 5, "event": "ready", "streaming": True}
                 children = Path(f"/proc/{proc.pid}/task/{proc.pid}/children").read_text().split()
                 assert len(children) == 1
                 helper = int(children[0])
@@ -140,7 +140,7 @@ def main():
                         with wave.open(str(wav), "wb") as out:
                             out.setnchannels(1); out.setsampwidth(2); out.setframerate(16000)
                             out.writeframes(bytes(9_600_000))
-                    finish = {"version": 4, "command": "finish", "force_rest": kind == "invalid_finish"}
+                    finish = {"version": 5, "command": "finish", "force_rest": kind == "invalid_finish"}
                     encoded_finish = b"{" if kind == "malformed_finish" else json.dumps(finish).encode()
                     proc.stdin.write(encoded_finish + b"\n"); proc.stdin.flush()
                     if kind == "delayed_finish":
@@ -179,7 +179,7 @@ def main():
         alias_wav = root / "alias.wav"
         os.link(pcm, alias_wav)
         for change in ({"deepgram_api_key": "synthetic"}, {"stt_provider": "deepgram"},
-                       {"processing_profile": "polished"}, {"version": 3},
+                       {"processing_profile": "llm"}, {"version": 3},
                        {"wav_path": "relative.wav"}, {"pcm_path": "relative.pcm"},
                        {"wav_path": ""}, {"pcm_path": ""},
                        {"wav_path": str(root / "missing.wav")},
@@ -199,7 +199,7 @@ def main():
             assert result.returncode == 0 and result.stderr == b""
             assert len(result.stdout) <= 4096
             value = json.loads(result.stdout)
-            assert value["version"] == 4 and value["transport"] == "local"
+            assert value["version"] == 5 and value["transport"] == "local"
             assert value["status"] == "error" and value["error"] == "invalid_request"
             assert "text" not in value
         print("PASS: missing, malformed, wrongly typed and oversized initial requests")

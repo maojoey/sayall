@@ -54,7 +54,7 @@ pub fn run(arena: std.mem.Allocator, io: std.Io, env: *const std.process.Environ
                 config_detail = "Deepgram credentials are missing";
             } else if (config.effectiveProcessingProfile(&cfg).usesPlanner() and cfg.llm.api_key.len == 0) {
                 warnings += 1;
-                config_detail = "valid; polished processing credentials are missing";
+                config_detail = "valid; llm processing credentials are missing";
             }
         } else |err| {
             config_ok = false;
@@ -198,10 +198,10 @@ fn parseLocalReadiness(arena: std.mem.Allocator, bytes: []const u8) LocalReadine
 
 test "doctor local readiness fails closed without echoing worker payloads" {
     const gpa = std.testing.allocator;
-    try std.testing.expect(parseLocalReadiness(gpa, "{\"version\":4,\"ready\":true}").ready);
+    try std.testing.expect(parseLocalReadiness(gpa, "{\"version\":5,\"ready\":true}").ready);
     for ([_][]const u8{
         "",                                "{}",                                 "{\"version\":3,\"ready\":true}",
-        "{\"version\":4,\"ready\":false}", "{\"version\":4,\"ready\":\"true\"}", "{\"version\":4,\"ready\":true,\"error\":\"private payload\"}",
+        "{\"version\":5,\"ready\":false}", "{\"version\":5,\"ready\":\"true\"}", "{\"version\":5,\"ready\":true,\"error\":\"private payload\"}",
     }) |invalid| {
         const result = parseLocalReadiness(gpa, invalid);
         try std.testing.expect(!result.ready);
@@ -210,7 +210,7 @@ test "doctor local readiness fails closed without echoing worker payloads" {
     const oversized = [_]u8{' '} ** (worker_protocol.max_ready_bytes + 1);
     try std.testing.expect(!parseLocalReadiness(gpa, &oversized).ready);
     for ([_][]const u8{ "local_model_missing", "local_model_invalid", "local_unavailable" }) |code| {
-        const frame = try std.fmt.allocPrint(gpa, "{{\"version\":4,\"ready\":false,\"error\":\"{s}\"}}", .{code});
+        const frame = try std.fmt.allocPrint(gpa, "{{\"version\":5,\"ready\":false,\"error\":\"{s}\"}}", .{code});
         defer gpa.free(frame);
         const result = parseLocalReadiness(gpa, frame);
         try std.testing.expect(!result.ready);

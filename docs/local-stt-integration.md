@@ -1,7 +1,7 @@
 # Local Q8 implementation and validation
 
 Local mode is opt-in, English-only Parakeet Unified Q8, with Clean or Verbatim.
-It has no API-key requirement, implicit download, model/cloud fallback, Polished,
+It has no API-key requirement, implicit download, model/cloud fallback, LLM,
 translation or recognition keyterms. Existing cloud configurations are unchanged.
 Linux owns microphone capture, cancellation, HUD and final delivery. Zig owns
 validation, model identity, inference supervision and deterministic cleanup.
@@ -44,7 +44,7 @@ and reap it. No model is retained between recordings.
 
 ## Protocol and lifecycle
 
-Worker protocol v4 must be updated together across Zig, Rust, Swift and fixtures;
+Worker protocol v5 must be updated together across Zig, Rust, Swift and fixtures;
 v3 is rejected. Host control remains v2, with legacy Linux control v1.
 Local requests contain empty credential fields, `stt_provider: "local"`,
 `local_model_path`, and local-compatible processing settings. Unknown fields

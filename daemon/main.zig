@@ -612,7 +612,7 @@ fn doctor(arena: std.mem.Allocator, io: Io, env: *const std.process.Environ.Map)
             const processing_profile = config.effectiveProcessingProfile(&cfg);
             if (processing_profile.usesPlanner() and cfg.llm.api_key.len == 0) {
                 warnings += 1;
-                try diagnostic(arena, io, "warn", "Cerebras credentials", "polished processing is selected but its API key is missing");
+                try diagnostic(arena, io, "warn", "Cerebras credentials", "llm processing is selected but its API key is missing");
             } else {
                 try diagnostic(arena, io, "ok", "Processing profile", @tagName(processing_profile));
             }

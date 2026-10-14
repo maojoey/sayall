@@ -4,10 +4,10 @@ These UTF-8 JSON files are language-neutral compatibility fixtures consumed by
 Zig, Swift, and Rust tests.
 
 `worker-result-v3-rejected.json` is a negative compatibility fixture: all three
-language readers must reject it after the v4 transition.
+language readers must reject it. Version 4 is also rejected by current readers.
 
-Other `worker-*` fixtures describe the private `sayall-process` protocol version 4,
-which replaces `cleanup_enabled` with a required `processing_profile`. Request decoders are strict; result readers validate required fields
+Other `worker-*` fixtures describe the private `sayall-process` protocol version 5,
+which renames the closed `polished` processing profile to `llm` without an alias. The required `processing_profile` previously replaced `cleanup_enabled`. Request decoders are strict; result readers validate required fields
 and ignore unknown additive object fields. Requests are intentionally omitted
 because they contain credentials and platform-owned secure audio paths; their
 typed schemas and bounds remain tested in Zig and Swift.

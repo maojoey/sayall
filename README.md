@@ -505,14 +505,14 @@ sayall/
    `results.channels[0].alternatives[0].transcript`.
 4. **Transcript processing** — Verbatim returns finalized Deepgram output
    without a provider request; Clean performs deterministic local cleanup;
-   Polished applies Clean once and requests one structured edit plan from
-   Cerebras. Polished preserves the speaker's meaning while correcting
+   LLM applies Clean once and requests one structured edit plan from
+   Cerebras. LLM preserves the speaker's meaning while correcting
    contextually unambiguous terminology, punctuation, and capitalization;
    adding paragraph breaks; and formatting clearly dictated or enumerated
    lists. The effective keyword list is supplied as a spelling glossary for
    terms such as `SayAll`. An anchored edit-plan validator and source-based
    renderer reject answers, broad rewrites, and unverifiable edits. Rejected or
-   failed Polished plans silently fall back to the deterministic Clean result.
+   failed LLM plans silently fall back to the deterministic Clean result.
 
 5. **Output** — type the complete transcript with `wtype`, copy it with
     `wl-copy`, or copy and paste it with one `Ctrl+V` shortcut. This works in
@@ -567,15 +567,21 @@ settings are preserved. Other formatting flags (`punctuate`, `dictation`,
 explicitly to Deepgram for both streaming transcription and the REST fallback.
 Deepgram requires `punctuate` when `dictation` is enabled.
 
-`processing.mode` accepts `verbatim`, `clean`, or `polished`. Verbatim is the
+`polished` is no longer accepted: explicitly change existing configuration to
+`"processing": { "mode": "llm" }`. There is no automatic migration. The worker
+protocol is now version 5, so the CLI, host, and worker must be upgraded together.
+Existing metrics history containing the removed profile is rejected and left
+untouched, not silently reset or rewritten; archive it before starting new metrics.
+
+`processing.mode` accepts `verbatim`, `clean`, or `llm`. Verbatim is the
 default and sends no transcript to Cerebras. Clean performs deterministic local
-cleanup without a provider request. Polished requires a Cerebras API key and
+cleanup without a provider request. LLM requires a Cerebras API key and
 the `gpt-oss-120b` model; if its request or validated transformation fails,
 SayAll silently delivers the deterministic Clean result. Existing
 configurations that omit `processing.mode` and set `llm.enabled` to `true`
 retain their legacy formatting behavior for this migration cycle. The legacy
 `llama-3.1-8b-instant` model remains syntactically accepted for that
-compatibility path but cannot be selected for Polished mode.
+compatibility path but cannot be selected for LLM mode.
 
 Clean collapses adjacent repeated English prose words by default, including
 standalone repetitions: `left left` → `left`, `right right` → `right`, and
@@ -596,7 +602,7 @@ Repetition removal does not cross sentence boundaries or line breaks.
 shortened and meaning can change. For example, `Rose rose to leave` becomes
 `Rose to leave`, and `I value value my parents taught me` loses one `value`.
 Use Verbatim for exact preservation, or add literal terms/names to the glossary.
-Enable Clean with `"processing": { "mode": "clean" }`; Polished also uses this
+Enable Clean with `"processing": { "mode": "clean" }`; LLM also uses this
 Clean stage. This does not change `2` into `two`.
 
 `hud.show_timer` defaults to `true` and displays recording duration as `mm:ss`.
