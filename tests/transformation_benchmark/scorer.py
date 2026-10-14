@@ -12,7 +12,7 @@ import re
 import sys
 from collections import Counter, defaultdict
 
-SCORER_VERSION = "1.2.1"
+SCORER_VERSION = "2.0.0"
 MODES = {"verbatim", "clean", "llm"}
 OUTCOMES = {"applied", "safe_fallback", "unsafe_plan", "adapter_error"}
 INVOCATION_MODES = {"not_applicable", "not_attempted_no_credential", "live_attempted"}
@@ -54,7 +54,7 @@ def validate_corpus(cases: list[dict]) -> None:
                     "expected_output", "expectation", "safety"}
         if not required <= case.keys() or not set(case) <= required | {"scenario"}:
             raise ContractError(f"corpus case missing fields: {case.get('id', '<unknown>')}")
-        if type(case["schema_version"]) is not int or case["schema_version"] != 1:
+        if type(case["schema_version"]) is not int or case["schema_version"] != 2:
             raise ContractError("unsupported corpus schema version")
         if not isinstance(case["corpus_id"], str) or not case["corpus_id"]:
             raise ContractError("invalid corpus id")
@@ -149,7 +149,7 @@ def validate_results(results: list[dict], cases_by_id: dict[str, dict]) -> dict[
         case_id = result["case_id"]
         if not isinstance(case_id, str) or case_id not in cases_by_id or case_id in indexed:
             raise ContractError(f"unknown or duplicate result case_id: {case_id!r}")
-        if (type(result["schema_version"]) is not int or result["schema_version"] != 1
+        if (type(result["schema_version"]) is not int or result["schema_version"] != 2
                 or not isinstance(result["outcome"], str) or result["outcome"] not in OUTCOMES):
             raise ContractError(f"invalid result schema or outcome: {case_id}")
         if result["output"] is not None and not isinstance(result["output"], str):
@@ -350,7 +350,7 @@ def score(cases: list[dict], results: list[dict], corpus_sha256: str,
         "invocation_modes": sorted({item.get("provider", {}).get("invocation_mode") for item in llm}),
         "models": sorted({item.get("provider", {}).get("model") for item in llm}),
     }
-    report = {"report_schema_version": 2, "scorer_version": SCORER_VERSION,
+    report = {"report_schema_version": 3, "scorer_version": SCORER_VERSION,
               "generated_at_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
               "corpus": {"schema_version": identity[0], "id": identity[1],
                          "sha256": corpus_sha256},
@@ -515,7 +515,7 @@ def markdown_report(report: dict) -> str:
 def main(argv=None) -> int:
     here = pathlib.Path(__file__).resolve().parent
     parser = argparse.ArgumentParser()
-    parser.add_argument("--corpus", type=pathlib.Path, default=here / "corpus-v1.jsonl")
+    parser.add_argument("--corpus", type=pathlib.Path, default=here / "corpus-v2.jsonl")
     parser.add_argument("--results", type=pathlib.Path, required=True)
     parser.add_argument("--baseline", type=pathlib.Path)
     parser.add_argument("--json", type=pathlib.Path, required=True)

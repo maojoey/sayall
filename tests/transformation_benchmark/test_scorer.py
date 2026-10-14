@@ -8,7 +8,7 @@ from scorer import (ContractError, main, markdown_report, percentile,
 
 
 HERE = pathlib.Path(__file__).resolve().parent
-CORPUS = HERE / "corpus-v1.jsonl"
+CORPUS = HERE / "corpus-v2.jsonl"
 DEFAULT_OUTPUT = object()
 
 
@@ -21,7 +21,7 @@ def result(case, latency=10, output=DEFAULT_OUTPUT, outcome="applied", fallback_
     invocation_mode = invocation_mode or ("live_attempted" if case["mode"] == "llm"
                                            else "not_applicable")
     record = {
-        "schema_version": 1,
+        "schema_version": 2,
         "case_id": case["id"],
         "outcome": outcome,
         "output": case["expected_output"] if output is DEFAULT_OUTPUT else output,
@@ -54,6 +54,21 @@ def perfect_report(latencies=None):
 
 
 class ScoringTests(unittest.TestCase):
+    def test_renamed_contracts_reject_old_versions_and_baselines(self):
+        cases, results, report = perfect_report()
+        self.assertEqual(report["report_schema_version"], 3)
+        self.assertEqual(report["corpus"]["schema_version"], 2)
+        old_case = {**cases[0], "schema_version": 1}
+        with self.assertRaisesRegex(ContractError, "unsupported corpus schema version"):
+            score([old_case, *cases[1:]], results, "synthetic")
+        old_result = {**results[0], "schema_version": 1}
+        with self.assertRaisesRegex(ContractError, "invalid result schema"):
+            score(cases, [old_result, *results[1:]], "synthetic")
+        old_report = {**report, "report_schema_version": 2}
+        compared = score(cases, results, report["corpus"]["sha256"], old_report)
+        self.assertFalse(compared["baseline"]["comparable"])
+        self.assertIn("report_schema_version differs", compared["baseline"]["reasons"])
+
     def test_adapter_error_with_null_output_is_a_hard_failure_not_a_crash(self):
         cases, digest = load_cases()
         results = [result(case) for case in cases]

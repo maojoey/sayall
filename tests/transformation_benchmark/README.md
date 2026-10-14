@@ -6,9 +6,9 @@ text modes. The versioned corpus and scorer remain independent contracts;
 `cloud_planner.clean` and `cloud_planner.llm` APIs without introducing a second
 transformation implementation.
 
-## Corpus contract (`corpus-v1.jsonl`)
+## Corpus contract (`corpus-v2.jsonl`)
 
-Each non-empty line is one JSON object. All records share `schema_version: 1`
+Each non-empty line is one JSON object. All records share `schema_version: 2`
 and one `corpus_id`.
 
 | Field | Type | Meaning |
@@ -37,7 +37,7 @@ credential is present.
 The production adapter writes one object per attempted corpus case:
 
 ```json
-{"schema_version":1,"case_id":"clean-filler-um","outcome":"applied","output":"please send the synthetic report.","latency_ms":18.4,"adapter":{"name":"sayall-production-transformation","version":"dev"},"provider":{"name":"none","model":"production-deterministic","invocation_mode":"not_applicable"},"plan":null}
+{"schema_version":2,"case_id":"clean-filler-um","outcome":"applied","output":"please send the synthetic report.","latency_ms":18.4,"adapter":{"name":"sayall-production-transformation","version":"dev"},"provider":{"name":"none","model":"production-deterministic","invocation_mode":"not_applicable"},"plan":null}
 ```
 
 Required fields are `schema_version`, `case_id`, `outcome`, `output`,
@@ -121,7 +121,12 @@ python3 tests/transformation_benchmark/scorer.py \
 Add `--baseline previous-report.json` to calculate deltas. Baselines are
 comparable only when corpus schema, ID, SHA-256, report schema, LLM
 invocation mode, and model match.
-The current machine report contract is `report_schema_version: 2`.
+The current machine report contract is `report_schema_version: 3`.
+The corpus and adapter/case-runner contracts use `schema_version: 2`.
+These versions rename the closed mode to `llm` and report fields to
+`llm_provider` / `llm_live`. Old corpus/results and case-runner responses are
+rejected, and old reports cannot be used as comparable baselines. The separate
+plan-evidence schema remains version 1; its fields have not changed.
 Latency p50/p95/p99 use the deterministic nearest-rank definition. The machine
 JSON includes category rates and per-case synthetic source, reference, actual
 output, provider/model, adapter, and edit-plan evidence. Markdown summarizes the

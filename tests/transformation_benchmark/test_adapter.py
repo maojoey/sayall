@@ -30,7 +30,7 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(clean["llm_api_key"], "")
 
     def test_runner_response_is_closed_and_never_accepts_raw_provider_data(self):
-        valid = {"schema_version": 1, "outcome": "applied", "output": "Synthetic output",
+        valid = {"schema_version": 2, "outcome": "applied", "output": "Synthetic output",
                  "fallback_reason": None}
         self.assertEqual(parse_runner_response(json.dumps(valid).encode()), valid)
         for field in ("raw_provider_body", "headers", "api_key"):
@@ -38,6 +38,14 @@ class AdapterTests(unittest.TestCase):
                 parse_runner_response(json.dumps({**valid, field: "private"}).encode())
         with self.assertRaises(ContractError):
             parse_runner_response(b"not json")
+
+    def test_runner_rejects_old_or_non_integer_schema_versions(self):
+        self.assertEqual(runner_request(CASE, "", "model")["schema_version"], 2)
+        for version in (1, True, 2.0, "2"):
+            response = {"schema_version": version, "outcome": "applied",
+                        "output": "Synthetic output", "fallback_reason": None}
+            with self.assertRaisesRegex(ContractError, "unsupported case runner schema version"):
+                parse_runner_response(json.dumps(response).encode())
 
     def test_fault_injection_timeout_becomes_content_free_adapter_error(self):
         expired = subprocess.TimeoutExpired("runner", 1, output=b"provider body", stderr=b"private")
@@ -61,7 +69,7 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(result["provider"]["invocation_mode"], "live_attempted")
 
     def test_no_credential_runs_production_fallback_without_live_provider(self):
-        response = {"schema_version": 1, "outcome": "safe_fallback",
+        response = {"schema_version": 2, "outcome": "safe_fallback",
                     "output": "Synthetic input", "fallback_reason": "missing_credential"}
         completed = subprocess.CompletedProcess([], 0, stdout=json.dumps(response).encode())
         with mock.patch("adapter.subprocess.run", return_value=completed) as subprocess_run:
@@ -92,7 +100,7 @@ class AdapterTests(unittest.TestCase):
                 self.assertEqual(result["provider"]["invocation_mode"], "not_applicable")
 
     def test_runner_fault_fallback_is_projected_without_extra_fields(self):
-        response = {"schema_version": 1, "outcome": "safe_fallback", "output": "Synthetic input",
+        response = {"schema_version": 2, "outcome": "safe_fallback", "output": "Synthetic input",
                     "fallback_reason": "malformed_plan"}
         completed = subprocess.CompletedProcess([], 0, stdout=json.dumps(response).encode())
         with mock.patch("adapter.subprocess.run", return_value=completed):
@@ -104,7 +112,7 @@ class AdapterTests(unittest.TestCase):
 
     def test_unallowlisted_runner_output_is_never_persisted(self):
         private = "raw provider body private-key"
-        response = {"schema_version": 1, "outcome": "applied", "output": private,
+        response = {"schema_version": 2, "outcome": "applied", "output": private,
                     "fallback_reason": None}
         completed = subprocess.CompletedProcess([], 0, stdout=json.dumps(response).encode())
         with mock.patch("adapter.subprocess.run", return_value=completed):
@@ -115,7 +123,7 @@ class AdapterTests(unittest.TestCase):
         self.assertNotIn(private, serialized)
 
     def test_llm_nonexact_formatting_variant_is_retained(self):
-        response = {"schema_version": 1, "outcome": "applied", "output": "Synthetic, input!",
+        response = {"schema_version": 2, "outcome": "applied", "output": "Synthetic, input!",
                     "fallback_reason": None}
         completed = subprocess.CompletedProcess([], 0, stdout=json.dumps(response).encode())
         with mock.patch("adapter.subprocess.run", return_value=completed):
@@ -131,7 +139,7 @@ class AdapterTests(unittest.TestCase):
             "expected_output": "1. Validate\n2. Run",
         }
         production_output = "1. First validate\n2. second run"
-        response = {"schema_version": 1, "outcome": "applied", "output": production_output,
+        response = {"schema_version": 2, "outcome": "applied", "output": production_output,
                     "fallback_reason": None}
         completed = subprocess.CompletedProcess([], 0, stdout=json.dumps(response).encode())
         with mock.patch("adapter.subprocess.run", return_value=completed):
@@ -141,7 +149,7 @@ class AdapterTests(unittest.TestCase):
 
     def test_introduced_numeric_sign_is_rejected_before_persistence(self):
         case = {**LLM_CASE, "input": "Distance 14.2 kilometers"}
-        response = {"schema_version": 1, "outcome": "applied",
+        response = {"schema_version": 2, "outcome": "applied",
                     "output": "Distance -14.2 kilometers", "fallback_reason": None}
         completed = subprocess.CompletedProcess([], 0, stdout=json.dumps(response).encode())
         with mock.patch("adapter.subprocess.run", return_value=completed):
@@ -151,7 +159,7 @@ class AdapterTests(unittest.TestCase):
 
     def test_lost_operator_is_rejected_before_persistence(self):
         case = {**LLM_CASE, "input": "Compute 6 / 3"}
-        response = {"schema_version": 1, "outcome": "applied", "output": "Compute 6 3",
+        response = {"schema_version": 2, "outcome": "applied", "output": "Compute 6 3",
                     "fallback_reason": None}
         completed = subprocess.CompletedProcess([], 0, stdout=json.dumps(response).encode())
         with mock.patch("adapter.subprocess.run", return_value=completed):
