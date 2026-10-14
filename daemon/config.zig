@@ -502,6 +502,7 @@ test "processing migration matrix and explicit mode precedence" {
         .{ .json = "{\"processing\":{\"mode\":\"verbatim\"},\"llm\":{\"enabled\":true}}", .expected = .verbatim },
         .{ .json = "{\"processing\":{\"mode\":\"clean\"},\"llm\":{\"enabled\":true}}", .expected = .clean },
         .{ .json = "{\"processing\":{\"mode\":\"polished\"},\"llm\":{\"enabled\":false}}", .expected = .polished },
+        .{ .json = "{\"processing\":{\"mode\":\"llm\"},\"llm\":{\"enabled\":false}}", .expected = .polished },
     }) |case| {
         const parsed = try std.json.parseFromSlice(Config, std.testing.allocator, case.json, .{});
         defer parsed.deinit();
@@ -649,8 +650,10 @@ test "local configuration defaults to Q8 Clean without any credential lookup" {
     try std.testing.expectEqualStrings("", cfg.llm.api_key);
     try std.testing.expect(!cfg.stt.streaming);
     try std.testing.expectEqual(processing.Profile.clean, effectiveProcessingProfile(&cfg));
-    cfg.processing.mode = .polished;
-    try std.testing.expectError(error.InvalidConfig, validate(&cfg));
+    for ([_]processing.Mode{ .polished, .llm }) |mode| {
+        cfg.processing.mode = mode;
+        try std.testing.expectError(error.InvalidConfig, validate(&cfg));
+    }
     cfg.processing.mode = .clean;
     cfg.stt.model = "parakeet-unified-en-q4";
     try std.testing.expectError(error.InvalidConfig, validate(&cfg));

@@ -8,7 +8,13 @@ pub const Mode = enum {
     clean,
     /// Apply deterministic cleanup, then attempt one semantic planner
     /// transformation and silently fall back to the cleaned text.
+    llm,
+    /// Compatibility spelling accepted from existing configuration files.
     polished,
+
+    pub fn jsonStringify(self: Mode, writer: anytype) !void {
+        try writer.write(if (self == .polished) "llm" else @tagName(self));
+    }
 };
 
 /// Internal routing contract. `legacy_v1` preserves the old formatter path for
@@ -45,7 +51,7 @@ pub fn effective(config: Config, legacy_llm_enabled: bool) Profile {
     if (config.mode) |mode| return switch (mode) {
         .verbatim => .verbatim,
         .clean => .clean,
-        .polished => .polished,
+        .llm, .polished => .polished,
     };
     return if (legacy_llm_enabled) .legacy_v1 else .verbatim;
 }
@@ -56,4 +62,17 @@ test "migration matrix preserves explicit modes and legacy compatibility" {
     try std.testing.expectEqual(Profile.verbatim, effective(.{ .mode = .verbatim }, true));
     try std.testing.expectEqual(Profile.clean, effective(.{ .mode = .clean }, true));
     try std.testing.expectEqual(Profile.polished, effective(.{ .mode = .polished }, false));
+    try std.testing.expectEqual(Profile.polished, effective(.{ .mode = .llm }, false));
+}
+
+test "LLM config spelling does not change the worker profile" {
+    for ([_]Mode{ .llm, .polished }) |mode| {
+        const json = try std.json.Stringify.valueAlloc(std.testing.allocator, mode, .{});
+        defer std.testing.allocator.free(json);
+        try std.testing.expectEqualStrings("\"llm\"", json);
+        const profile = effective(.{ .mode = mode }, false);
+        const wire = try std.json.Stringify.valueAlloc(std.testing.allocator, profile, .{});
+        defer std.testing.allocator.free(wire);
+        try std.testing.expectEqualStrings("\"polished\"", wire);
+    }
 }

@@ -7,6 +7,14 @@ enum ProcessingProtocol {
 enum ProcessingMode: String, Codable, CaseIterable, Equatable {
     case verbatim, clean, polished
 
+    // Configuration names are separate from the versioned worker profile.
+    // Keep the internal case stable while accepting existing config files.
+    init?(configurationValue: String) {
+        self.init(rawValue: configurationValue == "llm" ? "polished" : configurationValue)
+    }
+
+    var configurationValue: String { self == .polished ? "llm" : rawValue }
+
     var title: String { rawValue.capitalized }
     var description: String {
         switch self {

@@ -1605,6 +1605,50 @@ final class ConfigurationLoaderTests: XCTestCase {
         XCTAssertEqual(permissions.intValue & 0o777, 0o600)
     }
 
+    func testLLMConfigurationAliasPreservesValidationAndWorkerProfile() throws {
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: home) }
+        let loader = ConfigurationLoader(environment: [:], homeDirectory: home)
+        try preparePrivateParent(for: loader)
+
+        for name in ["llm", "polished"] {
+            XCTAssertEqual(ProcessingMode(configurationValue: name), .polished)
+            let original = Data("""
+                {"stt":{"api_key":"key"},"llm":{"api_key":"cerebras","enabled":false},
+                 "processing":{"mode":"\(name)"},"future":{"preserved":true}}
+                """.utf8)
+            try original.write(to: loader.url)
+            let config = try loader.load()
+            XCTAssertEqual(config.processingProfile, .polished)
+            XCTAssertEqual(try Data(contentsOf: loader.url), original)
+            let request = Coordinator.batchRequest(config: config, wavPath: "/audio.wav")
+            let wire = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(request)) as? [String: Any])
+            XCTAssertEqual(wire["processing_profile"] as? String, "polished")
+
+            try loader.setProcessingMode(.polished)
+            let saved = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: loader.url)) as? [String: Any])
+            XCTAssertEqual((saved["processing"] as? [String: Any])?["mode"] as? String, "llm")
+            XCTAssertEqual((saved["future"] as? [String: Any])?["preserved"] as? Bool, true)
+            XCTAssertEqual((saved["stt"] as? [String: Any])?["api_key"] as? String, "key")
+            XCTAssertEqual((saved["llm"] as? [String: Any])?["api_key"] as? String, "cerebras")
+
+            try Data("""
+                {"stt":{"api_key":"key"},"processing":{"mode":"\(name)"}}
+                """.utf8).write(to: loader.url)
+            XCTAssertThrowsError(try loader.load()) {
+                XCTAssertEqual($0 as? ConfigurationError, .missingCerebrasKey)
+            }
+            try Data("""
+                {"stt":{"provider":"local"},"processing":{"mode":"\(name)"}}
+                """.utf8).write(to: loader.url)
+            XCTAssertThrowsError(try loader.load()) {
+                XCTAssertEqual($0 as? ConfigurationError, .invalidProvider)
+            }
+        }
+        XCTAssertNil(ProcessingMode(configurationValue: "legacy_v1"))
+        XCTAssertNil(ProcessingMode(configurationValue: "LLM"))
+    }
+
     func testPrivateLegacyProfileProjectsToAUserFacingMode() {
         XCTAssertEqual(ProcessingMode.allCases, [.verbatim, .clean, .polished])
         XCTAssertEqual(ProcessingProfile.legacyV1.userMode, .polished)

@@ -108,6 +108,20 @@ Language-neutral examples for both contracts live in
 Rust tests consume these same files so contract drift fails CI before a runtime
 adapter is replaced.
 
+### Processing-name compatibility (SAY-99)
+
+Configuration accepts `processing.mode: "llm"` as the explicit name for the
+existing planner-based processing mode. The old `"polished"` spelling remains
+accepted, and an explicit mode save writes `"llm"`. Loading configuration alone
+does not rewrite it. Both names retain identical credential validation and
+processing behavior; worker protocol v4 continues to use the internal
+`processing_profile: "polished"` value.
+
+This compatibility layer does not enable local transcription with cloud
+processing. The local/cloud guard remains in place until the independently
+controlled provider/mode selection, explicit consent, and hybrid worker
+contract are implemented. The new spelling must not bypass that boundary.
+
 ### Migration and cutover
 
 0.2.0 extraction work preserves current runtime ownership first. Linux keeps

@@ -208,6 +208,9 @@ impl Default for Llm {
 pub enum ProcessingMode {
     Verbatim,
     Clean,
+    // Only the persisted/user-facing name changes. The worker profile stays
+    // "polished" so this configuration migration does not alter protocol v4.
+    #[serde(rename = "llm", alias = "polished")]
     Polished,
 }
 
@@ -1063,6 +1066,42 @@ mod tests {
         assert_eq!(explicit.processing.mode, Some(ProcessingMode::Polished));
         assert!(serde_json::from_str::<Config>(r#"{"processing":{"mode":"legacy_v1"}}"#).is_err());
         assert!(serde_json::from_str::<Config>(r#"{"processing":{"mode":"ai_only"}}"#).is_err());
+    }
+
+    #[test]
+    fn llm_and_legacy_polished_share_profile_and_canonical_persistence() {
+        for name in ["llm", "polished"] {
+            let bytes = serde_json::to_vec(&serde_json::json!({
+                "stt": {"api_key": "synthetic-deepgram"},
+                "llm": {"api_key": "synthetic-cerebras", "enabled": false},
+                "processing": {"mode": name},
+                "future": {"preserved": true}
+            }))
+            .unwrap();
+            let cfg = project_session_config(&bytes, Path::new("/not-read")).unwrap();
+            assert_eq!(cfg.provider.processing_profile, ProcessingProfile::Polished);
+            // Read/project is non-mutating; only an explicit save canonicalizes.
+            let updated = encode_processing_mode(&bytes, ProcessingMode::Polished).unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&updated).unwrap();
+            assert_eq!(value["processing"]["mode"], "llm");
+            assert_eq!(value["future"]["preserved"], true);
+            assert_eq!(value["stt"]["api_key"], "synthetic-deepgram");
+            assert_eq!(value["llm"]["api_key"], "synthetic-cerebras");
+            assert_eq!(
+                serde_json::to_value(cfg.provider.processing_profile).unwrap(),
+                "polished"
+            );
+            let mut local: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            local["stt"]["provider"] = "local".into();
+            assert!(
+                project_session_config(
+                    &serde_json::to_vec(&local).unwrap(),
+                    Path::new("/not-read")
+                )
+                .is_err(),
+                "the new spelling must not bypass the local/cloud boundary"
+            );
+        }
     }
 
     #[test]
