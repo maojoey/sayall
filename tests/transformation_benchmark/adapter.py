@@ -12,11 +12,11 @@ import subprocess
 import sys
 import time
 
-from scorer import (ContractError, polished_semantic_invariant, read_jsonl,
+from scorer import (ContractError, llm_semantic_invariant, read_jsonl,
                     validate_corpus, validate_results)
 
 ADAPTER_NAME = "sayall-production-transformation"
-ADAPTER_SCHEMA_VERSION = 1
+ADAPTER_SCHEMA_VERSION = 2
 DEFAULT_MODEL = "gpt-oss-120b"
 RUNNER_FIELDS = {"schema_version", "outcome", "output", "fallback_reason"}
 
@@ -40,7 +40,7 @@ def runner_request(case: dict, api_key: str, model: str) -> dict:
         "schema_version": ADAPTER_SCHEMA_VERSION,
         "mode": case["mode"],
         "input": case["input"],
-        "llm_api_key": api_key if case["mode"] == "polished" else "",
+        "llm_api_key": api_key if case["mode"] == "llm" else "",
         "model": model,
         "fault": (case.get("scenario") or {}).get("fault"),
     }
@@ -51,8 +51,10 @@ def parse_runner_response(raw: bytes) -> dict:
         value = json.loads(raw)
     except (json.JSONDecodeError, UnicodeError) as error:
         raise ContractError("case runner returned invalid JSON") from error
-    if (not isinstance(value, dict) or set(value) != RUNNER_FIELDS
-            or value.get("schema_version") != ADAPTER_SCHEMA_VERSION
+    if (not isinstance(value, dict) or type(value.get("schema_version")) is not int
+            or value["schema_version"] != ADAPTER_SCHEMA_VERSION):
+        raise ContractError("unsupported case runner schema version")
+    if (set(value) != RUNNER_FIELDS
             or value.get("outcome") not in {"applied", "safe_fallback", "adapter_error"}
             or (value.get("output") is not None and not isinstance(value["output"], str))
             or (value.get("fallback_reason") is not None
@@ -69,7 +71,7 @@ def parse_runner_response(raw: bytes) -> dict:
 def run_case(case: dict, runner: pathlib.Path, api_key: str, model: str,
              adapter_version: str, timeout: float) -> dict:
     started = time.monotonic()
-    invocation_mode = ("not_applicable" if case["mode"] != "polished" else
+    invocation_mode = ("not_applicable" if case["mode"] != "llm" else
                        "live_attempted" if api_key else "not_attempted_no_credential")
     try:
         completed = subprocess.run(
@@ -90,9 +92,9 @@ def run_case(case: dict, runner: pathlib.Path, api_key: str, model: str,
                     *case["safety"].get("accepted_outputs", [])}
     applied_is_unsafe = (response["outcome"] == "applied" and
                          (not isinstance(response["output"], str) or
-                          (case["mode"] == "polished"
-                           and not polished_semantic_invariant(case["input"], response["output"])) or
-                          (case["mode"] != "polished" and response["output"] not in safe_outputs)))
+                          (case["mode"] == "llm"
+                           and not llm_semantic_invariant(case["input"], response["output"])) or
+                          (case["mode"] != "llm" and response["output"] not in safe_outputs)))
     fallback_is_unsafe = (response["outcome"] == "safe_fallback" and
                           (not isinstance(response["output"], str) or
                            response["output"] not in safe_outputs))
@@ -109,7 +111,7 @@ def run_case(case: dict, runner: pathlib.Path, api_key: str, model: str,
         "latency_ms": round((time.monotonic() - started) * 1000, 3),
         "adapter": {"name": ADAPTER_NAME, "version": adapter_version},
         "provider": ({"name": "cerebras", "model": model, "invocation_mode": invocation_mode}
-                     if case["mode"] == "polished" else
+                     if case["mode"] == "llm" else
                      {"name": "none", "model": "production-deterministic",
                       "invocation_mode": invocation_mode}),
         "plan": None,
@@ -130,7 +132,7 @@ def run(cases: list[dict], runner: pathlib.Path, api_key: str, model: str,
 def main(argv=None) -> int:
     here = pathlib.Path(__file__).resolve().parent
     parser = argparse.ArgumentParser()
-    parser.add_argument("--corpus", type=pathlib.Path, default=here / "corpus-v1.jsonl")
+    parser.add_argument("--corpus", type=pathlib.Path, default=here / "corpus-v2.jsonl")
     parser.add_argument("--runner", type=pathlib.Path,
                         default=pathlib.Path("zig-out/bin/sayall-transformation-benchmark-case"))
     parser.add_argument("--output", type=pathlib.Path, required=True)
@@ -149,8 +151,8 @@ def main(argv=None) -> int:
                   args.adapter_version, args.timeout, args.concurrency)
     validate_results(results, {case["id"]: case for case in cases})
     args.output.write_text("".join(json.dumps(result, sort_keys=True) + "\n" for result in results))
-    polished = sum(case["mode"] == "polished" for case in cases)
-    print(f"wrote {len(results)} synthetic results; polished live cases scheduled: {polished if api_key else 0}")
+    llm = sum(case["mode"] == "llm" for case in cases)
+    print(f"wrote {len(results)} synthetic results; llm live cases scheduled: {llm if api_key else 0}")
     return 0
 
 

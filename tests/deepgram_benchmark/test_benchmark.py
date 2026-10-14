@@ -55,11 +55,11 @@ class MetricsTests(unittest.TestCase):
         self.assertFalse(thresholds_pass(clips, aggregate(clips), .10, .03, "stream"))
 
     def test_protocol_validation_requires_authoritative_transport(self):
-        base = {"version":4, "processing_profile":"verbatim"}
-        validate_ready({"version":4, "event":"ready", "streaming":True})
+        base = {"version":5, "processing_profile":"verbatim"}
+        validate_ready({"version":5, "event":"ready", "streaming":True})
         validate_result({**base, "status":"success", "text":"hello", "transport":"stream"})
         with self.assertRaises(RuntimeError): validate_result({**base, "status":"success", "text":"hello"})
-        with self.assertRaises(RuntimeError): validate_result({"version":4, "status":"success", "text":"hello", "transport":"rest"})
+        with self.assertRaises(RuntimeError): validate_result({"version":5, "status":"success", "text":"hello", "transport":"rest"})
         with self.assertRaises(RuntimeError): validate_result({**base, "status":"no_speech", "text":"" , "transport":"rest"})
         with self.assertRaises(ProtocolError): validate_result({**base, "status":"error", "error":"secret provider body", "transport":"rest"})
         with self.assertRaises(ProtocolError): validate_result({**base, "status":"success", "text":"hello", "error":"secret", "transport":"rest"})
@@ -140,9 +140,9 @@ class MetricsTests(unittest.TestCase):
             self.assertEqual(wav_path.stat().st_mode & 0o777, 0o600)
 
     def test_identity_projects_only_validated_public_fields(self):
-        completed = subprocess.CompletedProcess([], 0, stdout=b'{"protocol_version":4,"build_version":"0.2.10","untrusted":"drop me"}\n')
+        completed = subprocess.CompletedProcess([], 0, stdout=b'{"protocol_version":5,"build_version":"0.2.10","untrusted":"drop me"}\n')
         with mock.patch("benchmark.subprocess.run", return_value=completed):
-            self.assertEqual(worker_identity(pathlib.Path("worker")), {"protocol_version":4, "build_version":"0.2.10"})
+            self.assertEqual(worker_identity(pathlib.Path("worker")), {"protocol_version":5, "build_version":"0.2.10"})
         completed.stdout = b'["invalid"]\n'
         with mock.patch("benchmark.subprocess.run", return_value=completed), self.assertRaises(ProtocolError):
             worker_identity(pathlib.Path("worker"))
@@ -159,10 +159,10 @@ class MetricsTests(unittest.TestCase):
         script = """#!/usr/bin/env python3
 import json, sys, time
 if '--stream' not in sys.argv:
-    json.load(sys.stdin); print(json.dumps({'version':4,'status':'success','text':'ok','processing_profile':'verbatim','transport':'rest'})); raise SystemExit
-json.loads(sys.stdin.readline()); print(json.dumps({'version':4,'event':'ready','streaming':True}), flush=True)
+    json.load(sys.stdin); print(json.dumps({'version':5,'status':'success','text':'ok','processing_profile':'verbatim','transport':'rest'})); raise SystemExit
+json.loads(sys.stdin.readline()); print(json.dumps({'version':5,'event':'ready','streaming':True}), flush=True)
 json.loads(sys.stdin.readline()); time.sleep(0.03)
-print(json.dumps({'version':4,'status':'success','text':'ok','processing_profile':'verbatim','transport':'stream'}), flush=True)
+print(json.dumps({'version':5,'status':'success','text':'ok','processing_profile':'verbatim','transport':'stream'}), flush=True)
 """
         real_validate = validate_result
         def delayed_validate(frame):

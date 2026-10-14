@@ -85,21 +85,21 @@ jobs:
             gh run download "$run_id" --name "$artifact_name" --dir "$candidate" >/dev/null 2>&1 || continue
             report=$(find "$candidate" -name transformation-report.json -type f -size +0c -print -quit)
             [[ -n "$report" ]] || continue
-            if python3 - "$report" tests/transformation_benchmark/corpus-v1.jsonl transformation-results.jsonl <<'PY'
+            if python3 - "$report" tests/transformation_benchmark/corpus-v2.jsonl transformation-results.jsonl <<'PY'
           import hashlib, json, pathlib, sys
           report = json.loads(pathlib.Path(sys.argv[1]).read_text())
           corpus = pathlib.Path(sys.argv[2]).read_bytes()
           results = [json.loads(line) for line in pathlib.Path(sys.argv[3]).read_text().splitlines() if line]
           first = json.loads(next(line for line in corpus.splitlines() if line.strip()))
           identity = report.get("corpus", {})
-          polished = [result["provider"] for result in results if result["provider"]["invocation_mode"] != "not_applicable"]
-          provider = {"invocation_modes": sorted({item["invocation_mode"] for item in polished}),
-                      "models": sorted({item["model"] for item in polished})}
-          valid = (report.get("report_schema_version") == 2
+          llm = [result["provider"] for result in results if result["provider"]["invocation_mode"] != "not_applicable"]
+          provider = {"invocation_modes": sorted({item["invocation_mode"] for item in llm}),
+                      "models": sorted({item["model"] for item in llm})}
+          valid = (report.get("report_schema_version") == 3
                    and identity.get("schema_version") == first["schema_version"]
                    and identity.get("id") == first["corpus_id"]
                    and identity.get("sha256") == hashlib.sha256(corpus).hexdigest()
-                   and report.get("polished_provider") == provider)
+                   and report.get("llm_provider") == provider)
           raise SystemExit(0 if valid else 1)
           PY
             then

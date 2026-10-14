@@ -8,7 +8,7 @@ pub const Mode = enum {
     clean,
     /// Apply deterministic cleanup, then attempt one semantic planner
     /// transformation and silently fall back to the cleaned text.
-    polished,
+    llm,
 };
 
 /// Internal routing contract. `legacy_v1` preserves the old formatter path for
@@ -16,13 +16,13 @@ pub const Mode = enum {
 pub const Profile = enum {
     verbatim,
     clean,
-    polished,
+    llm,
     /// Compatibility route for legacy llm.enabled=true. It retains the old
     /// formatter behavior and does not opt into future Clean deletions.
     legacy_v1,
 
     pub fn usesPlanner(self: Profile) bool {
-        return self == .polished or self == .legacy_v1;
+        return self == .llm or self == .legacy_v1;
     }
 };
 
@@ -45,9 +45,24 @@ pub fn effective(config: Config, legacy_llm_enabled: bool) Profile {
     if (config.mode) |mode| return switch (mode) {
         .verbatim => .verbatim,
         .clean => .clean,
-        .polished => .polished,
+        .llm => .llm,
     };
     return if (legacy_llm_enabled) .legacy_v1 else .verbatim;
+}
+
+test "removed polished spelling is not a config or worker profile" {
+    try std.testing.expectError(error.InvalidEnumTag, std.json.parseFromSlice(
+        Mode,
+        std.testing.allocator,
+        "\"polished\"",
+        .{},
+    ));
+    try std.testing.expectError(error.InvalidEnumTag, std.json.parseFromSlice(
+        Profile,
+        std.testing.allocator,
+        "\"polished\"",
+        .{},
+    ));
 }
 
 test "migration matrix preserves explicit modes and legacy compatibility" {
@@ -55,5 +70,17 @@ test "migration matrix preserves explicit modes and legacy compatibility" {
     try std.testing.expectEqual(Profile.legacy_v1, effective(.{}, true));
     try std.testing.expectEqual(Profile.verbatim, effective(.{ .mode = .verbatim }, true));
     try std.testing.expectEqual(Profile.clean, effective(.{ .mode = .clean }, true));
-    try std.testing.expectEqual(Profile.polished, effective(.{ .mode = .polished }, false));
+    try std.testing.expectEqual(Profile.llm, effective(.{ .mode = .llm }, false));
+}
+
+test "LLM config and worker profile use the same name" {
+    for ([_]Mode{.llm}) |mode| {
+        const json = try std.json.Stringify.valueAlloc(std.testing.allocator, mode, .{});
+        defer std.testing.allocator.free(json);
+        try std.testing.expectEqualStrings("\"llm\"", json);
+        const profile = effective(.{ .mode = mode }, false);
+        const wire = try std.json.Stringify.valueAlloc(std.testing.allocator, profile, .{});
+        defer std.testing.allocator.free(wire);
+        try std.testing.expectEqualStrings("\"llm\"", wire);
+    }
 }

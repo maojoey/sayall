@@ -54,7 +54,7 @@ worker="$home/.local/lib/sayall/sayall-process"
 ! command -v sayall-process >/dev/null 2>&1
 
 info=$("$worker" --worker-info)
-grep -Fq '"protocol_version":4' <<<"$info"
+grep -Fq '"protocol_version":5' <<<"$info"
 grep -Fq "\"build_version\":\"$version\"" <<<"$info"
 bash "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/worker-info-wait.sh" "$worker"
 
@@ -138,10 +138,10 @@ try:
     doctor("local artifacts present")
 
     worker.rename(backup)
-    info = json.dumps({"protocol_version": 4, "build_version": version})
+    info = json.dumps({"protocol_version": 5, "build_version": version})
     prefix = "#!/bin/sh\nif [ \"$1\" = --worker-info ]; then\nprintf '%s\\n' '" + info + "'\nexit 0\nfi\n"
     for body, expected in (
-        ('test -z "${DEEPGRAM_API_KEY-}" || exit 9\nprintf \'%s\\n\' \'{"version":4,"ready":true}\'\n', "local artifacts present"),
+        ('test -z "${DEEPGRAM_API_KEY-}" || exit 9\nprintf \'%s\\n\' \'{"version":5,"ready":true}\'\n', "local artifacts present"),
         ("printf '{}\\n'\n", "local readiness probe failed"),
         ("exit 23\n", "local readiness probe failed"),
         ("exec /usr/bin/head -c 5000 /dev/zero\n", "local readiness probe failed"),

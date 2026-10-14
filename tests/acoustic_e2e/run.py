@@ -293,7 +293,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--fixture", required=True, type=pathlib.Path)
     parser.add_argument("--reference", required=True, type=pathlib.Path)
-    parser.add_argument("--mode", choices=("verbatim", "clean", "polished"), default="verbatim")
+    parser.add_argument("--mode", choices=("verbatim", "clean", "llm"), default="verbatim")
     parser.add_argument("--runs", type=int, default=3)
     parser.add_argument("--max-wer", type=float, default=0.09)
     parser.add_argument("--max-cer", type=float, default=0.03)

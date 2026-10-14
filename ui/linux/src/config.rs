@@ -208,7 +208,7 @@ impl Default for Llm {
 pub enum ProcessingMode {
     Verbatim,
     Clean,
-    Polished,
+    Llm,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -216,7 +216,7 @@ pub enum ProcessingMode {
 pub enum ProcessingProfile {
     Verbatim,
     Clean,
-    Polished,
+    Llm,
     LegacyV1,
 }
 
@@ -233,7 +233,7 @@ fn effective_processing_profile(
     match mode {
         Some(ProcessingMode::Verbatim) => ProcessingProfile::Verbatim,
         Some(ProcessingMode::Clean) => ProcessingProfile::Clean,
-        Some(ProcessingMode::Polished) => ProcessingProfile::Polished,
+        Some(ProcessingMode::Llm) => ProcessingProfile::Llm,
         None if legacy_llm_enabled => ProcessingProfile::LegacyV1,
         None => ProcessingProfile::Verbatim,
     }
@@ -250,7 +250,7 @@ pub fn selected_processing_mode() -> io::Result<ProcessingMode> {
         match effective_processing_profile(cfg.processing.mode, cfg.llm.enabled.unwrap_or(false)) {
             ProcessingProfile::Verbatim => ProcessingMode::Verbatim,
             ProcessingProfile::Clean => ProcessingMode::Clean,
-            ProcessingProfile::Polished | ProcessingProfile::LegacyV1 => ProcessingMode::Polished,
+            ProcessingProfile::Llm | ProcessingProfile::LegacyV1 => ProcessingMode::Llm,
         },
     )
 }
@@ -366,13 +366,13 @@ fn encode_processing_mode(bytes: &[u8], mode: ProcessingMode) -> io::Result<Vec<
         match mode {
             ProcessingMode::Verbatim => ProcessingProfile::Verbatim,
             ProcessingMode::Clean => ProcessingProfile::Clean,
-            ProcessingMode::Polished => ProcessingProfile::Polished,
+            ProcessingMode::Llm => ProcessingProfile::Llm,
         },
         &llm_api_key,
         &cfg.llm.model,
     ) {
         return Err(invalid(
-            "polished mode requires Cerebras credentials and a supported planner model",
+            "llm mode requires Cerebras credentials and a supported planner model",
         ));
     }
     let mut value: serde_json::Value =
@@ -516,10 +516,8 @@ fn project_local_config(cfg: Config) -> io::Result<SessionConfig> {
     let profile = match cfg.processing.mode {
         None | Some(ProcessingMode::Clean) => ProcessingProfile::Clean,
         Some(ProcessingMode::Verbatim) => ProcessingProfile::Verbatim,
-        Some(ProcessingMode::Polished) => {
-            return Err(invalid(
-                "local mode supports Verbatim or Clean, not Polished",
-            ));
+        Some(ProcessingMode::Llm) => {
+            return Err(invalid("local mode supports Verbatim or Clean, not Llm"));
         }
     };
     let model = if cfg.stt.local_model_path.is_empty() {
@@ -575,7 +573,7 @@ fn valid_processing_credentials(
     llm_model: &str,
 ) -> bool {
     match profile {
-        ProcessingProfile::Polished => llm_model == "gpt-oss-120b" && !llm_api_key.is_empty(),
+        ProcessingProfile::Llm => llm_model == "gpt-oss-120b" && !llm_api_key.is_empty(),
         ProcessingProfile::LegacyV1 => llm_model == "gpt-oss-120b",
         ProcessingProfile::Verbatim | ProcessingProfile::Clean => true,
     }
@@ -935,7 +933,7 @@ mod tests {
         }
         assert!(
             project_session_config(
-                br#"{"stt":{"provider":"local"},"processing":{"mode":"polished"}}"#,
+                br#"{"stt":{"provider":"local"},"processing":{"mode":"llm"}}"#,
                 Path::new("/not-read")
             )
             .is_err()
@@ -1050,35 +1048,73 @@ mod tests {
             ProcessingProfile::Clean
         );
         assert_eq!(
-            effective_processing_profile(Some(ProcessingMode::Polished), false),
-            ProcessingProfile::Polished
+            effective_processing_profile(Some(ProcessingMode::Llm), false),
+            ProcessingProfile::Llm
         );
     }
 
     #[test]
     fn processing_mode_rejects_private_legacy_profile() {
         let explicit: Config =
-            serde_json::from_str(r#"{"processing":{"mode":"polished"},"llm":{"enabled":true}}"#)
+            serde_json::from_str(r#"{"processing":{"mode":"llm"},"llm":{"enabled":true}}"#)
                 .unwrap();
-        assert_eq!(explicit.processing.mode, Some(ProcessingMode::Polished));
+        assert_eq!(explicit.processing.mode, Some(ProcessingMode::Llm));
         assert!(serde_json::from_str::<Config>(r#"{"processing":{"mode":"legacy_v1"}}"#).is_err());
         assert!(serde_json::from_str::<Config>(r#"{"processing":{"mode":"ai_only"}}"#).is_err());
+        assert!(serde_json::from_str::<Config>(r#"{"processing":{"mode":"polished"}}"#).is_err());
+        assert!(serde_json::from_str::<ProcessingProfile>(r#""polished""#).is_err());
     }
 
     #[test]
-    fn planner_profiles_require_the_supported_model_and_polished_requires_credentials() {
+    fn llm_profile_and_persistence_use_the_same_name() {
+        for name in ["llm"] {
+            let bytes = serde_json::to_vec(&serde_json::json!({
+                "stt": {"api_key": "synthetic-deepgram"},
+                "llm": {"api_key": "synthetic-cerebras", "enabled": false},
+                "processing": {"mode": name},
+                "future": {"preserved": true}
+            }))
+            .unwrap();
+            let cfg = project_session_config(&bytes, Path::new("/not-read")).unwrap();
+            assert_eq!(cfg.provider.processing_profile, ProcessingProfile::Llm);
+            // Read/project is non-mutating; only an explicit save canonicalizes.
+            let updated = encode_processing_mode(&bytes, ProcessingMode::Llm).unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&updated).unwrap();
+            assert_eq!(value["processing"]["mode"], "llm");
+            assert_eq!(value["future"]["preserved"], true);
+            assert_eq!(value["stt"]["api_key"], "synthetic-deepgram");
+            assert_eq!(value["llm"]["api_key"], "synthetic-cerebras");
+            assert_eq!(
+                serde_json::to_value(cfg.provider.processing_profile).unwrap(),
+                "llm"
+            );
+            let mut local: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            local["stt"]["provider"] = "local".into();
+            assert!(
+                project_session_config(
+                    &serde_json::to_vec(&local).unwrap(),
+                    Path::new("/not-read")
+                )
+                .is_err(),
+                "the new spelling must not bypass the local/cloud boundary"
+            );
+        }
+    }
+
+    #[test]
+    fn planner_profiles_require_the_supported_model_and_llm_requires_credentials() {
         assert!(valid_processing_credentials(
-            ProcessingProfile::Polished,
+            ProcessingProfile::Llm,
             "secret",
             "gpt-oss-120b"
         ));
         assert!(!valid_processing_credentials(
-            ProcessingProfile::Polished,
+            ProcessingProfile::Llm,
             "",
             "gpt-oss-120b"
         ));
         assert!(!valid_processing_credentials(
-            ProcessingProfile::Polished,
+            ProcessingProfile::Llm,
             "secret",
             "other/model"
         ));
@@ -1116,7 +1152,7 @@ mod tests {
     }
 
     #[test]
-    fn mode_mutation_validates_polished_before_publication_and_allows_recovery() {
+    fn mode_mutation_validates_llm_before_publication_and_allows_recovery() {
         let fixture = ConfigDir::new(
             br#"{"stt":{"api_key":"deepgram"},"processing":{"mode":"clean"},"llm":{"model":"other/model"}}"#,
         );
@@ -1124,7 +1160,7 @@ mod tests {
             set_processing_mode_at(
                 &fixture.open(),
                 &fixture.0,
-                ProcessingMode::Polished,
+                ProcessingMode::Llm,
                 || {},
                 || {}
             )
@@ -1136,7 +1172,7 @@ mod tests {
 
         fs::write(
             fixture.0.join(CONFIG_NAME),
-            br#"{"stt":{"api_key":"deepgram"},"processing":{"mode":"polished"},"llm":{"model":"other/model"}}"#,
+            br#"{"stt":{"api_key":"deepgram"},"processing":{"mode":"llm"},"llm":{"model":"other/model"}}"#,
         )
         .unwrap();
         set_processing_mode_at(
@@ -1195,7 +1231,7 @@ mod tests {
             set_processing_mode_at(
                 &second_parent,
                 &second_path,
-                ProcessingMode::Polished,
+                ProcessingMode::Llm,
                 || read_tx.send(()).unwrap(),
                 || {},
             )

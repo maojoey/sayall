@@ -117,10 +117,10 @@ pub fn show(app: &Application, shortcut_status: global_shortcut::Status) {
     processing_heading.add_css_class("settings-section-title");
     let verbatim = CheckButton::with_label("Verbatim — preserve finalized transcription");
     let clean = CheckButton::with_label("Clean — apply deterministic cleanup");
-    let polished = CheckButton::with_label("Polished — refine wording and structure");
+    let llm = CheckButton::with_label("LLM — refine wording and structure");
     clean.set_group(Some(&verbatim));
-    polished.set_group(Some(&verbatim));
-    for button in [&verbatim, &clean, &polished] {
+    llm.set_group(Some(&verbatim));
+    for button in [&verbatim, &clean, &llm] {
         button.set_sensitive(false);
         button.add_css_class("settings-option");
     }
@@ -133,7 +133,7 @@ pub fn show(app: &Application, shortcut_status: global_shortcut::Status) {
     processing.append(&processing_heading);
     processing.append(&verbatim);
     processing.append(&clean);
-    processing.append(&polished);
+    processing.append(&llm);
     column.append(&processing);
     let output = GtkBox::new(Orientation::Vertical, 6);
     output.add_css_class("settings-card");
@@ -185,7 +185,7 @@ pub fn show(app: &Application, shortcut_status: global_shortcut::Status) {
         let login = login.clone();
         let verbatim = verbatim.clone();
         let clean = clean.clone();
-        let polished = polished.clone();
+        let llm = llm.clone();
         let type_output = type_output.clone();
         let paste_output = paste_output.clone();
         let clipboard_output = clipboard_output.clone();
@@ -206,7 +206,7 @@ pub fn show(app: &Application, shortcut_status: global_shortcut::Status) {
             let login = login.clone();
             let verbatim = verbatim.clone();
             let clean = clean.clone();
-            let polished = polished.clone();
+            let llm = llm.clone();
             let type_output = type_output.clone();
             let paste_output = paste_output.clone();
             let clipboard_output = clipboard_output.clone();
@@ -239,7 +239,7 @@ pub fn show(app: &Application, shortcut_status: global_shortcut::Status) {
                 for button in [
                     &verbatim,
                     &clean,
-                    &polished,
+                    &llm,
                     &type_output,
                     &paste_output,
                     &clipboard_output,
@@ -252,7 +252,7 @@ pub fn show(app: &Application, shortcut_status: global_shortcut::Status) {
                     match mode {
                         config::ProcessingMode::Verbatim => verbatim.set_active(true),
                         config::ProcessingMode::Clean => clean.set_active(true),
-                        config::ProcessingMode::Polished => polished.set_active(true),
+                        config::ProcessingMode::Llm => llm.set_active(true),
                     }
                     changing.set(false);
                 }
@@ -312,14 +312,14 @@ pub fn show(app: &Application, shortcut_status: global_shortcut::Status) {
     for (button, mode) in [
         (verbatim.clone(), config::ProcessingMode::Verbatim),
         (clean.clone(), config::ProcessingMode::Clean),
-        (polished.clone(), config::ProcessingMode::Polished),
+        (llm.clone(), config::ProcessingMode::Llm),
     ] {
         let changing = changing.clone();
         let confirmed_mode = confirmed_mode.clone();
         let mode_status = status.clone();
         let verbatim = verbatim.clone();
         let clean = clean.clone();
-        let polished = polished.clone();
+        let llm = llm.clone();
         button.connect_toggled(move |button| {
             if changing.get() || !button.is_active() {
                 return;
@@ -334,7 +334,7 @@ pub fn show(app: &Application, shortcut_status: global_shortcut::Status) {
                     match confirmed_mode.get() {
                         config::ProcessingMode::Verbatim => verbatim.set_active(true),
                         config::ProcessingMode::Clean => clean.set_active(true),
-                        config::ProcessingMode::Polished => polished.set_active(true),
+                        config::ProcessingMode::Llm => llm.set_active(true),
                     }
                     changing.set(false);
                     mode_status.set_text(&format!("Could not change mode: {error}"));

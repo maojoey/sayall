@@ -162,7 +162,7 @@ final class CoordinatorControlTests: XCTestCase {
         coordinator.trigger(source: .menu)
         XCTAssertEqual(availabilityChanges, 1)
         XCTAssertEqual(coordinator.operationProcessingProfile, .clean)
-        XCTAssertNotNil(coordinator.selectProcessingMode(.polished))
+        XCTAssertNotNil(coordinator.selectProcessingMode(.llm))
         XCTAssertEqual(coordinator.operationProcessingProfile, .clean)
         XCTAssertEqual(try loader.load().processingProfile, .clean)
         XCTAssertFalse(coordinator.handleControl(.reload).ok)
@@ -172,7 +172,7 @@ final class CoordinatorControlTests: XCTestCase {
     }
 
     @MainActor
-    func testPolishedValidationReturnsActionableSelectionAndReloadErrors() throws {
+    func testLlmValidationReturnsActionableSelectionAndReloadErrors() throws {
         let home = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: home) }
         let loader = ConfigurationLoader(environment: [:], homeDirectory: home)
@@ -183,9 +183,9 @@ final class CoordinatorControlTests: XCTestCase {
         try Data(#"{"stt":{"api_key":"key"},"processing":{"mode":"verbatim"}}"#.utf8).write(to: loader.url)
         let coordinator = Coordinator(configuration: loader) {}
 
-        XCTAssertEqual(coordinator.selectProcessingMode(.polished),
+        XCTAssertEqual(coordinator.selectProcessingMode(.llm),
             "Cloud processing requires llm.api_key or CEREBRAS_API_KEY")
-        try Data(#"{"stt":{"api_key":"key"},"processing":{"mode":"polished"}}"#.utf8).write(to: loader.url)
+        try Data(#"{"stt":{"api_key":"key"},"processing":{"mode":"llm"}}"#.utf8).write(to: loader.url)
         let reload = coordinator.handleControl(.reload)
         XCTAssertFalse(reload.ok)
         XCTAssertTrue(reload.error?.contains("Cloud processing requires llm.api_key or CEREBRAS_API_KEY") == true)
@@ -1013,29 +1013,29 @@ final class AudioCaptureConversionTests: XCTestCase {
 
 final class HelperDecoderTests: XCTestCase {
     func testSuccessAndNoSpeechDecode() throws {
-        let success = try HelperDecoder.decode(Data(#"{"version":4,"status":"success","text":"hello","processing_profile":"clean","transport":"rest"}"#.utf8))
+        let success = try HelperDecoder.decode(Data(#"{"version":5,"status":"success","text":"hello","processing_profile":"clean","transport":"rest"}"#.utf8))
         XCTAssertEqual(success.text, "hello")
         XCTAssertEqual(success.processingProfile, .clean)
         XCTAssertEqual(success.transport, .rest)
-        XCTAssertEqual(try HelperDecoder.decode(Data(#"{"version":4,"status":"no_speech","processing_profile":"verbatim","transport":"stream"}"#.utf8)).status, .noSpeech)
+        XCTAssertEqual(try HelperDecoder.decode(Data(#"{"version":5,"status":"no_speech","processing_profile":"verbatim","transport":"stream"}"#.utf8)).status, .noSpeech)
     }
     func testStableErrorMapping() {
-        XCTAssertThrowsError(try HelperDecoder.decode(Data(#"{"version":4,"status":"error","error":"deepgram_network","processing_profile":"polished","transport":"rest"}"#.utf8))) { XCTAssertEqual($0 as? HelperFailure, .unsuccessful("deepgram_network")) }
-        XCTAssertThrowsError(try HelperDecoder.decode(Data(#"{"version":4,"status":"error","error":"future_error","processing_profile":"polished","transport":"rest"}"#.utf8))) { XCTAssertEqual($0 as? HelperFailure, .malformedOutput) }
+        XCTAssertThrowsError(try HelperDecoder.decode(Data(#"{"version":5,"status":"error","error":"deepgram_network","processing_profile":"llm","transport":"rest"}"#.utf8))) { XCTAssertEqual($0 as? HelperFailure, .unsuccessful("deepgram_network")) }
+        XCTAssertThrowsError(try HelperDecoder.decode(Data(#"{"version":5,"status":"error","error":"future_error","processing_profile":"llm","transport":"rest"}"#.utf8))) { XCTAssertEqual($0 as? HelperFailure, .malformedOutput) }
         XCTAssertThrowsError(try HelperDecoder.decode(Data(#"{"version":2,"status":"success","text":"old","processing_profile":"clean","transport":"rest"}"#.utf8))) { XCTAssertEqual($0 as? HelperFailure, .unsupportedVersion) }
-        XCTAssertThrowsError(try HelperDecoder.decode(Data(#"{"version":4,"status":"success","text":"missing fields"}"#.utf8))) { XCTAssertEqual($0 as? HelperFailure, .malformedOutput) }
-        XCTAssertThrowsError(try HelperDecoder.decode(Data(#"{"version":4,"status":"success","text":"hello","warning":"future","processing_profile":"clean","transport":"rest"}"#.utf8))) { XCTAssertEqual($0 as? HelperFailure, .malformedOutput) }
-        XCTAssertThrowsError(try HelperDecoder.decode(Data(#"{"version":4,"status":"no_speech","text":"unexpected","processing_profile":"clean","transport":"rest"}"#.utf8))) { XCTAssertEqual($0 as? HelperFailure, .malformedOutput) }
+        XCTAssertThrowsError(try HelperDecoder.decode(Data(#"{"version":5,"status":"success","text":"missing fields"}"#.utf8))) { XCTAssertEqual($0 as? HelperFailure, .malformedOutput) }
+        XCTAssertThrowsError(try HelperDecoder.decode(Data(#"{"version":5,"status":"success","text":"hello","warning":"future","processing_profile":"clean","transport":"rest"}"#.utf8))) { XCTAssertEqual($0 as? HelperFailure, .malformedOutput) }
+        XCTAssertThrowsError(try HelperDecoder.decode(Data(#"{"version":5,"status":"no_speech","text":"unexpected","processing_profile":"clean","transport":"rest"}"#.utf8))) { XCTAssertEqual($0 as? HelperFailure, .malformedOutput) }
         XCTAssertThrowsError(try HelperDecoder.decode(Data("nope".utf8))) { XCTAssertEqual($0 as? HelperFailure, .malformedOutput) }
         XCTAssertThrowsError(try HelperDecoder.decode(Data(repeating: 0, count: HelperDecoder.maximumOutputBytes + 1))) { XCTAssertEqual($0 as? HelperFailure, .oversizedOutput) }
     }
 
     func testStreamingDecoderRequiresReadyAndTerminalFrames() throws {
-        let ready = try StreamingHelperDecoder.decodeReady(Data(#"{"version":4,"event":"ready","streaming":true}"#.utf8))
+        let ready = try StreamingHelperDecoder.decodeReady(Data(#"{"version":5,"event":"ready","streaming":true}"#.utf8))
         XCTAssertTrue(ready.streaming)
-        let rest = try StreamingHelperDecoder.decodeReady(Data(#"{"version":4,"event":"ready","streaming":false}"#.utf8))
+        let rest = try StreamingHelperDecoder.decodeReady(Data(#"{"version":5,"event":"ready","streaming":false}"#.utf8))
         XCTAssertFalse(rest.streaming)
-        XCTAssertEqual(try StreamingHelperDecoder.decode(Data(#"{"version":4,"status":"success","text":"hello","processing_profile":"polished","transport":"stream"}"#.utf8)).text, "hello")
+        XCTAssertEqual(try StreamingHelperDecoder.decode(Data(#"{"version":5,"status":"success","text":"hello","processing_profile":"llm","transport":"stream"}"#.utf8)).text, "hello")
         XCTAssertThrowsError(try StreamingHelperDecoder.decodeReady(Data("{}".utf8)))
         XCTAssertThrowsError(try StreamingHelperDecoder.decodeReady(Data(#"{"version":2,"event":"ready","streaming":true}"#.utf8)))
         XCTAssertThrowsError(try StreamingHelperDecoder.decodeReady(Data(repeating: 0, count: StreamingHelperDecoder.maximumReadyBytes + 1)))
@@ -1048,7 +1048,7 @@ final class HelperDecoderTests: XCTestCase {
             llmAPIKey: "", llmModel: "gpt-oss-120b",
             llmBaseURL: "https://api.cerebras.ai/v1/chat/completions", processingProfile: .clean)
         let object = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(request)) as? [String: Any])
-        XCTAssertEqual(object["version"] as? Int, 4)
+        XCTAssertEqual(object["version"] as? Int, 5)
         XCTAssertEqual(object["processing_profile"] as? String, "clean")
         XCTAssertNil(object["cleanup_enabled"])
     }
@@ -1098,7 +1098,7 @@ final class HelperRunnerTests: XCTestCase {
 int main(void) {
     signal(SIGTERM, SIG_IGN);
     usleep(700000);
-    fputs("{\"protocol_version\":4,\"build_version\":\"test-build\"}\n", stdout);
+    fputs("{\"protocol_version\":5,\"build_version\":\"test-build\"}\n", stdout);
     fflush(stdout);
     sleep(3);
     return 0;
@@ -1139,7 +1139,7 @@ extern char **environ;
 int main(void) {
     if (environ[0] != NULL) return 4;
     while (getchar() != EOF) {}
-    fputs("{\"version\":4,\"status\":\"success\",\"text\":\"ok\",\"processing_profile\":\"clean\",\"transport\":\"rest\"}", stdout);
+    fputs("{\"version\":5,\"status\":\"success\",\"text\":\"ok\",\"processing_profile\":\"clean\",\"transport\":\"rest\"}", stdout);
     return 0;
 }
 """#.utf8).write(to: source)
@@ -1166,10 +1166,10 @@ int main(int argc, char **argv) {
     char line[65536];
     if (environ[0] != NULL) return 4;
     if (argc != 2 || strcmp(argv[1], "--stream") != 0 || !fgets(line, sizeof(line), stdin)) return 2;
-    fputs("{\"version\":4,\"event\":\"ready\",\"streaming\":true}\n", stdout);
+    fputs("{\"version\":5,\"event\":\"ready\",\"streaming\":true}\n", stdout);
     fflush(stdout);
     if (!fgets(line, sizeof(line), stdin) || !strstr(line, "\"command\":\"finish\"")) return 3;
-    fputs("{\"version\":4,\"status\":\"success\",\"text\":\"streamed\",\"processing_profile\":\"clean\",\"transport\":\"stream\"}\n", stdout);
+    fputs("{\"version\":5,\"status\":\"success\",\"text\":\"streamed\",\"processing_profile\":\"clean\",\"transport\":\"stream\"}\n", stdout);
     return 0;
 }
 """#.utf8).write(to: source)
@@ -1191,9 +1191,9 @@ int main(int argc, char **argv) {
 int main(void) {
     char line[65536];
     if (!fgets(line, sizeof(line), stdin)) return 2;
-    fputs("{\"version\":4,\"event\":\"ready\",\"streaming\":true}\n", stdout); fflush(stdout);
+    fputs("{\"version\":5,\"event\":\"ready\",\"streaming\":true}\n", stdout); fflush(stdout);
     if (!fgets(line, sizeof(line), stdin)) return 3;
-    fputs("{\"version\":4,\"status\":\"error\",\"error\":\"deepgram_network\",\"processing_profile\":\"clean\",\"transport\":\"stream\"}\n", stdout);
+    fputs("{\"version\":5,\"status\":\"error\",\"error\":\"deepgram_network\",\"processing_profile\":\"clean\",\"transport\":\"stream\"}\n", stdout);
     return 0;
 }
 """#.utf8).write(to: source)
@@ -1223,7 +1223,7 @@ int main(void) {
     char line[65536];
     for (int number = 1; number < 32; number++) signal(number, SIG_IGN);
     if (!fgets(line, sizeof(line), stdin)) return 2;
-    fputs("{\"version\":4,\"event\":\"ready\",\"streaming\":true}\n", stdout); fflush(stdout);
+    fputs("{\"version\":5,\"event\":\"ready\",\"streaming\":true}\n", stdout); fflush(stdout);
     for (;;) pause();
 }
 """#.utf8).write(to: source)
@@ -1281,7 +1281,7 @@ int main(void) {
     char line[65536];
     for (int number = 1; number < 32; number++) signal(number, SIG_IGN);
     if (!fgets(line, sizeof(line), stdin)) return 2;
-    fputs("{\"version\":4,\"event\":\"ready\",\"streaming\":true}\n", stdout); fflush(stdout);
+    fputs("{\"version\":5,\"event\":\"ready\",\"streaming\":true}\n", stdout); fflush(stdout);
     if (!fgets(line, sizeof(line), stdin)) return 3;
     for (;;) pause();
 }
@@ -1350,12 +1350,12 @@ final class ProcessingOwnershipTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: home) }
         let loader = ConfigurationLoader(environment: [:], homeDirectory: home)
         try FileManager.default.createDirectory(at: loader.url.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try Data(#"{"stt":{"api_key":"key"},"llm":{"api_key":"cerebras"},"processing":{"mode":"polished"}}"#.utf8).write(to: loader.url)
+        try Data(#"{"stt":{"api_key":"key"},"llm":{"api_key":"cerebras"},"processing":{"mode":"llm"}}"#.utf8).write(to: loader.url)
         let snapshot = try loader.load()
 
         let stream = Coordinator.streamingRequest(config: snapshot, wavPath: "/tmp/audio.wav", pcmPath: "/tmp/audio.pcm")
         let fallback = Coordinator.batchRequest(config: snapshot, wavPath: "/tmp/audio.wav")
-        XCTAssertEqual(stream.processingProfile, .polished)
+        XCTAssertEqual(stream.processingProfile, .llm)
         XCTAssertEqual(fallback.processingProfile, stream.processingProfile)
     }
 
@@ -1426,7 +1426,7 @@ final class SharedBackendContractTests: XCTestCase {
         let warning = try HelperDecoder.decode(fixture("worker-result-transformation-warning"))
         XCTAssertEqual(warning.warning, "transformation_failed")
         XCTAssertEqual(warning.text, "raw transcript")
-        XCTAssertEqual(warning.processingProfile, .polished)
+        XCTAssertEqual(warning.processingProfile, .llm)
         XCTAssertEqual(warning.transport, .stream)
 
         XCTAssertEqual(try HelperDecoder.decode(fixture("worker-result-no-speech")).status, .noSpeech)
@@ -1587,7 +1587,7 @@ final class ConfigurationLoaderTests: XCTestCase {
             (#"{"stt":{"api_key":"key"},"llm":{"enabled":true}}"#, .legacyV1),
             (#"{"stt":{"api_key":"key"},"llm":{"enabled":true},"processing":{"mode":"verbatim"}}"#, .verbatim),
             (#"{"stt":{"api_key":"key"},"llm":{"enabled":true},"processing":{"mode":"clean"}}"#, .clean),
-            (#"{"stt":{"api_key":"key"},"llm":{"api_key":"cerebras","enabled":false},"processing":{"mode":"polished"}}"#, .polished),
+            (#"{"stt":{"api_key":"key"},"llm":{"api_key":"cerebras","enabled":false},"processing":{"mode":"llm"}}"#, .llm),
         ] {
             try Data(json.utf8).write(to: loader.url)
             XCTAssertEqual(try loader.load().processingProfile, expected)
@@ -1605,9 +1605,63 @@ final class ConfigurationLoaderTests: XCTestCase {
         XCTAssertEqual(permissions.intValue & 0o777, 0o600)
     }
 
+    func testLLMConfigurationPreservesValidationAndUsesLLMWorkerProfile() throws {
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: home) }
+        let loader = ConfigurationLoader(environment: [:], homeDirectory: home)
+        try preparePrivateParent(for: loader)
+
+        for name in ["llm"] {
+            XCTAssertEqual(ProcessingMode(rawValue: name), .llm)
+            let original = Data("""
+                {"stt":{"api_key":"key"},"llm":{"api_key":"cerebras","enabled":false},
+                 "processing":{"mode":"\(name)"},"future":{"preserved":true}}
+                """.utf8)
+            try original.write(to: loader.url)
+            let config = try loader.load()
+            XCTAssertEqual(config.processingProfile, .llm)
+            XCTAssertEqual(try Data(contentsOf: loader.url), original)
+            let request = Coordinator.batchRequest(config: config, wavPath: "/audio.wav")
+            let wire = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(request)) as? [String: Any])
+            XCTAssertEqual(wire["processing_profile"] as? String, "llm")
+
+            try loader.setProcessingMode(.llm)
+            let saved = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: loader.url)) as? [String: Any])
+            XCTAssertEqual((saved["processing"] as? [String: Any])?["mode"] as? String, "llm")
+            XCTAssertEqual((saved["future"] as? [String: Any])?["preserved"] as? Bool, true)
+            XCTAssertEqual((saved["stt"] as? [String: Any])?["api_key"] as? String, "key")
+            XCTAssertEqual((saved["llm"] as? [String: Any])?["api_key"] as? String, "cerebras")
+
+            try Data("""
+                {"stt":{"api_key":"key"},"processing":{"mode":"\(name)"}}
+                """.utf8).write(to: loader.url)
+            XCTAssertThrowsError(try loader.load()) {
+                XCTAssertEqual($0 as? ConfigurationError, .missingCerebrasKey)
+            }
+            try Data("""
+                {"stt":{"provider":"local"},"processing":{"mode":"\(name)"}}
+                """.utf8).write(to: loader.url)
+            XCTAssertThrowsError(try loader.load()) {
+                XCTAssertEqual($0 as? ConfigurationError, .invalidProvider)
+            }
+        }
+        XCTAssertNil(ProcessingMode(rawValue: "legacy_v1"))
+        XCTAssertNil(ProcessingMode(rawValue: "LLM"))
+        XCTAssertNil(ProcessingMode(rawValue: "polished"))
+        XCTAssertNil(ProcessingProfile(rawValue: "polished"))
+        XCTAssertEqual(ProcessingMode.llm.title, "LLM")
+        try Data(#"{"stt":{"api_key":"key"},"processing":{"mode":"polished"}}"#.utf8).write(to: loader.url)
+        XCTAssertThrowsError(try loader.load()) {
+            XCTAssertEqual($0 as? ConfigurationError, .invalidProcessingMode)
+        }
+        XCTAssertThrowsError(try HelperDecoder.decode(Data(#"{"version":4,"status":"no_speech","processing_profile":"clean","transport":"rest"}"#.utf8))) {
+            XCTAssertEqual($0 as? HelperFailure, .unsupportedVersion)
+        }
+    }
+
     func testPrivateLegacyProfileProjectsToAUserFacingMode() {
-        XCTAssertEqual(ProcessingMode.allCases, [.verbatim, .clean, .polished])
-        XCTAssertEqual(ProcessingProfile.legacyV1.userMode, .polished)
+        XCTAssertEqual(ProcessingMode.allCases, [.verbatim, .clean, .llm])
+        XCTAssertEqual(ProcessingProfile.legacyV1.userMode, .llm)
     }
 
     func testModeMutationRejectsSymlinkWithoutReplacingItsTarget() throws {
@@ -1620,7 +1674,7 @@ final class ConfigurationLoaderTests: XCTestCase {
         try original.write(to: target)
         try FileManager.default.createSymbolicLink(at: loader.url, withDestinationURL: target)
 
-        XCTAssertThrowsError(try loader.setProcessingMode(.polished)) {
+        XCTAssertThrowsError(try loader.setProcessingMode(.llm)) {
             XCTAssertEqual($0 as? ConfigurationError, .writeFailed)
         }
         XCTAssertEqual(try Data(contentsOf: target), original)
@@ -1704,43 +1758,43 @@ final class ConfigurationLoaderTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: config), replacement)
     }
 
-    func testExplicitPolishedRequiresSupportedPlannerCredentialsBeforeWriteOrReload() throws {
+    func testExplicitLlmRequiresSupportedPlannerCredentialsBeforeWriteOrReload() throws {
         let home = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: home) }
         let loader = ConfigurationLoader(environment: [:], homeDirectory: home)
         try preparePrivateParent(for: loader)
 
-        let missingKey = Data(#"{"stt":{"api_key":"key"},"processing":{"mode":"polished"}}"#.utf8)
+        let missingKey = Data(#"{"stt":{"api_key":"key"},"processing":{"mode":"llm"}}"#.utf8)
         try missingKey.write(to: loader.url)
         XCTAssertThrowsError(try loader.load()) { XCTAssertEqual($0 as? ConfigurationError, .missingCerebrasKey) }
 
         let verbatim = Data(#"{"stt":{"api_key":"key"},"processing":{"mode":"verbatim"}}"#.utf8)
         try verbatim.write(to: loader.url)
-        XCTAssertThrowsError(try loader.setProcessingMode(.polished)) {
+        XCTAssertThrowsError(try loader.setProcessingMode(.llm)) {
             XCTAssertEqual($0 as? ConfigurationError, .missingCerebrasKey)
         }
         XCTAssertEqual(try Data(contentsOf: loader.url), verbatim)
 
-        let unsupported = #"{"stt":{"api_key":"key"},"llm":{"api_key":"cerebras","model":"other/model"},"processing":{"mode":"polished"}}"#
+        let unsupported = #"{"stt":{"api_key":"key"},"llm":{"api_key":"cerebras","model":"other/model"},"processing":{"mode":"llm"}}"#
         try Data(unsupported.utf8).write(to: loader.url)
         XCTAssertThrowsError(try loader.load()) {
             XCTAssertEqual($0 as? ConfigurationError, .unsupportedPlannerModel)
         }
-        let malformedModel = #"{"stt":{"api_key":"key"},"llm":{"api_key":"cerebras","model":"a/b/c"},"processing":{"mode":"polished"}}"#
+        let malformedModel = #"{"stt":{"api_key":"key"},"llm":{"api_key":"cerebras","model":"a/b/c"},"processing":{"mode":"llm"}}"#
         try Data(malformedModel.utf8).write(to: loader.url)
         XCTAssertThrowsError(try loader.load()) {
             XCTAssertEqual($0 as? ConfigurationError, .invalidProvider)
         }
         let unsupportedSelection = Data(#"{"stt":{"api_key":"key"},"llm":{"api_key":"cerebras","model":"other/model"},"processing":{"mode":"verbatim"}}"#.utf8)
         try unsupportedSelection.write(to: loader.url)
-        XCTAssertThrowsError(try loader.setProcessingMode(.polished)) {
+        XCTAssertThrowsError(try loader.setProcessingMode(.llm)) {
             XCTAssertEqual($0 as? ConfigurationError, .unsupportedPlannerModel)
         }
         XCTAssertEqual(try Data(contentsOf: loader.url), unsupportedSelection)
 
-        let supported = #"{"stt":{"api_key":"key"},"llm":{"api_key":"cerebras","model":"gpt-oss-120b"},"processing":{"mode":"polished"}}"#
+        let supported = #"{"stt":{"api_key":"key"},"llm":{"api_key":"cerebras","model":"gpt-oss-120b"},"processing":{"mode":"llm"}}"#
         try Data(supported.utf8).write(to: loader.url)
-        XCTAssertEqual(try loader.load().processingProfile, .polished)
+        XCTAssertEqual(try loader.load().processingProfile, .llm)
 
         try Data(#"{"stt":{"api_key":"key"},"llm":{"enabled":true,"model":"other/model"}}"#.utf8)
             .write(to: loader.url)
@@ -1782,7 +1836,7 @@ final class ConfigurationLoaderTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: home) }
         let loader = ConfigurationLoader(environment: [:], homeDirectory: home)
         try preparePrivateParent(for: loader)
-        let legacy = #"{"stt":{"api_key":"deepgram"},"llm":{"provider":"groq","api_key":"legacy-secret","model":"openai/gpt-oss-20b","base_url":"https://api.groq.com/openai/v1/chat/completions"},"processing":{"mode":"polished"}}"#
+        let legacy = #"{"stt":{"api_key":"deepgram"},"llm":{"provider":"groq","api_key":"legacy-secret","model":"openai/gpt-oss-20b","base_url":"https://api.groq.com/openai/v1/chat/completions"},"processing":{"mode":"llm"}}"#
         try Data(legacy.utf8).write(to: loader.url)
         XCTAssertThrowsError(try loader.load()) {
             XCTAssertEqual($0 as? ConfigurationError, .missingCerebrasKey)
@@ -1876,12 +1930,12 @@ final class StartupMetricsTests: XCTestCase {
 
 final class PipelineMetricsTests: XCTestCase {
     func testTimingDecodesWithoutWeakeningResultContract() throws {
-        let result = try HelperDecoder.decode(Data(#"{"version":4,"status":"success","text":"hello","processing_profile":"clean","transport":"stream","timing":{"deepgram_connect_ms":12,"deepgram_stop_to_final_ms":34,"deterministic_processing_ms":5,"processing_total_ms":40}}"#.utf8))
+        let result = try HelperDecoder.decode(Data(#"{"version":5,"status":"success","text":"hello","processing_profile":"clean","transport":"stream","timing":{"deepgram_connect_ms":12,"deepgram_stop_to_final_ms":34,"deterministic_processing_ms":5,"processing_total_ms":40}}"#.utf8))
         XCTAssertEqual(result.timing?.deepgramConnectMs, 12)
         XCTAssertEqual(result.timing?.deepgramStopToFinalMs, 34)
         XCTAssertEqual(result.timing?.deterministicProcessingMs, 5)
         XCTAssertNil(result.timing?.restSTTMs)
-        XCTAssertThrowsError(try HelperDecoder.decode(Data(#"{"version":4,"status":"success","text":"hello","processing_profile":"clean","transport":"stream","timing":{"processing_total_ms":40}}"#.utf8)))
+        XCTAssertThrowsError(try HelperDecoder.decode(Data(#"{"version":5,"status":"success","text":"hello","processing_profile":"clean","transport":"stream","timing":{"processing_total_ms":40}}"#.utf8)))
     }
 
     func testPipelineStoreIsBoundedAndPrivate() async throws {
@@ -1893,7 +1947,7 @@ final class PipelineMetricsTests: XCTestCase {
             deepgramConnectMs: 1, deepgramStopToFinalMs: 2,
             restSTTMs: nil, deterministicProcessingMs: 3, plannerMs: 4, processingTotalMs: 5,
             helperFinishMs: 6, deliveryMs: 7, stopToDeliveredMs: 13,
-            outcome: "success", profile: .polished, transport: .stream)
+            outcome: "success", profile: .llm, transport: .stream)
         await store.record(sample, enabled: true, limit: 1)
         await store.record(sample, enabled: true, limit: 1)
         let samples = await store.samplesForTesting()

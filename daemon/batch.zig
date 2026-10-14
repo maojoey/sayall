@@ -348,7 +348,7 @@ fn liveClean(_: ?*anyopaque, gpa: std.mem.Allocator, keyterms: []const []const u
 
 fn livePlanner(_: ?*anyopaque, gpa: std.mem.Allocator, io: std.Io, cfg: *const provider.LlmConfig, keyterms: []const []const u8, profile: processing.Profile, raw: []const u8) ![]u8 {
     return switch (profile) {
-        .polished => cloud_planner.planFormatting(gpa, io, cfg, keyterms, raw, false),
+        .llm => cloud_planner.planFormatting(gpa, io, cfg, keyterms, raw, false),
         .legacy_v1 => cloud_planner.cleanup(gpa, io, cfg, keyterms, raw, false),
         else => error.InvalidProfile,
     };
@@ -366,9 +366,9 @@ const FakeProvider = struct {
     local_error: ?anyerror = null,
     clean_calls: usize = 0,
     planner_calls: usize = 0,
-    polished_calls: usize = 0,
+    llm_calls: usize = 0,
     legacy_calls: usize = 0,
-    invalid_polished_plan: bool = false,
+    invalid_llm_plan: bool = false,
     valid_no_change_plan: bool = false,
 
     fn transcribe(context: ?*anyopaque, gpa: std.mem.Allocator, _: std.Io, cfg: *const provider.SttConfig, _: []const u8) ![]u8 {
@@ -393,13 +393,13 @@ const FakeProvider = struct {
         const self: *FakeProvider = @ptrCast(@alignCast(context.?));
         self.planner_calls += 1;
         switch (profile) {
-            .polished => self.polished_calls += 1,
+            .llm => self.llm_calls += 1,
             .legacy_v1 => self.legacy_calls += 1,
             else => return error.InvalidProfile,
         }
         if (self.planner_fails) return error.RequestFailed;
-        if (self.invalid_polished_plan and profile == .polished) return cloud_planner.cleanup_engine.polishedFromJson(gpa, raw, keyterms, "{}");
-        if (self.valid_no_change_plan and profile == .polished) return cloud_planner.cleanup_engine.polished(gpa, raw, keyterms, .{ .version = 2, .deletions = &.{}, .corrections = &.{}, .punctuation = &.{}, .paragraph_breaks = &.{}, .lists = &.{} });
+        if (self.invalid_llm_plan and profile == .llm) return cloud_planner.cleanup_engine.llmFromJson(gpa, raw, keyterms, "{}");
+        if (self.valid_no_change_plan and profile == .llm) return cloud_planner.cleanup_engine.llm(gpa, raw, keyterms, .{ .version = 2, .deletions = &.{}, .corrections = &.{}, .punctuation = &.{}, .paragraph_breaks = &.{}, .lists = &.{} });
         return std.fmt.allocPrint(gpa, "{s}: {s}", .{ @tagName(profile), raw });
     }
 
@@ -532,8 +532,8 @@ test "real Clean repairs missing local question punctuation without changing clo
 test "local rejects unsupported profiles credentials and streamed injection before inference" {
     const gpa = std.testing.allocator;
     var fake: FakeProvider = .{};
-    var r: Request = .{ .version = worker_protocol.version, .wav_path = "/not-opened.wav", .stt_provider = .local, .local_model_path = "/synthetic/q8.gguf", .deepgram_api_key = "", .llm_api_key = "", .processing_profile = .polished };
-    for ([_]processing.Profile{ .polished, .legacy_v1 }) |profile| {
+    var r: Request = .{ .version = worker_protocol.version, .wav_path = "/not-opened.wav", .stt_provider = .local, .local_model_path = "/synthetic/q8.gguf", .deepgram_api_key = "", .llm_api_key = "", .processing_profile = .llm };
+    for ([_]processing.Profile{ .llm, .legacy_v1 }) |profile| {
         r.processing_profile = profile;
         try std.testing.expectEqual(ErrorCode.unsupported_features, process(gpa, std.testing.io, r, fake.seam()).@"error".?);
     }
@@ -550,12 +550,12 @@ test "local rejects unsupported profiles credentials and streamed injection befo
 }
 
 test "strict bounded request and result JSON" {
-    const json = "{\"version\":4,\"wav_path\":\"/a\",\"deepgram_api_key\":\"d\",\"llm_api_key\":\"g\",\"processing_profile\":\"polished\"}";
+    const json = "{\"version\":5,\"wav_path\":\"/a\",\"deepgram_api_key\":\"d\",\"llm_api_key\":\"g\",\"processing_profile\":\"llm\"}";
     const parsed = try parseRequest(std.testing.allocator, json);
     defer parsed.deinit();
     try std.testing.expectError(error.InvalidRequest, parseRequest(std.testing.allocator, json ++ "x"));
-    try std.testing.expectError(error.InvalidRequest, parseRequest(std.testing.allocator, "{\"version\":4,\"wav_path\":\"/a\",\"deepgram_api_key\":\"d\",\"llm_api_key\":\"g\"}"));
-    try std.testing.expectError(error.InvalidRequest, parseRequest(std.testing.allocator, "{\"version\":4,\"wav_path\":\"/a\",\"deepgram_api_key\":\"d\",\"llm_api_key\":\"g\",\"cleanup_enabled\":true}"));
+    try std.testing.expectError(error.InvalidRequest, parseRequest(std.testing.allocator, "{\"version\":5,\"wav_path\":\"/a\",\"deepgram_api_key\":\"d\",\"llm_api_key\":\"g\"}"));
+    try std.testing.expectError(error.InvalidRequest, parseRequest(std.testing.allocator, "{\"version\":5,\"wav_path\":\"/a\",\"deepgram_api_key\":\"d\",\"llm_api_key\":\"g\",\"cleanup_enabled\":true}"));
     const out = try stringifyResult(std.testing.allocator, .{
         .status = .success,
         .text = "München",
@@ -588,16 +588,16 @@ test "result timing is additive and round trips" {
 }
 
 test "worker result decoder requires fields and status semantics" {
-    const valid = try parseResult(std.testing.allocator, "{\"version\":4,\"status\":\"success\",\"text\":\"hello\",\"processing_profile\":\"clean\",\"transport\":\"stream\",\"future\":true}");
+    const valid = try parseResult(std.testing.allocator, "{\"version\":5,\"status\":\"success\",\"text\":\"hello\",\"processing_profile\":\"clean\",\"transport\":\"stream\",\"future\":true}");
     defer valid.deinit();
     try std.testing.expectEqualStrings("hello", valid.value.text.?);
     for ([_][]const u8{
         "{\"status\":\"success\",\"text\":\"hello\"}",
-        "{\"version\":4,\"status\":\"success\",\"text\":\"hello\",\"transport\":\"rest\"}",
-        "{\"version\":4,\"status\":\"success\",\"text\":\"hello\",\"processing_profile\":\"verbatim\"}",
-        "{\"version\":4,\"status\":\"success\",\"text\":\"\",\"processing_profile\":\"verbatim\",\"transport\":\"rest\"}",
-        "{\"version\":4,\"status\":\"no_speech\",\"text\":\"unexpected\",\"processing_profile\":\"verbatim\",\"transport\":\"rest\"}",
-        "{\"version\":4,\"status\":\"error\",\"processing_profile\":\"verbatim\",\"transport\":\"rest\"}",
+        "{\"version\":5,\"status\":\"success\",\"text\":\"hello\",\"transport\":\"rest\"}",
+        "{\"version\":5,\"status\":\"success\",\"text\":\"hello\",\"processing_profile\":\"verbatim\"}",
+        "{\"version\":5,\"status\":\"success\",\"text\":\"\",\"processing_profile\":\"verbatim\",\"transport\":\"rest\"}",
+        "{\"version\":5,\"status\":\"no_speech\",\"text\":\"unexpected\",\"processing_profile\":\"verbatim\",\"transport\":\"rest\"}",
+        "{\"version\":5,\"status\":\"error\",\"processing_profile\":\"verbatim\",\"transport\":\"rest\"}",
     }) |invalid_json| try std.testing.expectError(error.InvalidResult, parseResult(std.testing.allocator, invalid_json));
 }
 
@@ -630,7 +630,7 @@ test "stream worker uses real Clean for stutters and preserves Verbatim" {
     }
 }
 
-test "REST and stream planner failure preserve polished profile with Clean fallback" {
+test "REST and stream planner failure preserve llm profile with Clean fallback" {
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     const path = try writeTestWav(&tmp, 16_000);
@@ -646,16 +646,16 @@ test "REST and stream planner failure preserve polished profile with Clean fallb
         .deepgram_numerals = true,
         .deepgram_measurements = true,
         .llm_api_key = "cerebras",
-        .processing_profile = .polished,
+        .processing_profile = .llm,
     };
     var fake: FakeProvider = .{ .planner_fails = true, .expected_region = "eu", .expected_formatting = true };
     const result = process(std.testing.allocator, std.testing.io, request, fake.seam());
     defer if (result.text) |text| std.testing.allocator.free(text);
     try std.testing.expectEqual(.success, result.status);
     try std.testing.expectEqual(Transport.rest, result.transport);
-    try std.testing.expectEqual(processing.Profile.polished, result.processing_profile);
+    try std.testing.expectEqual(processing.Profile.llm, result.processing_profile);
     try std.testing.expectEqual(@as(usize, 1), fake.transcribe_calls);
-    try std.testing.expectEqual(@as(usize, 1), fake.polished_calls);
+    try std.testing.expectEqual(@as(usize, 1), fake.llm_calls);
     try std.testing.expectEqual(@as(usize, 0), fake.legacy_calls);
     try std.testing.expectEqual(@as(?Warning, null), result.warning);
     try std.testing.expectEqualStrings("clean: München", result.text.?);
@@ -664,12 +664,12 @@ test "REST and stream planner failure preserve polished profile with Clean fallb
     defer if (streamed.text) |text| std.testing.allocator.free(text);
     try std.testing.expectEqual(.success, streamed.status);
     try std.testing.expectEqual(Transport.stream, streamed.transport);
-    try std.testing.expectEqual(processing.Profile.polished, streamed.processing_profile);
+    try std.testing.expectEqual(processing.Profile.llm, streamed.processing_profile);
     try std.testing.expectEqual(@as(?Warning, null), streamed.warning);
     try std.testing.expectEqualStrings("clean: streamed", streamed.text.?);
 }
 
-test "protocol v4 routes clean polished and legacy engines by profile" {
+test "protocol v5 routes clean llm and legacy engines by profile" {
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     const path = try writeTestWav(&tmp, 16_000);
@@ -697,30 +697,30 @@ test "protocol v4 routes clean polished and legacy engines by profile" {
     try std.testing.expectEqual(@as(usize, 1), fake.clean_calls);
     try std.testing.expectEqual(@as(usize, 0), fake.planner_calls);
 
-    request.processing_profile = .polished;
-    const polished = processWithTranscript(std.testing.allocator, std.testing.io, request, fake.seam(), "raw");
-    defer if (polished.text) |text| std.testing.allocator.free(text);
-    try std.testing.expectEqualStrings("polished: clean: raw", polished.text.?);
-    try std.testing.expectEqual(@as(usize, 1), fake.polished_calls);
+    request.processing_profile = .llm;
+    const llm = processWithTranscript(std.testing.allocator, std.testing.io, request, fake.seam(), "raw");
+    defer if (llm.text) |text| std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("llm: clean: raw", llm.text.?);
+    try std.testing.expectEqual(@as(usize, 1), fake.llm_calls);
     try std.testing.expectEqual(@as(usize, 0), fake.legacy_calls);
 
     request.processing_profile = .legacy_v1;
     const legacy = processWithTranscript(std.testing.allocator, std.testing.io, request, fake.seam(), "raw");
     defer if (legacy.text) |text| std.testing.allocator.free(text);
     try std.testing.expectEqualStrings("legacy_v1: raw", legacy.text.?);
-    try std.testing.expectEqual(@as(usize, 1), fake.polished_calls);
+    try std.testing.expectEqual(@as(usize, 1), fake.llm_calls);
     try std.testing.expectEqual(@as(usize, 1), fake.legacy_calls);
 
-    fake.invalid_polished_plan = true;
-    request.processing_profile = .polished;
+    fake.invalid_llm_plan = true;
+    request.processing_profile = .llm;
     const invalid_plan = processWithTranscript(std.testing.allocator, std.testing.io, request, fake.seam(), "please do not change");
     defer if (invalid_plan.text) |text| std.testing.allocator.free(text);
     try std.testing.expectEqualStrings("clean: please do not change", invalid_plan.text.?);
     try std.testing.expectEqual(@as(?Warning, null), invalid_plan.warning);
-    try std.testing.expectEqual(@as(usize, 2), fake.polished_calls);
+    try std.testing.expectEqual(@as(usize, 2), fake.llm_calls);
     try std.testing.expectEqual(@as(usize, 0), fake.transcribe_calls);
 
-    fake.invalid_polished_plan = false;
+    fake.invalid_llm_plan = false;
     fake.valid_no_change_plan = true;
     const no_change = processWithTranscript(std.testing.allocator, std.testing.io, request, fake.seam(), "keep  exactly\nthis");
     defer if (no_change.text) |text| std.testing.allocator.free(text);

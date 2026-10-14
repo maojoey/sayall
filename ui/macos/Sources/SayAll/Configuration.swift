@@ -187,7 +187,7 @@ struct ConfigurationLoader {
         guard Self.supportedPlannerModels.contains(llmModel) else {
             throw ConfigurationError.unsupportedPlannerModel
         }
-        if configuredMode == .polished {
+        if configuredMode == .llm {
             guard !cerebras.isEmpty else { throw ConfigurationError.missingCerebrasKey }
         }
         guard (document.stt?.provider ?? "deepgram") == "deepgram",

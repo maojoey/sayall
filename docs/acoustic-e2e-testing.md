@@ -63,7 +63,7 @@ WER exceeds 0.09 or aggregate CER exceeds 0.03. Override these thresholds with
 `--max-wer` and `--max-cer` only when explicitly evaluating a new corpus; the
 release streaming gate uses the same limits.
 
-Run Verbatim first to measure transcription accuracy. Clean and Polished are
+Run Verbatim first to measure transcription accuracy. Clean and LLM are
 additional transformation checks and can intentionally differ from a verbatim
 reference.
 

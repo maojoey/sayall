@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 const CONTROL_MAX: usize = 64 * 1024;
 const RESULT_MAX: usize = 1024 * 1024;
 const SUPERVISED_MAX: usize = 4097;
-const PROTOCOL_VERSION: u32 = 4;
+const PROTOCOL_VERSION: u32 = 5;
 
 pub struct SupervisedOutput {
     pub status: ExitStatus,
@@ -1167,7 +1167,7 @@ mod tests {
     fn probe() -> String {
         format!(
             r#"if [ "${{1-}}" = "--worker-info" ]; then
-  printf '%s\n' '{{"protocol_version":4,"build_version":"{}"}}'
+  printf '%s\n' '{{"protocol_version":5,"build_version":"{}"}}'
   IFS= read -r ignored || true
   exit 0
 fi"#,
@@ -1239,9 +1239,9 @@ fi"#,
 [ "${{1-}}" = "--local-stream" ] || exit 31
 IFS= read -r request
 sleep 13
-printf '%s\n' '{{"version":4,"event":"ready","streaming":true}}'
+printf '%s\n' '{{"version":5,"event":"ready","streaming":true}}'
 IFS= read -r finish
-printf '%s\n' '{{"version":4,"status":"no_speech","processing_profile":"clean","transport":"local"}}'
+printf '%s\n' '{{"version":5,"status":"no_speech","processing_profile":"clean","transport":"local"}}'
 "#,
             probe()
         );
@@ -1265,13 +1265,13 @@ printf '%s\n' '{{"version":4,"status":"no_speech","processing_profile":"clean","
         let body = format!(
             r#"{}
 if [ "${{1-}}" = "--local-readiness" ]; then
-  printf '%s' '{{"version":4,"ready":true}}'; exit 0
+  printf '%s' '{{"version":5,"ready":true}}'; exit 0
 fi
 [ "${{1-}}" != "--stream" ] || exit 31
 IFS= read -r request || true
 case "$request" in *secret-deepgram*|*secret-cerebras*|*pcm_path*|*stream_finalize_timeout_ms*) exit 32;; esac
 case "$request" in *'"stt_provider":"local"'*) ;; *) exit 33;; esac
-printf '%s' '{{"version":4,"status":"success","text":"local result","processing_profile":"clean","transport":"local"}}'
+printf '%s' '{{"version":5,"status":"success","text":"local result","processing_profile":"clean","transport":"local"}}'
 "#,
             probe()
         );
@@ -1299,7 +1299,7 @@ printf '%s' '{{"version":4,"status":"success","text":"local result","processing_
                 warning: None,
             }
         );
-        cfg.processing_profile = ProcessingProfile::Polished;
+        cfg.processing_profile = ProcessingProfile::Llm;
         assert!(encode(&fixture.wav, None, &cfg).is_err());
     }
 
@@ -1307,7 +1307,7 @@ printf '%s' '{{"version":4,"status":"success","text":"local result","processing_
     fn local_incremental_uses_private_mode_and_never_retries_failed_streams() {
         for success in [true, false] {
             let terminal = if success {
-                "printf '%s\\n' '{\"version\":4,\"status\":\"success\",\"text\":\"local result\",\"processing_profile\":\"clean\",\"transport\":\"local\"}'"
+                "printf '%s\\n' '{\"version\":5,\"status\":\"success\",\"text\":\"local result\",\"processing_profile\":\"clean\",\"transport\":\"local\"}'"
             } else {
                 "exit 0"
             };
@@ -1317,7 +1317,7 @@ if [ "${{1-}}" != --local-stream ]; then touch "$(dirname "$0")/fallback"; exit 
 IFS= read -r request
 case "$request" in *secret-deepgram*|*secret-cerebras*) exit 32;; esac
 case "$request" in *'"pcm_path"'*) ;; *) exit 33;; esac
-printf '%s\n' '{{"version":4,"event":"ready","streaming":true}}'
+printf '%s\n' '{{"version":5,"event":"ready","streaming":true}}'
 IFS= read -r finish
 {}
 "#,
@@ -1360,10 +1360,10 @@ IFS= read -r finish
 [ "${{1-}}" = "--stream" ]
 IFS= read -r request
 case "$request" in *secret-deepgram*) ;; *) exit 31;; esac
-printf '%s\n' '{{"version":4,"event":"ready","streaming":true}}'
+printf '%s\n' '{{"version":5,"event":"ready","streaming":true}}'
 IFS= read -r finish
-[ "$finish" = '{{"command":"finish","force_rest":false,"version":4}}' ]
-printf '%s\n' '{{"version":4,"status":"success","text":"hello","processing_profile":"clean","transport":"stream"}}'"#,
+[ "$finish" = '{{"command":"finish","force_rest":false,"version":5}}' ]
+printf '%s\n' '{{"version":5,"status":"success","text":"hello","processing_profile":"clean","transport":"stream"}}'"#,
             probe()
         );
         let fixture = Fixture::new(&body);
@@ -1395,7 +1395,7 @@ printf '%s\n' '{{"version":4,"status":"success","text":"hello","processing_profi
 if [ "${{1-}}" = "--stream" ]; then exit 32; fi
 IFS= read -r request
 case "$request" in *pcm_path*) exit 33;; esac
-printf '%s' '{{"version":4,"status":"no_speech","processing_profile":"clean","transport":"rest"}}'"#,
+printf '%s' '{{"version":5,"status":"no_speech","processing_profile":"clean","transport":"rest"}}'"#,
             probe()
         );
         let fixture = Fixture::new(&body);
@@ -1429,13 +1429,13 @@ if [ "${{1-}}" = "--stream" ]; then
   printf S >> '{}'
   IFS= read -r request
   case "$request" in *'"processing_profile":"clean"'*) ;; *) exit 37;; esac
-  printf '%s\n' '{{"version":4,"event":"ready","streaming":true}}'
+  printf '%s\n' '{{"version":5,"event":"ready","streaming":true}}'
   exit 0
 fi
 printf B >> '{}'
 IFS= read -r request
 case "$request" in *'"processing_profile":"clean"'*) ;; *) exit 38;; esac
-printf '%s' '{{"version":4,"status":"success","text":"fallback","processing_profile":"clean","transport":"rest"}}'"#,
+printf '%s' '{{"version":5,"status":"success","text":"fallback","processing_profile":"clean","transport":"rest"}}'"#,
             probe(),
             log.display(),
             log.display()
@@ -1474,7 +1474,7 @@ printf '%s' '{{"version":4,"status":"success","text":"fallback","processing_prof
 if [ "${{1-}}" = "--stream" ]; then
   printf S >> '{}'
   IFS= read -r request
-  printf '%s\n' '{{"version":4,"event":"ready","streaming":true}}'
+  printf '%s\n' '{{"version":5,"event":"ready","streaming":true}}'
   IFS= read -r finish
   printf '%s\n' '{{'
   exit 0
@@ -1511,7 +1511,7 @@ exit 34"#,
 if [ "${{1-}}" = "--stream" ]; then
   printf S >> '{}'
   IFS= read -r request
-  printf '%s\n' '{{"version":4,"event":"ready","streaming":true}}'
+  printf '%s\n' '{{"version":5,"event":"ready","streaming":true}}'
   IFS= read -r finish
   printf '{{'
   /bin/sleep 2
@@ -1549,8 +1549,8 @@ exit 35"#,
 if [ "${{1-}}" = "--stream" ]; then
   printf S >> '{}'
   IFS= read -r request
-  printf '%s\n' '{{"version":4,"event":"ready","streaming":true}}'
-  printf '%s\n' '{{"version":4,"status":"success","text":"unsolicited","processing_profile":"clean","transport":"stream"}}'
+  printf '%s\n' '{{"version":5,"event":"ready","streaming":true}}'
+  printf '%s\n' '{{"version":5,"status":"success","text":"unsolicited","processing_profile":"clean","transport":"stream"}}'
   IFS= read -r finish || true
   exit 0
 fi
@@ -1579,7 +1579,7 @@ exit 36"#,
     fn incompatible_worker_build_is_rejected() {
         let fixture = Fixture::new(
             r#"if [ "${1-}" = "--worker-info" ]; then
-  printf '%s\n' '{"protocol_version":4,"build_version":"different"}'
+  printf '%s\n' '{"protocol_version":5,"build_version":"different"}'
   IFS= read -r ignored || true
 fi"#,
         );
@@ -1596,7 +1596,7 @@ fi"#,
     }
 
     #[test]
-    fn v4_codec_requires_metadata_and_projects_transformation_warning() {
+    fn v5_codec_requires_metadata_and_projects_transformation_warning() {
         let local = include_bytes!("../../../tests/contracts-0.2/worker-result-local.json");
         assert_eq!(
             decode_result(local.to_vec()).unwrap(),
@@ -1617,32 +1617,34 @@ fi"#,
         let request: serde_json::Value =
             serde_json::from_slice(&encode(Path::new("/tmp/a.wav"), None, &config(false)).unwrap())
                 .unwrap();
-        assert_eq!(request["version"], 4);
+        assert_eq!(request["version"], 5);
         assert_eq!(request["processing_profile"], "clean");
         assert!(request.get("cleanup_enabled").is_none());
 
         assert_eq!(
             decode_result(
-                br#"{"version":4,"status":"success","text":"raw","warning":"transformation_failed","processing_profile":"polished","transport":"stream"}"#.to_vec()
+                br#"{"version":5,"status":"success","text":"raw","warning":"transformation_failed","processing_profile":"llm","transport":"stream"}"#.to_vec()
             )
             .unwrap(),
             Outcome::Transcript {
                 text: "raw".into(),
-                processing_profile: ProcessingProfile::Polished,
+                processing_profile: ProcessingProfile::Llm,
                 transport: Transport::Stream,
                 warning: Some(Warning::TransformationFailed),
             }
         );
         for invalid in [
             br#"{"version":2,"status":"no_speech","processing_profile":"clean","transport":"rest"}"#.as_slice(),
-            br#"{"version":4,"status":"no_speech","transport":"rest"}"#.as_slice(),
-            br#"{"version":4,"status":"no_speech","processing_profile":"clean"}"#.as_slice(),
-            br#"{"version":4,"status":"success","text":"raw","warning":"provider_failed","processing_profile":"polished","transport":"stream"}"#.as_slice(),
-            br#"{"version":4,"status":"success","text":"raw","error":"internal","processing_profile":"polished","transport":"stream"}"#.as_slice(),
-            br#"{"version":4,"status":"no_speech","text":"raw","processing_profile":"clean","transport":"rest"}"#.as_slice(),
-            br#"{"version":4,"status":"error","processing_profile":"clean","transport":"rest"}"#.as_slice(),
-            br#"{"version":4,"status":"error","error":"future_error","processing_profile":"clean","transport":"rest"}"#.as_slice(),
-            br#"{"version":4,"status":"future_status","processing_profile":"clean","transport":"rest"}"#.as_slice(),
+            br#"{"version":4,"status":"no_speech","processing_profile":"clean","transport":"rest"}"#.as_slice(),
+            br#"{"version":5,"status":"no_speech","processing_profile":"polished","transport":"rest"}"#.as_slice(),
+            br#"{"version":5,"status":"no_speech","transport":"rest"}"#.as_slice(),
+            br#"{"version":5,"status":"no_speech","processing_profile":"clean"}"#.as_slice(),
+            br#"{"version":5,"status":"success","text":"raw","warning":"provider_failed","processing_profile":"llm","transport":"stream"}"#.as_slice(),
+            br#"{"version":5,"status":"success","text":"raw","error":"internal","processing_profile":"llm","transport":"stream"}"#.as_slice(),
+            br#"{"version":5,"status":"no_speech","text":"raw","processing_profile":"clean","transport":"rest"}"#.as_slice(),
+            br#"{"version":5,"status":"error","processing_profile":"clean","transport":"rest"}"#.as_slice(),
+            br#"{"version":5,"status":"error","error":"future_error","processing_profile":"clean","transport":"rest"}"#.as_slice(),
+            br#"{"version":5,"status":"future_status","processing_profile":"clean","transport":"rest"}"#.as_slice(),
         ] {
             assert!(decode_result(invalid.to_vec()).is_err());
         }

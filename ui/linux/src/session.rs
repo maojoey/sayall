@@ -1302,7 +1302,7 @@ mod tests {
         let completion = deliver_outcome(
             worker::Outcome::Transcript {
                 text: "raw".into(),
-                processing_profile: config::ProcessingProfile::Polished,
+                processing_profile: config::ProcessingProfile::Llm,
                 transport: worker::Transport::Rest,
                 warning: Some(worker::Warning::TransformationFailed),
             },
@@ -1695,7 +1695,7 @@ mod tests {
         }));
 
         assert!(matches!(
-            controller.set_processing_mode(config::ProcessingMode::Polished),
+            controller.set_processing_mode(config::ProcessingMode::Llm),
             Err(ToggleError::Busy)
         ));
         assert!(rx.try_recv().is_err());

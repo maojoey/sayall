@@ -313,7 +313,7 @@ test "session completion serializes explicit no-change processing outcome" {
         .reason = null,
         .stt_attempted = true,
         .latency_ms = 125,
-        .processing_profile = .polished,
+        .processing_profile = .llm,
         .transformation_outcome = .no_change,
         .planner_latency_ms = 40,
     };
@@ -321,7 +321,7 @@ test "session completion serializes explicit no-change processing outcome" {
     defer std.testing.allocator.free(json);
     const parsed = try std.json.parseFromSlice(SessionCompleted, std.testing.allocator, json, .{});
     defer parsed.deinit();
-    try std.testing.expectEqual(processing.Profile.polished, parsed.value.processing_profile);
+    try std.testing.expectEqual(processing.Profile.llm, parsed.value.processing_profile);
     try std.testing.expectEqual(TransformationOutcome.no_change, parsed.value.transformation_outcome);
     try std.testing.expectEqual(@as(?u64, 40), parsed.value.planner_latency_ms);
 }

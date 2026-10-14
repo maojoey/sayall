@@ -140,9 +140,9 @@ fn validateFinish(gpa: std.mem.Allocator, line: ?[]const u8) !void {
 }
 
 test "local finish rejects missing or malformed frames as protocol errors" {
-    for ([_]?[]const u8{ null, "", "{", "{}", "{\"version\":4,\"command\":1}", "{\"version\":3,\"command\":\"finish\"}" }) |line|
+    for ([_]?[]const u8{ null, "", "{", "{}", "{\"version\":5,\"command\":1}", "{\"version\":3,\"command\":\"finish\"}" }) |line|
         try std.testing.expectError(error.InvalidRequest, validateFinish(std.testing.allocator, line));
-    try validateFinish(std.testing.allocator, "{\"version\":4,\"command\":\"finish\",\"force_rest\":false}");
+    try validateFinish(std.testing.allocator, "{\"version\":5,\"command\":\"finish\",\"force_rest\":false}");
 }
 
 const Transcript = struct { text: []const u8, pcm_bytes: usize };
@@ -168,7 +168,7 @@ test "local stream rejects cloud, credentials, formatting and unsupported profil
     invalid.deepgram_api_key = "synthetic";
     try std.testing.expectError(error.InvalidRequest, validate(invalid));
     invalid = valid;
-    invalid.processing_profile = .polished;
+    invalid.processing_profile = .llm;
     try std.testing.expectError(error.InvalidRequest, validate(invalid));
     invalid = valid;
     invalid.deepgram_keyterms = &.{"unsupported"};

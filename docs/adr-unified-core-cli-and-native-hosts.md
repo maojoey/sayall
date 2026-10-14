@@ -68,7 +68,7 @@ native UI ─────────▶│ native app host     │
 - A worker failure cannot perform text delivery and cannot leave the host with
   two active sessions.
 - Streaming failure permits at most one REST fallback. Cerebras cleanup failure
-  preserves the conservative deterministic Polished baseline.
+  preserves the conservative deterministic LLM baseline.
 - Transcript delivery is at most once even when a provider or worker outcome
   is ambiguous. The host is the only delivery authority.
 - Secrets are never passed in argv, inherited environment, filenames, logs, or
@@ -76,7 +76,7 @@ native UI ─────────▶│ native app host     │
 
 ### Contracts
 
-The private processing worker uses bounded protocol version 4. Version 2 added
+The private processing worker uses bounded protocol version 5. Version 2 added
 explicit Deepgram formatting flags, version 3 made processing profiles explicit,
 and version 4 adds the Q8-only local batch provider, local transport/timing and
 local failure codes. See [local file integration](local-stt-integration.md). Worker requests are strict: unknown or wrongly typed
@@ -107,6 +107,21 @@ Language-neutral examples for both contracts live in
 [`tests/contracts-0.2/`](../tests/contracts-0.2/). Zig, Swift, and
 Rust tests consume these same files so contract drift fails CI before a runtime
 adapter is replaced.
+
+### LLM processing name (SAY-99)
+
+The user-facing mode, configuration value, and worker profile are all `llm`.
+The old `polished` spelling is rejected, not aliased or migrated. Existing
+configuration using it must be explicitly edited to `"mode": "llm"`.
+Reading configuration or persisted records does not rewrite them.
+
+Worker protocol version 5 replaces the closed `polished` profile with `llm`;
+hosts, CLI, and worker must be upgraded together. Version-4 workers/results
+are incompatible. Native-host control remains version 2.
+
+The processing algorithm is unchanged. This rename does not enable local
+transcription with cloud processing: that guard remains until explicit
+consent and the hybrid contract are implemented.
 
 ### Migration and cutover
 

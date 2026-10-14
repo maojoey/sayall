@@ -1,1 +1,1 @@
-{"version":4,"status":"success","text":"Local speech.","processing_profile":"clean","transport":"local","timing":{"local_stt_ms":100,"deterministic_processing_ms":1,"processing_total_ms":101}}
+{"version":5,"status":"success","text":"Local speech.","processing_profile":"clean","transport":"local","timing":{"local_stt_ms":100,"deterministic_processing_ms":1,"processing_total_ms":101}}

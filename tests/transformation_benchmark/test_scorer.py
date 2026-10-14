@@ -4,11 +4,11 @@ import tempfile
 import unittest
 
 from scorer import (ContractError, main, markdown_report, percentile,
-                    polished_semantic_invariant, read_jsonl, score)
+                    llm_semantic_invariant, read_jsonl, score)
 
 
 HERE = pathlib.Path(__file__).resolve().parent
-CORPUS = HERE / "corpus-v1.jsonl"
+CORPUS = HERE / "corpus-v2.jsonl"
 DEFAULT_OUTPUT = object()
 
 
@@ -18,18 +18,18 @@ def load_cases():
 
 def result(case, latency=10, output=DEFAULT_OUTPUT, outcome="applied", fallback_reason=None,
            invocation_mode=None, model=None):
-    invocation_mode = invocation_mode or ("live_attempted" if case["mode"] == "polished"
+    invocation_mode = invocation_mode or ("live_attempted" if case["mode"] == "llm"
                                            else "not_applicable")
     record = {
-        "schema_version": 1,
+        "schema_version": 2,
         "case_id": case["id"],
         "outcome": outcome,
         "output": case["expected_output"] if output is DEFAULT_OUTPUT else output,
         "latency_ms": latency,
         "adapter": {"name": "unit-fixture", "version": "1"},
         "provider": {
-            "name": "cerebras" if case["mode"] == "polished" else "none",
-            "model": model or ("polished-fixture" if case["mode"] == "polished"
+            "name": "cerebras" if case["mode"] == "llm" else "none",
+            "model": model or ("llm-fixture" if case["mode"] == "llm"
                                else "deterministic-fixture"),
             "invocation_mode": invocation_mode,
         },
@@ -54,10 +54,25 @@ def perfect_report(latencies=None):
 
 
 class ScoringTests(unittest.TestCase):
+    def test_renamed_contracts_reject_old_versions_and_baselines(self):
+        cases, results, report = perfect_report()
+        self.assertEqual(report["report_schema_version"], 3)
+        self.assertEqual(report["corpus"]["schema_version"], 2)
+        old_case = {**cases[0], "schema_version": 1}
+        with self.assertRaisesRegex(ContractError, "unsupported corpus schema version"):
+            score([old_case, *cases[1:]], results, "synthetic")
+        old_result = {**results[0], "schema_version": 1}
+        with self.assertRaisesRegex(ContractError, "invalid result schema"):
+            score(cases, [old_result, *results[1:]], "synthetic")
+        old_report = {**report, "report_schema_version": 2}
+        compared = score(cases, results, report["corpus"]["sha256"], old_report)
+        self.assertFalse(compared["baseline"]["comparable"])
+        self.assertIn("report_schema_version differs", compared["baseline"]["reasons"])
+
     def test_adapter_error_with_null_output_is_a_hard_failure_not_a_crash(self):
         cases, digest = load_cases()
         results = [result(case) for case in cases]
-        target = next(case for case in cases if case["id"] == "polished-punctuation")
+        target = next(case for case in cases if case["id"] == "llm-punctuation")
         results[cases.index(target)] = result(target, output=None, outcome="adapter_error")
         report = score(cases, results, digest)
         scored = next(item for item in report["cases"] if item["case_id"] == target["id"])
@@ -104,8 +119,8 @@ class ScoringTests(unittest.TestCase):
     def test_unallowlisted_fact_or_value_change_is_hard_failure(self):
         cases, digest = load_cases()
         results = [result(case) for case in cases]
-        values = next(case for case in cases if case["id"] == "polished-values")
-        punctuation = next(case for case in cases if case["id"] == "polished-punctuation")
+        values = next(case for case in cases if case["id"] == "llm-values")
+        punctuation = next(case for case in cases if case["id"] == "llm-punctuation")
         results[cases.index(values)] = result(
             values, output="Budget: $9,999, not $2,100. Delivery: June 6, 2031. Distance: 14.2 kilometers."
         )
@@ -118,10 +133,10 @@ class ScoringTests(unittest.TestCase):
             self.assertIn("semantic_units_changed", scored["hard_violations"])
             self.assertIsNone(scored["actual_output"])
 
-    def test_polished_formatting_variant_is_safe_but_an_exact_quality_miss(self):
+    def test_llm_formatting_variant_is_safe_but_an_exact_quality_miss(self):
         cases, digest = load_cases()
         results = [result(case) for case in cases]
-        target = next(case for case in cases if case["id"] == "polished-punctuation")
+        target = next(case for case in cases if case["id"] == "llm-punctuation")
         variant = "The fixture is synthetic; it contains no user data!"
         results[cases.index(target)] = result(target, output=variant)
         report = score(cases, results, digest)
@@ -131,71 +146,71 @@ class ScoringTests(unittest.TestCase):
         self.assertEqual(scored["actual_output"], variant)
 
     def test_list_invariant_accepts_production_markers_without_hiding_conjunctions(self):
-        self.assertTrue(polished_semantic_invariant(
+        self.assertTrue(llm_semantic_invariant(
             "First validate second run third inspect",
             "1. First validate\n2. second run\n3. third inspect",
         ))
-        self.assertTrue(polished_semantic_invariant(
+        self.assertTrue(llm_semantic_invariant(
             "Bring apples bananas and pears",
             "Bring:\n- Apples\n- Bananas\n- and Pears",
         ))
-        self.assertFalse(polished_semantic_invariant(
+        self.assertFalse(llm_semantic_invariant(
             "Alice Bob approved",
             "- Alice and Bob approved",
         ))
-        self.assertFalse(polished_semantic_invariant(
+        self.assertFalse(llm_semantic_invariant(
             "Bring three items apples bananas and pears",
             "- Bring three items apples bananas pears",
         ))
-        self.assertFalse(polished_semantic_invariant(
+        self.assertFalse(llm_semantic_invariant(
             "Alice and Bob approved apples bananas pears",
             "Alice Bob approved:\n- Apples\n- Bananas\n- Pears",
         ))
-        self.assertFalse(polished_semantic_invariant(
+        self.assertFalse(llm_semantic_invariant(
             "Distance 14.2 kilometers",
             "Distance -14.2 kilometers",
         ))
-        self.assertFalse(polished_semantic_invariant(
+        self.assertFalse(llm_semantic_invariant(
             "The release is pending",
             "The release is pending ✅",
         ))
-        self.assertFalse(polished_semantic_invariant("Compute 6 / 3", "Compute 6 3"))
-        self.assertFalse(polished_semantic_invariant("Compute 5 - 3", "Compute 5 3"))
-        self.assertFalse(polished_semantic_invariant("Use 50 %", "Use 50"))
-        self.assertFalse(polished_semantic_invariant("Press #️⃣", "Press"))
-        self.assertFalse(polished_semantic_invariant("Use snake_case", "Use snake case"))
-        self.assertFalse(polished_semantic_invariant(
+        self.assertFalse(llm_semantic_invariant("Compute 6 / 3", "Compute 6 3"))
+        self.assertFalse(llm_semantic_invariant("Compute 5 - 3", "Compute 5 3"))
+        self.assertFalse(llm_semantic_invariant("Use 50 %", "Use 50"))
+        self.assertFalse(llm_semantic_invariant("Press #️⃣", "Press"))
+        self.assertFalse(llm_semantic_invariant("Use snake_case", "Use snake case"))
+        self.assertFalse(llm_semantic_invariant(
             "First alpha second beta apples and pears",
             "1. First alpha\n2. second beta\nApples\n- Pears",
         ))
-        self.assertFalse(polished_semantic_invariant("Fourth inspect", "4. Inspect"))
-        self.assertTrue(polished_semantic_invariant("Fourth inspect", "4. Fourth inspect"))
-        self.assertFalse(polished_semantic_invariant("Budget 1200 dollars", "Budget $1,200"))
-        self.assertFalse(polished_semantic_invariant("Budget 1200 dollars", "Budget 1,200 dollars"))
-        self.assertFalse(polished_semantic_invariant("Don’t stop", "Don't stop"))
-        self.assertFalse(polished_semantic_invariant("Straße", "STRASSE"))
-        self.assertFalse(polished_semantic_invariant("- Keep this", "Keep this"))
-        self.assertFalse(polished_semantic_invariant("1. Keep this", "Keep this"))
-        self.assertTrue(polished_semantic_invariant("- Keep this", "- Keep this"))
-        self.assertTrue(polished_semantic_invariant("1. Keep this", "1. Keep this"))
+        self.assertFalse(llm_semantic_invariant("Fourth inspect", "4. Inspect"))
+        self.assertTrue(llm_semantic_invariant("Fourth inspect", "4. Fourth inspect"))
+        self.assertFalse(llm_semantic_invariant("Budget 1200 dollars", "Budget $1,200"))
+        self.assertFalse(llm_semantic_invariant("Budget 1200 dollars", "Budget 1,200 dollars"))
+        self.assertFalse(llm_semantic_invariant("Don’t stop", "Don't stop"))
+        self.assertFalse(llm_semantic_invariant("Straße", "STRASSE"))
+        self.assertFalse(llm_semantic_invariant("- Keep this", "Keep this"))
+        self.assertFalse(llm_semantic_invariant("1. Keep this", "Keep this"))
+        self.assertTrue(llm_semantic_invariant("- Keep this", "- Keep this"))
+        self.assertTrue(llm_semantic_invariant("1. Keep this", "1. Keep this"))
 
     def test_list_conjunction_policy_requires_exact_source_units(self):
         source = "Bring apples bananas and pears"
-        self.assertTrue(polished_semantic_invariant(source, source))
-        self.assertFalse(polished_semantic_invariant(
+        self.assertTrue(llm_semantic_invariant(source, source))
+        self.assertFalse(llm_semantic_invariant(
             source, "Bring:\n- Apples\n- Bananas\n- Pears"
         ))
-        self.assertTrue(polished_semantic_invariant(
+        self.assertTrue(llm_semantic_invariant(
             source, "Bring:\n- Apples\n- Bananas\n- and Pears"
         ))
-        self.assertFalse(polished_semantic_invariant(source, "Bring apples bananas pears"))
-        self.assertFalse(polished_semantic_invariant(
+        self.assertFalse(llm_semantic_invariant(source, "Bring apples bananas pears"))
+        self.assertFalse(llm_semantic_invariant(
             "Bring apples bananas pears", "Bring:\n- Apples\n- Bananas and Pears"
         ))
-        self.assertFalse(polished_semantic_invariant(
+        self.assertFalse(llm_semantic_invariant(
             "Bring apples and bananas and pears", "Bring:\n- Apples\n- Bananas\n- Pears"
         ))
-        self.assertFalse(polished_semantic_invariant(
+        self.assertFalse(llm_semantic_invariant(
             source, "Bring:\n- Apples and Bananas\n- Pears"
         ))
 
@@ -240,7 +255,7 @@ class ScoringTests(unittest.TestCase):
         self.assertEqual(report["summary"]["negative_preservation"]["rate"], 1.0)
         self.assertNotIn(f"| {preserve['id']} |", markdown_report(report))
 
-        list_case = next(case for case in cases if case["id"] == "polished-list")
+        list_case = next(case for case in cases if case["id"] == "llm-list")
         results[cases.index(list_case)] = result(
             list_case, output=list_case["input"], outcome="safe_fallback",
             fallback_reason="adapter_rejection"
@@ -252,7 +267,7 @@ class ScoringTests(unittest.TestCase):
     def test_unsafe_plan_outcome_is_a_hard_failure(self):
         cases, digest = load_cases()
         results = [result(case) for case in cases]
-        target = next(case for case in cases if case["id"] == "polished-unsafe-plan-fallback")
+        target = next(case for case in cases if case["id"] == "llm-unsafe-plan-fallback")
         results[cases.index(target)] = result(target, output=None, outcome="unsafe_plan")
         report = score(cases, results, digest)
         scored = next(item for item in report["cases"] if item["case_id"] == target["id"])
@@ -269,7 +284,7 @@ class ScoringTests(unittest.TestCase):
         comparison = current["baseline"]
         self.assertTrue(comparison["comparable"])
         self.assertLess(comparison["deltas"]["positive_transformation_rate"], 0)
-        self.assertEqual(comparison["deltas"]["polished_live_latency_p95_ms"], 10)
+        self.assertEqual(comparison["deltas"]["llm_live_latency_p95_ms"], 10)
         self.assertLess(
             comparison["deltas"]["category_positive_transformation_rates"]["fillers"], 0
         )
@@ -277,16 +292,16 @@ class ScoringTests(unittest.TestCase):
         incompatible["corpus"]["sha256"] = "different"
         self.assertFalse(score(cases, results, baseline["corpus"]["sha256"], incompatible)["baseline"]["comparable"])
         incompatible_provider = json.loads(json.dumps(baseline))
-        incompatible_provider["polished_provider"]["models"] = ["other-model"]
+        incompatible_provider["llm_provider"]["models"] = ["other-model"]
         compared = score(cases, results, baseline["corpus"]["sha256"], incompatible_provider)["baseline"]
         self.assertFalse(compared["comparable"])
-        self.assertIn("Polished invocation mode or model differs", compared["reasons"])
+        self.assertIn("Llm invocation mode or model differs", compared["reasons"])
 
     def test_no_credential_reports_no_live_latency_and_retains_fallback_reason(self):
         cases, digest = load_cases()
         results = []
         for case in cases:
-            if case["mode"] == "polished" and not case.get("scenario"):
+            if case["mode"] == "llm" and not case.get("scenario"):
                 results.append(result(case, output=case["input"], outcome="safe_fallback",
                                       fallback_reason="missing_credential",
                                       invocation_mode="not_attempted_no_credential"))
@@ -294,15 +309,15 @@ class ScoringTests(unittest.TestCase):
                 results.append(result(case, output=case["input"], outcome="safe_fallback",
                                       fallback_reason=case["scenario"]["fault"],
                                       invocation_mode=("not_attempted_no_credential"
-                                                       if case["mode"] == "polished" else "not_applicable")))
+                                                       if case["mode"] == "llm" else "not_applicable")))
             else:
                 results.append(result(case))
         report = score(cases, results, digest)
-        live = report["summary"]["polished_live"]
+        live = report["summary"]["llm_live"]
         self.assertEqual(live["live_attempted"], 0)
         self.assertGreater(live["not_attempted_no_credential"], 0)
         self.assertEqual(live["latency_ms"], {"p50": None, "p95": None, "p99": None})
-        target = next(item for item in report["cases"] if item["case_id"] == "polished-question")
+        target = next(item for item in report["cases"] if item["case_id"] == "llm-question")
         self.assertEqual(target["fallback_reason"], "missing_credential")
         self.assertGreater(report["summary"]["fallback_reasons"]["missing_credential"], 0)
         self.assertIn("missing_credential", markdown_report(report))
@@ -377,7 +392,7 @@ class ScoringTests(unittest.TestCase):
         with self.assertRaises(ContractError):
             score([unknown_safety], [], digest)
         gated = next(case for case in cases if case["id"] == "clean-filler-um")
-        wrong_gate = dict(gated, mode="polished")
+        wrong_gate = dict(gated, mode="llm")
         with self.assertRaises(ContractError):
             score([wrong_gate], [], digest)
         invalid_result = result(cases[0])
@@ -412,7 +427,7 @@ class ScoringTests(unittest.TestCase):
         cases, results, baseline = perfect_report()
         malformed = {"report_schema_version": baseline["report_schema_version"],
                      "corpus": baseline["corpus"],
-                     "polished_provider": baseline["polished_provider"],
+                     "llm_provider": baseline["llm_provider"],
                      "summary": {}, "categories": {}}
         report = score(cases, results, baseline["corpus"]["sha256"], malformed)
         self.assertFalse(report["baseline"]["comparable"])

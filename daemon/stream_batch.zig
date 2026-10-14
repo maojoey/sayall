@@ -241,12 +241,12 @@ fn writeLine(io: std.Io, bytes: []const u8) !void {
 }
 
 test "stream request is strict and preserves regional provider settings" {
-    const json = "{\"version\":4,\"wav_path\":\"/tmp/a.wav\",\"pcm_path\":\"/tmp/a.pcm\",\"deepgram_api_key\":\"d\",\"deepgram_model\":\"nova-3\",\"deepgram_language\":\"en-GB\",\"deepgram_region\":\"eu\",\"llm_api_key\":\"\",\"processing_profile\":\"clean\"}";
+    const json = "{\"version\":5,\"wav_path\":\"/tmp/a.wav\",\"pcm_path\":\"/tmp/a.pcm\",\"deepgram_api_key\":\"d\",\"deepgram_model\":\"nova-3\",\"deepgram_language\":\"en-GB\",\"deepgram_region\":\"eu\",\"llm_api_key\":\"\",\"processing_profile\":\"clean\"}";
     const parsed = try parseRequest(std.testing.allocator, json);
     defer parsed.deinit();
     try std.testing.expectEqualStrings("eu", parsed.value.deepgram_region);
     try std.testing.expectEqualStrings("en-GB", batchRequest(parsed.value).deepgram_language);
     try std.testing.expectEqual(processing.Profile.clean, batchRequest(parsed.value).processing_profile);
     try std.testing.expectError(error.InvalidRequest, parseRequest(std.testing.allocator, json[0 .. json.len - 1]));
-    try std.testing.expectError(error.InvalidRequest, parseRequest(std.testing.allocator, "{\"version\":4,\"wav_path\":\"/tmp/a.wav\",\"pcm_path\":\"/tmp/a.pcm\",\"deepgram_api_key\":\"d\",\"llm_api_key\":\"\"}"));
+    try std.testing.expectError(error.InvalidRequest, parseRequest(std.testing.allocator, "{\"version\":5,\"wav_path\":\"/tmp/a.wav\",\"pcm_path\":\"/tmp/a.pcm\",\"deepgram_api_key\":\"d\",\"llm_api_key\":\"\"}"));
 }

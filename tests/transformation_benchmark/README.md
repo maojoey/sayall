@@ -3,18 +3,18 @@
 This directory contains a privacy-safe, synthetic benchmark for Feature Set A
 text modes. The versioned corpus and scorer remain independent contracts;
 `adapter.py` and the test-only Zig case runner connect them to the production
-`cloud_planner.clean` and `cloud_planner.polished` APIs without introducing a second
+`cloud_planner.clean` and `cloud_planner.llm` APIs without introducing a second
 transformation implementation.
 
-## Corpus contract (`corpus-v1.jsonl`)
+## Corpus contract (`corpus-v2.jsonl`)
 
-Each non-empty line is one JSON object. All records share `schema_version: 1`
+Each non-empty line is one JSON object. All records share `schema_version: 2`
 and one `corpus_id`.
 
 | Field | Type | Meaning |
 | --- | --- | --- |
 | `id` | string | Stable unique case ID. |
-| `mode` | enum | `verbatim`, `clean`, or `polished`. |
+| `mode` | enum | `verbatim`, `clean`, or `llm`. |
 | `category` | string | Aggregation bucket. |
 | `input` | string | Entirely synthetic source text. |
 | `expected_output` | string | One deterministic reference output. |
@@ -25,7 +25,7 @@ and one `corpus_id`.
 | `scenario` | object | Optional benchmark-owned deterministic fault injection. |
 
 The corpus covers exact Verbatim preservation; positive and negative Clean
-fillers, repetition, false starts, and explicit backtracks; Polished
+fillers, repetition, false starts, and explicit backtracks; LLM
 punctuation, paragraphs, and lists; inert questions/instructions; quoted cue
 words; URLs, email addresses, and paths; negation, quantities, dates,
 currencies, and measurements; and malformed/unsafe plan fallback scenarios.
@@ -37,7 +37,7 @@ credential is present.
 The production adapter writes one object per attempted corpus case:
 
 ```json
-{"schema_version":1,"case_id":"clean-filler-um","outcome":"applied","output":"please send the synthetic report.","latency_ms":18.4,"adapter":{"name":"sayall-production-transformation","version":"dev"},"provider":{"name":"none","model":"production-deterministic","invocation_mode":"not_applicable"},"plan":null}
+{"schema_version":2,"case_id":"clean-filler-um","outcome":"applied","output":"please send the synthetic report.","latency_ms":18.4,"adapter":{"name":"sayall-production-transformation","version":"dev"},"provider":{"name":"none","model":"production-deterministic","invocation_mode":"not_applicable"},"plan":null}
 ```
 
 Required fields are `schema_version`, `case_id`, `outcome`, `output`,
@@ -92,8 +92,8 @@ python3 tests/transformation_benchmark/scorer.py --enforce-hard \
   --markdown transformation-report.md
 ```
 
-Set `CEREBRAS_API_KEY` locally to exercise Polished live. Every Polished corpus case invokes
-exactly one `cloud_planner.polished` call. Verbatim and Clean always use their production
+Set `CEREBRAS_API_KEY` locally to exercise LLM live. Every LLM corpus case invokes
+exactly one `cloud_planner.llm` call. Verbatim and Clean always use their production
 deterministic paths and never receive the key. The adapter defaults to four
 case processes and a 45-second per-case deadline; `--concurrency` and
 `--timeout` may lower or raise those explicit bounds. Any outer case-process
@@ -119,9 +119,14 @@ python3 tests/transformation_benchmark/scorer.py \
 ```
 
 Add `--baseline previous-report.json` to calculate deltas. Baselines are
-comparable only when corpus schema, ID, SHA-256, report schema, Polished
+comparable only when corpus schema, ID, SHA-256, report schema, LLM
 invocation mode, and model match.
-The current machine report contract is `report_schema_version: 2`.
+The current machine report contract is `report_schema_version: 3`.
+The corpus and adapter/case-runner contracts use `schema_version: 2`.
+These versions rename the closed mode to `llm` and report fields to
+`llm_provider` / `llm_live`. Old corpus/results and case-runner responses are
+rejected, and old reports cannot be used as comparable baselines. The separate
+plan-evidence schema remains version 1; its fields have not changed.
 Latency p50/p95/p99 use the deterministic nearest-rank definition. The machine
 JSON includes category rates and per-case synthetic source, reference, actual
 output, provider/model, adapter, and edit-plan evidence. Markdown summarizes the
@@ -136,10 +141,10 @@ provider and receive no Cerebras credential. A release passes its exact
 identity from that `HEAD`, so tests and evidence bind to the release source. The
 workflow runs unit tests, downloads the newest retained compatible deterministic
 report when available, runs the adapter, renders JSON and Markdown, and uploads
-result JSONL plus both reports for 30 days. Polished cases therefore produce
+result JSONL plus both reports for 30 days. LLM cases therefore produce
 `missing_credential`, source-exact fallbacks while deterministic coverage runs.
 
-Live Polished remains locally runnable with `CEREBRAS_API_KEY`. CI live runs require
+Live LLM remains locally runnable with `CEREBRAS_API_KEY`. CI live runs require
 a future protected GitHub environment restricted to trusted release branches;
 until that environment and its approvals are configured, workflows must not
 reference or receive the provider credential.
@@ -153,13 +158,13 @@ proposed quality policy:
 - exact accepted output for the deterministic Clean transformation gates
   (`clean-filler-um` and `clean-url-path`).
 
-Polished safety is independent of exact-reference quality. Exact preservation,
+LLM safety is independent of exact-reference quality. Exact preservation,
 fallback equality, protected literals, scenarios, adapter errors, and a
 conservative sequence of non-formatting semantic units remain hard. Safe
 punctuation, capitalization, list-marker, currency, and layout variants may
 therefore miss the exact reference without becoming hard failures.
 
-Polished uses exactly the live production source-anchored API when a secret is
+LLM uses exactly the live production source-anchored API when a secret is
 available, but provider quality and latency vary and have not been ratified.
 Positive quality, category rates, latency, and compatible-baseline deltas are
 therefore artifact evidence only and do not block a release. The JSON report
