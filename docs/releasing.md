@@ -1,0 +1,286 @@
+# Releasing SayAll
+
+SayAll's public Zig CLI, native applications, and private processing workers
+share one product version. `VERSION` is the source of truth. `build.zig.zon`
+and `ui/linux/Cargo.toml` must carry the same version because their package
+formats require literal metadata, and `ui/linux/Cargo.lock` records that local
+application package version. The release script rejects a mismatch among all
+four files and verifies the Linux CLI, native host, and worker report that
+version.
+
+Protocol versions are independent of the product version. Do not increment
+the control protocol merely for an application release.
+
+## Supported release targets and publication gates
+
+| Platform / target | Release status |
+| --- | --- |
+| Current, fully updated x86-64 Arch Linux with Omarchy (Wayland/Hyprland) | Supported; Arch-targeted Linux archive and AUR packages; every candidate requires physical qualification |
+| Apple Silicon arm64, macOS 15.0+ | Supported since 0.1.7; each release requires protected signing and physical qualification |
+| Windows (`x86_64-windows` compile target) | Core compile readiness only; no app, runtime, package, or installable output |
+
+Arch X11, Arch GNOME/KDE portal sessions, Ubuntu LTS GNOME, Fedora current
+GNOME, and KDE on other distributions are exploratory/non-blocking. They are
+not release cells until intentionally supported and packaged, and the
+Arch-built archive is not a universal Linux artifact. Published Linux inputs
+are identity-bound by the recorded checksum manifest; published macOS inputs
+must additionally be Developer ID signed, notarized, and stapled. The Darwin
+core check is distinct from the native macOS app build. The Windows check is
+not a release artifact. See the
+accepted [0.1.6 macOS ADR](adr-macos-0.1.6.md), the
+[macOS qualification gate](macos-release-qualification.md), the
+[Linux qualification gate](linux-release-qualification.md), and the accepted
+[unified architecture](adr-unified-core-cli-and-native-hosts.md).
+
+## macOS signing and qualification
+
+Normal CI runs on macOS 15 arm64, tests, and ad-hoc assembles a clearly named
+`-unsigned` ZIP without release credentials. That artifact is evidence of
+automated readiness only and must not be published as the supported download.
+
+`scripts/package-macos-release.sh` builds with a macOS 15 deployment target and
+produces the tested, ad-hoc-signed CI candidate. On `release/<version>`, the Release
+workflow rebuilds that candidate without credentials, verifies it before
+credentials are exposed, then uses a protected job to sign the nested CLI and
+processing helper first and the app second, notarize, staple, and
+Gatekeeper-check the result. It then creates a DMG containing that one app and
+an `/Applications` symlink, and notarizes, staples, and validates the final DMG.
+Repository build or test code does not run while release credentials are
+available, and an `if: always()` step removes the certificate, notary key, and
+temporary keychain before the signed artifact is uploaded.
+
+Create two protected environments with required reviewers, prevent self-review,
+disable administrator bypass where operationally acceptable, and restrict both
+to release branches. Keep their authority separate:
+
+- `macos-signing` authorizes only signing/notarization. Configure the
+  `APPLE_TEAM_ID` variable and all six Apple secrets below.
+- `macos-publication` contains no signing credentials. An unprivileged
+  `candidate-identities` job verifies the exact artifacts and records their
+  hashes before this environment requests approval. The protected publish job
+  receives those same-run hashes through job outputs and rejects different
+  downloads. Approving that exact job therefore binds publication to one
+  signed DMG and both Linux archives without mutable cross-release variables.
+
+Configure secrets:
+
+- `APPLE_DEVELOPER_ID_CERTIFICATE_BASE64`
+- `APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD`
+- `APPLE_DEVELOPER_ID_APPLICATION`
+- `APPLE_NOTARY_KEY_BASE64`
+- `APPLE_NOTARY_KEY_ID`
+- `APPLE_NOTARY_ISSUER_ID`
+
+Execute and retain every signing command and physical matrix row in [the
+qualification checklist](macos-release-qualification.md). A green build, test,
+unsigned assembly, or successful notarization alone does not satisfy the
+support-publication gate. If qualification is incomplete, do not approve the
+publish job; move macOS publication to a later version rather than weakening
+the gate.
+
+## Prepare a release
+
+1. Update local `main` to the tested `origin/main`, then create a non-triggering
+   preparation branch such as `prep/0.1.8`. Do not use `release/*` for the
+   preparation PR: any push to that pattern starts the protected release
+   workflow.
+2. On the preparation branch, move the user-visible changes from `Unreleased`
+   into the versioned changelog section with the intended publication date and
+   add its comparison link. If publication slips to another date, correct the
+   changelog through another preparation PR rather than editing a release
+   branch.
+3. Set the same SemVer value in `VERSION`, `build.zig.zon`, and
+   `ui/linux/Cargo.toml`, then update `ui/linux/Cargo.lock`.
+4. Run `zig build test`, `zig build check-darwin-core`,
+   `zig build check-windows-core`, `cargo test --locked --manifest-path
+   ui/linux/Cargo.toml`, and `cargo check --locked --manifest-path
+   ui/linux/Cargo.toml` on supported Linux.
+5. Run `scripts/package-release.sh`. It checks version agreement, builds the
+   public CLI, Rust native host, and private worker, validates every AUR
+   `package()` layout against the exact payload, and writes the Linux x86-64
+   binary archive, source archive, and checksums to `dist/`. Inspect both
+   archive listings; no Darwin or Windows compile output is installable or
+   included.
+6. Confirm the local Linux release assembly and package-layout smoke tests pass.
+   Physical Linux qualification happens later against the exact frozen workflow
+   artifact, not this pre-merge build.
+7. Confirm the normal macOS CI test and ad-hoc unsigned assembly remain green;
+   this is regression coverage only and produces no releasable artifact.
+8. Commit and push the preparation branch, merge its PR, then fetch and
+   fast-forward local `main` to the merged `origin/main`. Pushing `main` runs CI
+   but cannot publish a release. The secret-capable AUR workflow later requires
+   its templates and preparation script on the default branch to match the
+   release commit.
+9. Verify the worktree is clean and no same-version release branch, tag, or
+   GitHub release already exists. Create `release/<version>` from the exact
+   merged `origin/main` commit, assert both SHAs match, make no further edits or
+   commits, and push it once to trigger the release workflow.
+10. After the `linux-assets` job succeeds, download that exact artifact while
+    publication remains blocked. Generate release-commit candidate AUR recipes
+    from its checksums and complete every non-`N/A` row in
+    [the Linux qualification checklist](linux-release-qualification.md),
+    including standalone archive, upgrade from the immediately preceding public
+    release/candidate, applicable historical migrations, supported Hyprland
+    delivery, recovery, uninstall, soak, and rollback gates. Run the separate
+    X11/GNOME/KDE/distro matrix as exploratory coverage. Record the workflow run attempt and exact candidate
+    `SHA256SUMS` file's SHA-256. Do not approve publication if any row is
+    incomplete.
+11. After the unsigned macOS job succeeds, approve the
+    protected `macos-assets` job to sign, notarize, staple, and upload the exact
+    candidate.
+12. Download that exact `macos-assets` artifact while `publish` remains blocked.
+    Complete the artifact checks and physical Apple Silicon matrix, record the
+    approver, decision, and DMG SHA-256. Confirm the `candidate-identities` job
+    summary reports the same Linux manifest and macOS DMG hashes. Do not approve
+    publication if any required row is incomplete or either hash differs.
+13. Approve the protected `publish` job once, only after both Linux and macOS
+    qualification records are complete. It verifies downloaded artifacts
+    against the identities produced before the approval gate, creates the
+    immutable `v<version>` tag at the exact release commit, and publishes Linux,
+    source, and signed macOS archives with one checksum manifest. A
+    default-branch workflow then publishes all three AUR repositories from
+    those immutable assets. Keep the release branch until AUR publication
+    succeeds; it may then be deleted.
+
+If only publication fails while the GitHub release is still a draft, rerun only
+the failed `publish` job when possible; it reuses the successful
+`candidate-identities` outputs and revalidates the retained candidate artifacts.
+Do not partially rerun a successful artifact-producing job: v4 artifact names
+are unique within a workflow run, so its same-name upload will fail. To rebuild
+a candidate, cancel the pending run if necessary and use **Re-run all jobs**.
+Treat both Linux and macOS artifacts as new candidates, repeat signing approval
+and both complete physical qualification gates, compare both hashes with the
+new-attempt `candidate-identities` summary, and approve the new publish job. If
+the release is already published, do not rerun or move its tag. Use the manual
+`Publish AUR` workflow with the immutable version when only AUR publication
+needs retrying.
+
+Do not move or recreate a published tag. Corrections receive a new patch
+release. Enable **immutable releases** in the GitHub repository settings before
+publishing the first tag; the workflow also refuses to overwrite existing
+assets.
+
+Treat a successfully published release branch as frozen. If publication
+succeeds and a defect is found afterward, prepare a new patch version rather
+than pushing replacement artifacts to the same branch.
+
+## Stable-readiness phase boundary
+
+Phase 5 requires a frozen exact candidate (commit plus checksum-bound Linux
+artifacts and signed/notarized macOS artifact) and a separate, explicit user
+approval after qualification. Completion of earlier readiness phases does not
+authorize creating, naming, or publishing a candidate, and approval of one
+platform or an unfrozen build cannot be carried forward.
+
+For stable 1.x, public configuration and control contracts evolve additively
+within the major version and persisted-format changes require migrations. The
+private worker remains a same-version implementation detail, atomically
+packaged with host and CLI; mismatches are rejected loudly. Qualification must
+prove metrics/state migration and backup, plus rollback that either preserves
+data or clearly refuses state an older release cannot safely consume.
+
+## Automated Homebrew Cask publishing
+
+The release workflow generates `sayall.rb` from the approved DMG version and
+SHA-256 and retains it as the `homebrew-cask` workflow artifact. After the
+release is published, the default-branch `Publish Homebrew Cask` workflow
+independently downloads the immutable DMG and checksum manifest, verifies the
+tag and release commit, regenerates the exact Cask, runs `brew style` and
+`brew audit --cask`, and pushes `Casks/sayall.rb` to the dedicated
+[`saiemsaeed/homebrew-sayall`](https://github.com/saiemsaeed/homebrew-sayall)
+tap. It uses a write-enabled deploy key scoped only to that tap; the private key
+is `HOMEBREW_TAP_SSH_PRIVATE_KEY` and its expected public fingerprint is
+`HOMEBREW_TAP_SSH_KEY_FINGERPRINT`. The private key exists only in the
+`homebrew-publication` environment, which permits deployment from `main`; Cask
+generation, download, style, and audit run before the key is injected into the
+final Git-only publication step. It does not share Apple credentials or a
+general-purpose GitHub token.
+
+The Cask uses the immutable GitHub release DMG, installs `SayAll.app`, and lets
+Homebrew expose `Contents/Helpers/sayall`; it never uses `sha256 :no_check`.
+Normal uninstall quits bundle ID `pro.leets.sayall` and removes Homebrew's app
+and binary shim. Shared configuration is removed only by explicit `--zap`.
+Manual retries require the immutable version and verify the matching release
+branch, tag, asset, checksum, and generator before accessing the deploy key.
+The publisher permits an equal-version idempotent retry but refuses to replace
+the tap with an older version.
+
+## Automated AUR publishing
+
+The default-branch `Publish AUR` workflow runs only after the `Release` workflow
+succeeds and verifies that the published release targets the triggering commit.
+It can also be manually retried with an explicit version after a publishing
+failure; the retry verifies the immutable release, tag, and matching release
+branch before reading the AUR credential.
+It uses a dedicated, unencrypted CI key stored in the `AUR_SSH_PRIVATE_KEY`
+GitHub Actions secret. Its public-key fingerprint is stored in the
+`AUR_SSH_KEY_FINGERPRINT` Actions variable and checked before any AUR access.
+Add only that key's public half to the maintainer's AUR account; do not reuse a
+personal or 1Password-managed SSH key. The workflow pins the AUR ED25519 host
+key rather than trusting a dynamic `ssh-keyscan` result. Keeping the publishing
+workflow on the default branch prevents release-branch workflow changes from
+reading the AUR credential. The workflow also requires the preparation script
+and all three AUR template directories on the default branch to match the
+immutable release commit, preventing retries from combining old release assets
+with newer package recipes.
+
+`scripts/prepare-aur-release.sh` copies the checked-in `sayall`, `sayall-bin`,
+and `sayall-git` templates, updates stable package versions and final checksums,
+seeds the VCS package metadata with the release commit's version, and regenerates
+all three `.SRCINFO` files. The public VCS recipe still follows moving `main`, as
+expected for an AUR `-git` package. The workflow checks the
+public package ownership, clones all three standalone AUR repositories before
+the first mutation, and then publishes `sayall-bin`, `sayall`, and `sayall-git`
+in that order. Publishing the binary alternative first gives existing prebuilt
+users a valid switch target before `sayall` changes to a source recipe. A retry
+is safe: commits are never forced and repositories whose
+generated files already match are skipped.
+
+Set the `AUR_MAINTAINER` Actions variable to the AUR username that owns the
+dedicated publishing key. That account must maintain `sayall`, `sayall-bin`,
+and `sayall-git`; a package found under another maintainer causes the workflow
+to stop before any AUR push.
+
+Only after all three current packages are live, submit a manual AUR merge
+request from `sayall-src` into `sayall` so its votes and comments follow the
+canonical stable source package. Do not merge `sayall-src` first: existing
+source users need a live target for their explicit one-time switch.
+
+Before pushing the release branch:
+
+1. Run a clean `makepkg` build in the `sayall` and `sayall-bin` package
+   directories. Inspect (do not install) each package archive. Verify the
+   packaged CLI, native host, and private worker report the release version,
+   the single systemd unit uses `/usr/bin`, the worker is absent from `PATH`,
+   and licenses are under `/usr/share/licenses/<pkgname>`.
+2. Run a clean `makepkg` build for `sayall-git`. Its `pkgver()` function
+   derives the development version from Git and does not require an update for
+   every upstream commit.
+3. Test the transition paths. Upgrade an existing prebuilt `sayall`
+   installation to the new stable source recipe, and explicitly switch another
+   such installation with `yay -S sayall-bin`. Upgrade an existing
+   `sayall-bin` installation in place and switch an existing `sayall-src`
+   installation with `yay -S sayall`. Review each conflict-removal prompt, run
+   `sayall setup` and `sayall doctor`, and complete a recording, transcription,
+   HUD, and typing smoke test. Verify all switches preserve
+   `~/.config/sayall/config.json`.
+   The explicit command is required for users still running the 0.1.4
+   `sayall-src` CLI; its older `sayall update` implementation cannot redirect
+   itself to the later package name.
+4. Repeat `sayall setup` after switching among all three mutually conflicting
+   current variants and verify each switch preserves the selected or disabled
+   shortcut state. Also test an upgrade with an existing manual
+   `bind = CTRL, SLASH, exec, sayall toggle`: setup must leave the line intact
+   while successfully restarting the native host service. Verify `sayall update` detects
+   and targets `sayall`, `sayall-bin`, and `sayall-git`; retain `sayall-src`
+   coverage only as a legacy migration fallback.
+5. After the workflow succeeds, confirm the public pages for `sayall`,
+   `sayall-bin`, and `sayall-git` show the intended versions and maintainer.
+   Then request the `sayall-src` into `sayall` AUR merge.
+
+## Service paths in packages
+
+The checked-in systemd units intentionally target `%h/.local/bin` for the
+documented manual installation. Distribution packages must install equivalent
+units whose `ExecStart` paths use that package manager's installation prefix;
+they must not patch users' existing units during upgrades.

@@ -1,0 +1,464 @@
+name: Release
+
+on:
+  push:
+    branches: ['release/*']
+
+concurrency:
+  group: release-publishing
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  deepgram-integration:
+    permissions:
+      actions: read
+      contents: read
+    uses: ./.github/workflows/deepgram-benchmark.yml
+    with:
+      benchmark_sha: ${{ github.sha }}
+      enforce: true
+      max_wer: 0.09
+      max_cer: 0.03
+    secrets:
+      SAYALL_DEEPGRAM_BENCHMARK_API_KEY: ${{ secrets.SAYALL_DEEPGRAM_BENCHMARK_API_KEY }}
+
+  transformation-integration:
+    permissions:
+      actions: read
+      contents: read
+    uses: ./.github/workflows/transformation-benchmark.yml
+    with:
+      benchmark_sha: ${{ github.sha }}
+      enforce: true
+
+  linux-assets:
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Install build dependencies
+        run: pacman -Syu --noconfirm zig rust python gtk4 gtk4-layer-shell
+      - name: Verify release version
+        id: release
+        run: |
+          version=$(tr -d '[:space:]' < VERSION)
+          [[ $version =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+          test "$GITHUB_REF_NAME" = "release/$version"
+          grep -Eq "^## \[$version\] - [0-9]{4}-[0-9]{2}-[0-9]{2}$" CHANGELOG.md
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Compile readiness / unsupported runtime — Darwin core
+        run: zig build check-darwin-core
+      - name: Compile readiness / unsupported runtime — Windows core
+        run: zig build check-windows-core
+      - name: Check Rust HUD
+        run: cargo check --locked --manifest-path ui/linux/Cargo.toml
+      - name: Build Linux x86-64 release archive
+        run: bash scripts/package-release.sh
+      - name: Upload Linux and source assets
+        id: upload-linux-assets
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: linux-assets
+          path: |
+            dist/sayall-${{ steps.release.outputs.version }}-linux-x86_64.tar.gz
+            dist/sayall-${{ steps.release.outputs.version }}.tar.gz
+            dist/SHA256SUMS
+          if-no-files-found: error
+      - name: Record exact Linux qualification identity
+        env:
+          ARTIFACT_ID: ${{ steps.upload-linux-assets.outputs.artifact-id }}
+          ARTIFACT_DIGEST: ${{ steps.upload-linux-assets.outputs.artifact-digest }}
+        run: |
+          test -n "$ARTIFACT_ID"
+          test -n "$ARTIFACT_DIGEST"
+          printf '### Linux qualification candidate\n\n- Run: `%s`\n- Attempt: `%s`\n- Commit: `%s`\n- Artifact ID: `%s`\n- Artifact digest: `%s`\n' \
+            "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$GITHUB_SHA" \
+            "$ARTIFACT_ID" "$ARTIFACT_DIGEST" >> "$GITHUB_STEP_SUMMARY"
+
+  macos-unsigned:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Verify release version and runner
+        id: release
+        run: |
+          test "$(uname -s)-$(uname -m)" = Darwin-arm64
+          version=$(tr -d '[:space:]' < VERSION)
+          [[ $version =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+          test "$GITHUB_REF_NAME" = "release/$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Install Zig 0.16.0
+        uses: mlugg/setup-zig@8d6198c65fb0feaa111df26e6b467fea8345e46f # v2.0.5
+        with:
+          version: 0.16.0
+      - name: Build and test without release credentials
+        env:
+          MACOS_SIGN_MODE: adhoc
+        run: |
+          bash scripts/package-macos-release.sh
+          bash tests/homebrew-cask.sh
+      - name: Upload unsigned candidate for isolated signing
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: macos-unsigned
+          path: dist/sayall-${{ steps.release.outputs.version }}-macos-arm64-unsigned.zip
+          if-no-files-found: error
+
+  macos-assets:
+    needs: macos-unsigned
+    runs-on: macos-15
+    environment: macos-signing
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Download exact unsigned candidate
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: macos-unsigned
+          path: unsigned
+      - name: Verify candidate before exposing credentials
+        run: |
+          set -euo pipefail
+          test "$(uname -s)-$(uname -m)" = Darwin-arm64
+          version=$(tr -d '[:space:]' < VERSION)
+          [[ $version =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+          test "$GITHUB_REF_NAME" = "release/$version"
+          archive="unsigned/sayall-$version-macos-arm64-unsigned.zip"
+          test -f "$archive"
+          mkdir unsigned/extracted
+          ditto -x -k "$archive" unsigned/extracted
+          app="$GITHUB_WORKSPACE/unsigned/extracted/SayAll.app"
+          bash scripts/verify-macos-app.sh "$app" "$version" adhoc
+          cat > "$RUNNER_TEMP/SayAll.entitlements" <<'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict><key>com.apple.security.device.audio-input</key><true/></dict></plist>
+          PLIST
+      - name: Import Developer ID certificate and notary key
+        env:
+          CERTIFICATE_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_CERTIFICATE_BASE64 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD }}
+          APPLE_DEVELOPER_ID_APPLICATION: ${{ secrets.APPLE_DEVELOPER_ID_APPLICATION }}
+          NOTARY_KEY_BASE64: ${{ secrets.APPLE_NOTARY_KEY_BASE64 }}
+        run: |
+          set -euo pipefail
+          test -n "$APPLE_DEVELOPER_ID_APPLICATION"
+          python3 - <<'PY'
+          import base64, os, pathlib
+          temporary = pathlib.Path(os.environ["RUNNER_TEMP"])
+          temporary.joinpath("developer-id.p12").write_bytes(
+              base64.b64decode(os.environ["CERTIFICATE_BASE64"], validate=True)
+          )
+          temporary.joinpath("notary.p8").write_bytes(
+              base64.b64decode(os.environ["NOTARY_KEY_BASE64"], validate=True)
+          )
+          PY
+          chmod 600 "$RUNNER_TEMP/developer-id.p12" "$RUNNER_TEMP/notary.p8"
+          keychain="$RUNNER_TEMP/sayall-signing.keychain-db"
+          password=$(openssl rand -hex 32)
+          echo "SIGNING_KEYCHAIN=$keychain" >> "$GITHUB_ENV"
+          security create-keychain -p "$password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$password" "$keychain"
+          security import "$RUNNER_TEMP/developer-id.p12" \
+            -P "$CERTIFICATE_PASSWORD" -T /usr/bin/codesign \
+            -f pkcs12 -k "$keychain"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$password" "$keychain"
+          security list-keychains -d user -s "$keychain"
+          security find-identity -v -p codesigning "$keychain" |
+            grep -Fq "\"$APPLE_DEVELOPER_ID_APPLICATION\""
+      - name: Sign, notarize, staple, and package without running repository code
+        env:
+          APPLE_DEVELOPER_ID_APPLICATION: ${{ secrets.APPLE_DEVELOPER_ID_APPLICATION }}
+          APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          test -n "$APPLE_DEVELOPER_ID_APPLICATION"
+          test -n "$APPLE_TEAM_ID"
+          test -n "$APPLE_NOTARY_KEY_ID"
+          test -n "$APPLE_NOTARY_ISSUER_ID"
+          version=$(tr -d '[:space:]' < VERSION)
+          app="$GITHUB_WORKSPACE/unsigned/extracted/SayAll.app"
+          cli="$app/Contents/Helpers/sayall"
+          helper="$app/Contents/Helpers/sayall-process"
+          codesign --force --sign "$APPLE_DEVELOPER_ID_APPLICATION" \
+            --options runtime --timestamp "$cli"
+          codesign --force --sign "$APPLE_DEVELOPER_ID_APPLICATION" \
+            --options runtime --timestamp "$helper"
+          codesign --force --sign "$APPLE_DEVELOPER_ID_APPLICATION" \
+            --options runtime --timestamp \
+            --entitlements "$RUNNER_TEMP/SayAll.entitlements" "$app"
+          codesign --verify --strict --verbose=2 "$cli"
+          codesign --verify --strict --verbose=2 "$helper"
+          codesign --verify --deep --strict --verbose=2 "$app"
+          for executable in "$app" "$cli" "$helper"; do
+            details=$(codesign --display --verbose=4 "$executable" 2>&1)
+            grep -Fq "TeamIdentifier=$APPLE_TEAM_ID" <<<"$details"
+            grep -Eq 'flags=.*runtime' <<<"$details"
+          done
+          submission="$RUNNER_TEMP/sayall-$version-notarization.zip"
+          ditto -c -k --sequesterRsrc --keepParent "$app" "$submission"
+          xcrun notarytool submit "$submission" \
+            --key "$RUNNER_TEMP/notary.p8" \
+            --key-id "$APPLE_NOTARY_KEY_ID" \
+            --issuer "$APPLE_NOTARY_ISSUER_ID" --wait
+          xcrun stapler staple "$app"
+          xcrun stapler validate "$app"
+          spctl --assess --type execute --verbose=2 "$app"
+          dmg_root="$RUNNER_TEMP/dmg-root"
+          mkdir "$dmg_root"
+          ditto "$app" "$dmg_root/SayAll.app"
+          ln -s /Applications "$dmg_root/Applications"
+          mkdir -p dist
+          dmg="$GITHUB_WORKSPACE/dist/sayall-$version-macos-arm64.dmg"
+          hdiutil create -quiet -fs HFS+ -format UDZO -imagekey zlib-level=9 \
+            -volname SayAll -srcfolder "$dmg_root" "$dmg"
+          codesign --force --sign "$APPLE_DEVELOPER_ID_APPLICATION" \
+            --timestamp "$dmg"
+          codesign --verify --strict --verbose=2 "$dmg"
+          xcrun notarytool submit "$dmg" \
+            --key "$RUNNER_TEMP/notary.p8" \
+            --key-id "$APPLE_NOTARY_KEY_ID" \
+            --issuer "$APPLE_NOTARY_ISSUER_ID" --wait
+          xcrun stapler staple "$dmg"
+          xcrun stapler validate "$dmg"
+          spctl --assess --type open --context context:primary-signature \
+            --verbose=2 "$dmg"
+          mount="$RUNNER_TEMP/dmg-mount"
+          mounted=false
+          cleanup_mount() {
+            if [[ $mounted == true ]]; then hdiutil detach -quiet "$mount"; fi
+          }
+          trap cleanup_mount EXIT
+          mkdir "$mount"
+          hdiutil attach -quiet -readonly -nobrowse -mountpoint "$mount" "$dmg"
+          mounted=true
+          test -d "$mount/SayAll.app"
+          test -L "$mount/Applications"
+          test "$(readlink "$mount/Applications")" = /Applications
+          mounted_app="$mount/SayAll.app"
+          plist="$mounted_app/Contents/Info.plist"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$plist")" = "$version"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$plist")" = "$version"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "$plist")" = 15.0
+          for executable in "$mounted_app/Contents/MacOS/SayAll" \
+            "$mounted_app/Contents/Helpers/sayall" \
+            "$mounted_app/Contents/Helpers/sayall-process"; do
+            test "$(lipo -archs "$executable")" = arm64
+            vtool -show-build "$executable" | grep -Eq 'minos 15\.0'
+            codesign --verify --strict --verbose=2 "$executable"
+          done
+          codesign --verify --deep --strict --verbose=2 "$mounted_app"
+          hdiutil detach -quiet "$mount"
+          mounted=false
+          trap - EXIT
+          (cd dist && shasum -a 256 "$(basename "$dmg")" > SHA256SUMS.macos)
+          cat dist/SHA256SUMS.macos | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Remove signing credentials
+        if: always()
+        run: |
+          rm -f "$RUNNER_TEMP/developer-id.p12" "$RUNNER_TEMP/notary.p8" \
+            "$RUNNER_TEMP"/sayall-*-notarization.zip
+          if [[ -n "${SIGNING_KEYCHAIN:-}" ]]; then
+            security delete-keychain "$SIGNING_KEYCHAIN"
+          fi
+          echo "SIGNING_KEYCHAIN=" >> "$GITHUB_ENV"
+      - name: Upload signed and notarized candidate
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: macos-assets
+          path: |
+            dist/sayall-*-macos-arm64.dmg
+            dist/SHA256SUMS.macos
+          if-no-files-found: error
+
+  candidate-identities:
+    needs: [linux-assets, macos-assets]
+    runs-on: ubuntu-latest
+    outputs:
+      linux-manifest-sha256: ${{ steps.identities.outputs.linux-manifest-sha256 }}
+      macos-sha256: ${{ steps.identities.outputs.macos-sha256 }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Verify release version
+        id: release
+        run: |
+          version=$(tr -d '[:space:]' < VERSION)
+          [[ $version =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+          test "$GITHUB_REF_NAME" = "release/$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Download Linux and source candidates
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: linux-assets
+          path: candidate
+      - name: Download signed macOS candidate
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: macos-assets
+          path: candidate
+      - name: Record exact candidate identities before publication approval
+        id: identities
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          (cd candidate && sha256sum --check SHA256SUMS)
+          (cd candidate && sha256sum --check SHA256SUMS.macos)
+          test "$(wc -l < candidate/SHA256SUMS)" -eq 2
+          grep -Eq "^[0-9a-f]{64}  sayall-$VERSION-linux-x86_64\.tar\.gz$" candidate/SHA256SUMS
+          grep -Eq "^[0-9a-f]{64}  sayall-$VERSION\.tar\.gz$" candidate/SHA256SUMS
+          macos_sha=$(awk -v file="sayall-$VERSION-macos-arm64.dmg" \
+            '$2 == file { print $1 }' candidate/SHA256SUMS.macos)
+          [[ $macos_sha =~ ^[0-9a-f]{64}$ ]]
+          test "$(wc -l < candidate/SHA256SUMS.macos)" -eq 1
+          linux_manifest_sha=$(sha256sum candidate/SHA256SUMS | awk '{ print $1 }')
+          echo "linux-manifest-sha256=$linux_manifest_sha" >> "$GITHUB_OUTPUT"
+          echo "macos-sha256=$macos_sha" >> "$GITHUB_OUTPUT"
+          printf '### Exact candidates awaiting physical qualification and publication approval\n\n- Run: `%s`\n- Attempt: `%s`\n- Commit: `%s`\n- Linux manifest SHA-256: `%s`\n- macOS DMG SHA-256: `%s`\n' \
+            "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$GITHUB_SHA" \
+            "$linux_manifest_sha" "$macos_sha" >> "$GITHUB_STEP_SUMMARY"
+
+  publish:
+    needs: [candidate-identities, deepgram-integration, transformation-integration]
+    runs-on: ubuntu-latest
+    environment: macos-publication
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Verify release version
+        id: release
+        run: |
+          version=$(tr -d '[:space:]' < VERSION)
+          [[ $version =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+          test "$GITHUB_REF_NAME" = "release/$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Download Linux and source assets
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: linux-assets
+          path: dist
+      - name: Download signed macOS asset
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: macos-assets
+          path: dist
+      - name: Assemble and verify release assets
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+          CANDIDATE_MACOS_SHA256: ${{ needs.candidate-identities.outputs.macos-sha256 }}
+          CANDIDATE_LINUX_MANIFEST_SHA256: ${{ needs.candidate-identities.outputs.linux-manifest-sha256 }}
+        run: |
+          test -n "$CANDIDATE_LINUX_MANIFEST_SHA256"
+          linux_manifest_sha=$(sha256sum dist/SHA256SUMS | awk '{ print $1 }')
+          test "$linux_manifest_sha" = "$CANDIDATE_LINUX_MANIFEST_SHA256"
+          cat dist/SHA256SUMS dist/SHA256SUMS.macos | sort -k2 > dist/SHA256SUMS.all
+          mv dist/SHA256SUMS.all dist/SHA256SUMS
+          rm dist/SHA256SUMS.macos
+          (cd dist && sha256sum --check SHA256SUMS)
+          test "$(wc -l < dist/SHA256SUMS)" -eq 3
+          grep -Eq "^[0-9a-f]{64}  sayall-$VERSION-linux-x86_64\.tar\.gz$" dist/SHA256SUMS
+          grep -Eq "^[0-9a-f]{64}  sayall-$VERSION\.tar\.gz$" dist/SHA256SUMS
+          macos_sha=$(awk -v file="sayall-$VERSION-macos-arm64.dmg" '$2 == file { print $1 }' dist/SHA256SUMS)
+          test -n "$CANDIDATE_MACOS_SHA256"
+          test "$macos_sha" = "$CANDIDATE_MACOS_SHA256"
+          bash scripts/generate-homebrew-cask.sh "$VERSION" "$macos_sha" dist/sayall.rb
+          ruby -c dist/sayall.rb
+          grep -Fq 'binary "#{appdir}/SayAll.app/Contents/Helpers/sayall"' dist/sayall.rb
+          ! grep -Fq ':no_check' dist/sayall.rb
+      - name: Retain generated Homebrew Cask for tap publication
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: homebrew-cask
+          path: dist/sayall.rb
+          if-no-files-found: error
+          overwrite: true
+      - name: Atomically bind the release tag to this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          ref="tags/v$VERSION"
+          if existing=$(gh api "repos/${{ github.repository }}/git/ref/$ref" 2>/dev/null); then
+            test "$(jq -r .object.type <<<"$existing")" = commit
+            test "$(jq -r .object.sha <<<"$existing")" = "$GITHUB_SHA"
+          else
+            gh api --method POST "repos/${{ github.repository }}/git/refs" \
+              -f ref="refs/$ref" -f sha="$GITHUB_SHA" >/dev/null
+          fi
+      - name: Create a clean draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          releases=$(gh api --paginate "repos/${{ github.repository }}/releases?per_page=100" |
+            jq -cs --arg tag "v$VERSION" '[.[][] | select(.tag_name == $tag)]')
+          test "$(jq length <<<"$releases")" -le 1
+          if [[ $(jq length <<<"$releases") -eq 1 ]]; then
+            release=$(jq -c '.[0]' <<<"$releases")
+            if [[ $(jq -r .draft <<<"$release") != true ]]; then
+              echo "v$VERSION is already published; use the AUR retry workflow if needed" >&2
+              exit 1
+            fi
+            gh api --method DELETE "repos/${{ github.repository }}/releases/$(jq -r .id <<<"$release")"
+          fi
+          cat > "$RUNNER_TEMP/release-notes.md" <<EOF
+          SayAll $VERSION provides an x86-64 Arch Linux release for Omarchy and a signed and notarized Apple Silicon app for macOS 15.0 or later.
+
+          The macOS app is distributed directly as a DMG for Apple Silicon. It does not support Intel Macs, the App Store, or automatic updates.
+
+          See CHANGELOG.md for the complete user-visible changes and known limitations.
+          EOF
+          gh release create "v$VERSION" --repo "${{ github.repository }}" \
+            --verify-tag --draft --title "SayAll $VERSION" \
+            --notes-file "$RUNNER_TEMP/release-notes.md" \
+            "dist/sayall-$VERSION-linux-x86_64.tar.gz" \
+            "dist/sayall-$VERSION.tar.gz" \
+            "dist/sayall-$VERSION-macos-arm64.dmg" \
+            dist/SHA256SUMS
+      - name: Verify uploaded draft and publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          releases=[]
+          for attempt in {1..10}; do
+            releases=$(gh api --paginate "repos/${{ github.repository }}/releases?per_page=100" |
+              jq -cs --arg tag "v$VERSION" '[.[][] | select(.tag_name == $tag)]')
+            count=$(jq length <<<"$releases")
+            test "$count" -le 1
+            [[ $count -eq 1 ]] && break
+            sleep 2
+          done
+          test "$(jq length <<<"$releases")" -eq 1
+          release=$(jq -c '.[0]' <<<"$releases")
+          release_id=$(jq -r .id <<<"$release")
+          [[ $release_id =~ ^[0-9]+$ ]]
+          test "$(jq -r .draft <<<"$release")" = true
+          printf '%s\n' SHA256SUMS "sayall-$VERSION-linux-x86_64.tar.gz" \
+            "sayall-$VERSION-macos-arm64.dmg" "sayall-$VERSION.tar.gz" |
+            sort > "$RUNNER_TEMP/expected-assets"
+          jq -r '.assets[].name' <<<"$release" | sort > "$RUNNER_TEMP/actual-assets"
+          diff -u "$RUNNER_TEMP/expected-assets" "$RUNNER_TEMP/actual-assets"
+          mkdir "$RUNNER_TEMP/uploaded"
+          for name in SHA256SUMS "sayall-$VERSION-linux-x86_64.tar.gz" \
+            "sayall-$VERSION-macos-arm64.dmg" "sayall-$VERSION.tar.gz"; do
+            asset_id=$(jq -r --arg name "$name" '.assets[] | select(.name == $name) | .id' <<<"$release")
+            test -n "$asset_id"
+            gh api -H 'Accept: application/octet-stream' \
+              "repos/${{ github.repository }}/releases/assets/$asset_id" > "$RUNNER_TEMP/uploaded/$name"
+          done
+          cmp dist/SHA256SUMS "$RUNNER_TEMP/uploaded/SHA256SUMS"
+          (cd "$RUNNER_TEMP/uploaded" && sha256sum --check SHA256SUMS)
+          gh api --method PATCH "repos/${{ github.repository }}/releases/$release_id" \
+            -F draft=false >/dev/null

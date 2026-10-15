@@ -1,0 +1,17 @@
+pub const request_additive = @embedFile("protocol-v1/request-additive.json");
+pub const response_capabilities_additive = @embedFile("protocol-v1/response-capabilities-additive.json");
+pub const response_state_additive = @embedFile("protocol-v1/response-state-additive.json");
+pub const response_subscribe_additive = @embedFile("protocol-v1/response-subscribe-additive.json");
+pub const response_error_additive = @embedFile("protocol-v1/response-error-additive.json");
+pub const events_known = @embedFile("protocol-v1/events-known.ndjson");
+pub const event_unknown_additive = @embedFile("protocol-v1/event-unknown-additive.json");
+pub const host_status_request = @embedFile("contracts-0.2/host-status-request.json");
+pub const host_toggle_request = @embedFile("contracts-0.2/host-toggle-request.json");
+pub const host_reload_request = @embedFile("contracts-0.2/host-reload-request.json");
+pub const host_status_response = @embedFile("contracts-0.2/host-status-response.json");
+pub const host_busy_response = @embedFile("contracts-0.2/host-busy-response.json");
+pub const host_shortcut_request = @embedFile("contracts-0.2/host-shortcut-request.json");
+pub const host_shortcut_response = @embedFile("contracts-0.2/host-shortcut-response.json");
+pub const host_shortcut_conflict_response = @embedFile("contracts-0.2/host-shortcut-conflict-response.json");
+pub const macos_shortcut_keys = @embedFile("contracts-0.2/macos-shortcut-keys.json");
+pub const macos_shortcut_chords = @embedFile("contracts-0.2/macos-shortcut-chords.json");

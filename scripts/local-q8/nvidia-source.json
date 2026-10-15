@@ -1,0 +1,10 @@
+{
+  "id": "nvidia-parakeet-unified-en-source",
+  "repository": "nvidia/parakeet-unified-en-0.6b",
+  "revision": "d4ac9928f3bf238223ff0779c06b8149bf8ac4e1",
+  "file": "parakeet-unified-en-0.6b.nemo",
+  "bytes": 2474055680,
+  "sha256": "ec23ed9150c8fde49072c3e2d61678ab903dbcef389d658db833420cbc1da35b",
+  "license": "NVIDIA Open Model License",
+  "license_url": "https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-open-model-license/"
+}

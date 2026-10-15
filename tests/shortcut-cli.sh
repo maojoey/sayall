@@ -1,0 +1,315 @@
+#!/bin/sh
+set -eu
+
+if [ "$(uname -s)" != Linux ]; then
+  echo 'shortcut CLI tests skipped: Linux host required'
+  exit 0
+fi
+
+sayall=$1
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+test_dir=$(mktemp -d /tmp/sayall-shortcut-test.XXXXXX)
+host_pid=
+cleanup() {
+  if [ -n "$host_pid" ]; then
+    kill "$host_pid" 2>/dev/null || true
+    wait "$host_pid" 2>/dev/null || true
+  fi
+  rm -rf -- "$test_dir"
+}
+trap cleanup EXIT HUP INT TERM
+
+mkdir -p "$test_dir/bin" "$test_dir/home" "$test_dir/config/hypr"
+cp "$script_dir/fixtures/systemctl" "$test_dir/bin/systemctl"
+cp "$script_dir/fixtures/hyprctl" "$test_dir/bin/hyprctl"
+chmod +x "$test_dir/bin/systemctl"
+chmod +x "$test_dir/bin/hyprctl"
+
+SAYALL_SOCKET=$test_dir/sayall.sock
+export SAYALL_SOCKET
+python3 - "$SAYALL_SOCKET" <<'PY' &
+import os
+import socket
+import sys
+
+path = sys.argv[1]
+server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+server.bind(path)
+os.chmod(path, 0o600)
+server.listen()
+while True:
+    connection, _ = server.accept()
+    with connection:
+        request = b""
+        while not request.endswith(b"\n"):
+            chunk = connection.recv(4096)
+            if not chunk:
+                break
+            request += chunk
+        connection.sendall(b'{"version":2,"ok":true,"state":"idle"}\n')
+PY
+host_pid=$!
+for _ in $(seq 1 100); do
+  [ -S "$SAYALL_SOCKET" ] && break
+  sleep 0.01
+done
+test -S "$SAYALL_SOCKET"
+
+root=$test_dir/config/hypr/hyprland.conf
+bindings=$test_dir/config/hypr/bindings.conf
+systemctl_log=$test_dir/systemctl.log
+output=$test_dir/output
+
+assert_service_migration() {
+  expected=$test_dir/systemctl.expected
+  cat >"$expected" <<'EOF'
+--user daemon-reload
+--user enable sayall-hud.service
+--user show sayall.service --property=LoadState --value
+--user stop sayall.service
+--user is-active sayall.service
+--user disable sayall.service
+--user restart sayall-hud.service
+EOF
+  cmp "$expected" "$systemctl_log"
+}
+
+for retired in 'daemon' '__service' 'stop' 'toggle --raw'; do
+  if HOME=$test_dir/home XDG_CONFIG_HOME=$test_dir/config \
+      sh -c 'exec "$1" $2' _ "$sayall" "$retired" >"$output" 2>&1; then
+    echo "retired CLI route unexpectedly succeeded: $retired" >&2
+    exit 1
+  fi
+  grep -q 'usage:' "$output"
+done
+
+printf '%s\n' 'source = bindings.conf' >"$root"
+printf '%s\n' 'bind = CTRL, SLASH, exec, sayall toggle' >"$bindings"
+cp "$root" "$test_dir/root.before"
+cp "$bindings" "$test_dir/bindings.before"
+
+SAYALL_TEST_SYSTEMCTL_LOG=$systemctl_log \
+HOME=$test_dir/home \
+XDG_CONFIG_HOME=$test_dir/config \
+PATH=$test_dir/bin:$PATH \
+env -u HYPRLAND_INSTANCE_SIGNATURE "$sayall" setup >"$output" 2>&1
+
+cmp "$test_dir/root.before" "$root"
+cmp "$test_dir/bindings.before" "$bindings"
+test ! -e "$test_dir/config/hypr/sayall.conf"
+test ! -e "$test_dir/config/sayall/shortcut.json"
+grep -q 'leaving the existing binding unchanged' "$output"
+assert_service_migration
+
+: >"$systemctl_log"
+SAYALL_TEST_SYSTEMCTL_LOG=$systemctl_log \
+SAYALL_TEST_LEGACY_STATE=missing \
+HOME=$test_dir/home \
+XDG_CONFIG_HOME=$test_dir/config \
+PATH=$test_dir/bin:$PATH \
+env -u HYPRLAND_INSTANCE_SIGNATURE "$sayall" setup >"$output" 2>&1
+cat >"$test_dir/systemctl-missing.expected" <<'EOF'
+--user daemon-reload
+--user enable sayall-hud.service
+--user show sayall.service --property=LoadState --value
+--user restart sayall-hud.service
+EOF
+cmp "$test_dir/systemctl-missing.expected" "$systemctl_log"
+
+: >"$systemctl_log"
+if SAYALL_TEST_SYSTEMCTL_LOG=$systemctl_log \
+    SAYALL_TEST_LEGACY_STATE=active \
+    HOME=$test_dir/home \
+    XDG_CONFIG_HOME=$test_dir/config \
+    PATH=$test_dir/bin:$PATH \
+    env -u HYPRLAND_INSTANCE_SIGNATURE "$sayall" setup >"$output" 2>&1; then
+  echo 'setup unexpectedly started the native host while the legacy owner remained active' >&2
+  exit 1
+fi
+cat >"$test_dir/systemctl-active.expected" <<'EOF'
+--user daemon-reload
+--user enable sayall-hud.service
+--user show sayall.service --property=LoadState --value
+--user stop sayall.service
+--user is-active sayall.service
+EOF
+cmp "$test_dir/systemctl-active.expected" "$systemctl_log"
+
+variable_config=$test_dir/variable-config
+mkdir -p "$variable_config/hypr"
+cp "$script_dir/fixtures/hypr-variable-binding.conf" "$variable_config/hypr/hyprland.conf"
+cp "$variable_config/hypr/hyprland.conf" "$test_dir/variable-binding.before"
+if HOME=$test_dir/home XDG_CONFIG_HOME=$variable_config \
+    env -u HYPRLAND_INSTANCE_SIGNATURE "$sayall" shortcut set SUPER+H >"$output" 2>&1; then
+  echo 'variable-based modifier unexpectedly passed conflict scanning' >&2
+  exit 1
+fi
+grep -q 'unresolved Hyprland expression' "$output"
+grep -q 'No files were changed' "$output"
+cmp "$test_dir/variable-binding.before" "$variable_config/hypr/hyprland.conf"
+test ! -e "$variable_config/hypr/sayall.conf"
+test ! -e "$variable_config/sayall/shortcut.json"
+
+variable_source_config=$test_dir/variable-source-config
+mkdir -p "$variable_source_config/hypr"
+cp "$script_dir/fixtures/hypr-variable-source.conf" "$variable_source_config/hypr/hyprland.conf"
+cp "$variable_source_config/hypr/hyprland.conf" "$test_dir/variable-source.before"
+if HOME=$test_dir/home XDG_CONFIG_HOME=$variable_source_config \
+    env -u HYPRLAND_INSTANCE_SIGNATURE "$sayall" shortcut reset >"$output" 2>&1; then
+  echo 'variable-based source unexpectedly passed conflict scanning' >&2
+  exit 1
+fi
+grep -q 'unresolved Hyprland expression' "$output"
+grep -q 'No files were changed' "$output"
+cmp "$test_dir/variable-source.before" "$variable_source_config/hypr/hyprland.conf"
+test ! -e "$variable_source_config/hypr/sayall.conf"
+test ! -e "$variable_source_config/sayall/shortcut.json"
+
+symlink_config=$test_dir/symlink-config
+mkdir -p "$symlink_config/hypr"
+symlink_target=$test_dir/symlink-target.conf
+printf '%s\n' '# symlink target must survive' >"$symlink_target"
+cp "$symlink_target" "$test_dir/symlink-target.before"
+ln -s "$symlink_target" "$symlink_config/hypr/hyprland.conf"
+symlink_before=$(readlink "$symlink_config/hypr/hyprland.conf")
+if HOME=$test_dir/home XDG_CONFIG_HOME=$symlink_config \
+    env -u HYPRLAND_INSTANCE_SIGNATURE "$sayall" shortcut reset >"$output" 2>&1; then
+  echo 'symlinked hyprland.conf unexpectedly accepted' >&2
+  exit 1
+fi
+grep -q 'symlinked Hyprland roots are unsupported' "$output"
+grep -q 'No files were changed' "$output"
+test -L "$symlink_config/hypr/hyprland.conf"
+test "$(readlink "$symlink_config/hypr/hyprland.conf")" = "$symlink_before"
+cmp "$test_dir/symlink-target.before" "$symlink_target"
+test ! -e "$symlink_config/sayall"
+test ! -e "$symlink_config/sayall/shortcut.lock"
+test ! -e "$symlink_config/hypr/sayall.conf"
+test ! -e "$symlink_config/sayall/shortcut.json"
+
+if HOME=$test_dir/home XDG_CONFIG_HOME=$test_dir/config \
+    env -u HYPRLAND_INSTANCE_SIGNATURE "$sayall" shortcut set SUPER+H >"$output" 2>&1; then
+  echo 'shortcut set unexpectedly took ownership from a manual binding' >&2
+  exit 1
+fi
+grep -q 'owned by an existing manual Hyprland binding' "$output"
+if HOME=$test_dir/home XDG_CONFIG_HOME=$test_dir/config \
+    env -u HYPRLAND_INSTANCE_SIGNATURE "$sayall" shortcut disable >"$output" 2>&1; then
+  echo 'shortcut disable unexpectedly ignored a manual binding' >&2
+  exit 1
+fi
+grep -q 'owned by an existing manual Hyprland binding' "$output"
+HOME=$test_dir/home XDG_CONFIG_HOME=$test_dir/config \
+  env -u HYPRLAND_INSTANCE_SIGNATURE "$sayall" shortcut reset >"$output" 2>&1
+cmp "$test_dir/root.before" "$root"
+cmp "$test_dir/bindings.before" "$bindings"
+test ! -e "$test_dir/config/hypr/sayall.conf"
+test ! -e "$test_dir/config/sayall/shortcut.json"
+
+managed_config=$test_dir/managed-config
+managed_root=$managed_config/hypr/hyprland.conf
+mkdir -p "$managed_config/hypr"
+printf '%s\n' '# isolated managed shortcut test' >"$managed_root"
+
+HOME=$test_dir/home XDG_CONFIG_HOME=$managed_config \
+  env -u HYPRLAND_INSTANCE_SIGNATURE "$sayall" shortcut show >"$output" 2>&1
+grep -q 'CTRL+SLASH (default' "$output"
+
+HOME=$test_dir/home XDG_CONFIG_HOME=$managed_config \
+  env -u HYPRLAND_INSTANCE_SIGNATURE "$sayall" shortcut set SUPER+H >"$output" 2>&1
+cp "$managed_root" "$test_dir/managed-root.before"
+cp "$managed_config/hypr/sayall.conf" "$test_dir/managed-fragment.before"
+cp "$managed_config/sayall/shortcut.json" "$test_dir/managed-state.before"
+HOME=$test_dir/home XDG_CONFIG_HOME=$managed_config \
+  env -u HYPRLAND_INSTANCE_SIGNATURE "$sayall" shortcut set SUPER+H >"$output" 2>&1
+cmp "$test_dir/managed-root.before" "$managed_root"
+cmp "$test_dir/managed-fragment.before" "$managed_config/hypr/sayall.conf"
+cmp "$test_dir/managed-state.before" "$managed_config/sayall/shortcut.json"
+test "$(grep -c 'BEGIN SAYALL MANAGED SHORTCUT' "$managed_root")" -eq 1
+grep -q 'bindd = SUPER, H, Toggle SayAll dictation, exec, sayall toggle' \
+  "$managed_config/hypr/sayall.conf"
+
+: >"$systemctl_log"
+SAYALL_TEST_SYSTEMCTL_LOG=$systemctl_log \
+HOME=$test_dir/home \
+XDG_CONFIG_HOME=$managed_config \
+PATH=$test_dir/bin:$PATH \
+env -u HYPRLAND_INSTANCE_SIGNATURE "$sayall" setup >"$output" 2>&1
+grep -q '"shortcut": "SUPER+H"' "$managed_config/sayall/shortcut.json"
+assert_service_migration
+
+HOME=$test_dir/home XDG_CONFIG_HOME=$managed_config \
+  env -u HYPRLAND_INSTANCE_SIGNATURE "$sayall" shortcut disable >"$output" 2>&1
+! grep -q '^bind' "$managed_config/hypr/sayall.conf"
+HOME=$test_dir/home XDG_CONFIG_HOME=$managed_config \
+  env -u HYPRLAND_INSTANCE_SIGNATURE "$sayall" shortcut reset >"$output" 2>&1
+grep -q 'bindd = CTRL, SLASH, Toggle SayAll dictation, exec, sayall toggle' \
+  "$managed_config/hypr/sayall.conf"
+
+hyprctl_log=$test_dir/hyprctl.log
+SAYALL_TEST_HYPRCTL_LOG=$hyprctl_log \
+HOME=$test_dir/home \
+XDG_CONFIG_HOME=$managed_config \
+PATH=$test_dir/bin:$PATH \
+HYPRLAND_INSTANCE_SIGNATURE=test-instance \
+"$sayall" shortcut set ALT+F10 >"$output" 2>&1
+test "$(wc -l <"$hyprctl_log")" -eq 2
+grep -q 'bindd = ALT, F10, Toggle SayAll dictation, exec, sayall toggle' \
+  "$managed_config/hypr/sayall.conf"
+
+cp "$managed_root" "$test_dir/reload-root.before"
+cp "$managed_config/hypr/sayall.conf" "$test_dir/reload-fragment.before"
+cp "$managed_config/sayall/shortcut.json" "$test_dir/reload-state.before"
+: >"$hyprctl_log"
+if SAYALL_TEST_HYPRCTL_LOG=$hyprctl_log \
+    SAYALL_TEST_CONFIGERRORS='test config error' \
+    HOME=$test_dir/home \
+    XDG_CONFIG_HOME=$managed_config \
+    PATH=$test_dir/bin:$PATH \
+    HYPRLAND_INSTANCE_SIGNATURE=test-instance \
+    "$sayall" shortcut set CTRL+ALT+Q >"$output" 2>&1; then
+  echo 'shortcut change unexpectedly survived Hyprland config errors' >&2
+  exit 1
+fi
+cmp "$test_dir/reload-root.before" "$managed_root"
+cmp "$test_dir/reload-fragment.before" "$managed_config/hypr/sayall.conf"
+cmp "$test_dir/reload-state.before" "$managed_config/sayall/shortcut.json"
+grep -q 'previous shortcut files were restored' "$output"
+test "$(wc -l <"$hyprctl_log")" -eq 4
+
+printf '%s\n' 'bind = CTRL, SLASH, exec, other-command' >"$bindings"
+: >"$systemctl_log"
+if SAYALL_TEST_SYSTEMCTL_LOG=$systemctl_log \
+    HOME=$test_dir/home \
+    XDG_CONFIG_HOME=$test_dir/config \
+    PATH=$test_dir/bin:$PATH \
+    env -u HYPRLAND_INSTANCE_SIGNATURE "$sayall" setup >"$output" 2>&1; then
+  echo 'setup unexpectedly accepted a conflicting shortcut' >&2
+  exit 1
+fi
+
+grep -q 'shortcut conflicts with' "$output"
+grep -q 'host service was enabled and restarted' "$output"
+assert_service_migration
+test ! -e "$test_dir/config/hypr/sayall.conf"
+test ! -e "$test_dir/config/sayall/shortcut.json"
+
+cp "$managed_config/hypr/sayall.conf" "$test_dir/concurrent-fragment.before"
+cp "$managed_config/sayall/shortcut.json" "$test_dir/concurrent-state.before"
+: >"$hyprctl_log"
+if SAYALL_TEST_HYPRCTL_LOG=$hyprctl_log \
+    SAYALL_TEST_CONFIGERRORS='test config error' \
+    SAYALL_TEST_MUTATE_ROOT_ON_RELOAD=$managed_root \
+    HOME=$test_dir/home \
+    XDG_CONFIG_HOME=$managed_config \
+    PATH=$test_dir/bin:$PATH \
+    HYPRLAND_INSTANCE_SIGNATURE=test-instance \
+    "$sayall" shortcut set SUPER+F12 >"$output" 2>&1; then
+  echo 'concurrent rollback modification unexpectedly succeeded' >&2
+  exit 1
+fi
+grep -q 'could not safely restore every transaction file' "$output"
+! grep -q 'previous shortcut files were restored' "$output"
+grep -q '^# concurrent external edit$' "$managed_root"
+cmp "$test_dir/concurrent-fragment.before" "$managed_config/hypr/sayall.conf"
+cmp "$test_dir/concurrent-state.before" "$managed_config/sayall/shortcut.json"

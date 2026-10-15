@@ -1,0 +1,2241 @@
+//! Pure, source-anchored transcript cleanup.  This module deliberately has no
+//! provider or configuration dependencies.
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+
+pub const max_tokens = 2048;
+pub const max_operations = 128;
+pub const max_list_items = 128;
+
+pub const Error = error{ OutOfMemory, InvalidPlan, TranscriptTooLarge };
+pub const Token = struct { text: []const u8, start: usize, end: usize, protected: bool };
+pub const DeleteKind = enum { filler, repetition, backtrack };
+pub const ScalarCategory = enum { number, weekday, quantity };
+pub const Deletion = struct {
+    start_token: usize,
+    end_token: usize,
+    source: []const u8,
+    kind: DeleteKind,
+    // repetition: the retained, immediately preceding phrase. backtrack: cue
+    // and surviving replacement. filler ignores these fields.
+    proof_start_token: usize,
+    proof_end_token: usize,
+    cue: []const u8,
+    category: ?ScalarCategory,
+};
+pub const CorrectionKind = enum { case, glossary, orthographic };
+pub const Correction = struct { start_token: usize, end_token: usize, source: []const u8, replacement: []const u8, kind: CorrectionKind };
+pub const PunctuationMark = enum { period, comma, question, exclamation, colon, semicolon };
+pub const Punctuation = struct { after_token: usize, mark: PunctuationMark };
+pub const ListKind = enum { bullet, numbered };
+pub const ListAnchor = struct { start_token: usize };
+pub const List = struct { start_token: usize, end_token: usize, items: []const ListAnchor, kind: ListKind };
+pub const LlmPlan = struct {
+    version: u32,
+    deletions: []const Deletion,
+    corrections: []const Correction,
+    punctuation: []const Punctuation,
+    paragraph_breaks: []const usize,
+    lists: []const List,
+};
+
+fn questionAuxiliary(word: []const u8) bool {
+    for ([_][]const u8{ "can", "could", "would", "should", "will", "do", "does", "did", "is", "are", "was", "were", "have", "has", "had", "am", "may", "might" }) |candidate| if (asciiEq(word, candidate)) return true;
+    return false;
+}
+
+fn questionSubject(word: []const u8) bool {
+    for ([_][]const u8{ "i", "you", "we", "he", "she", "they", "it", "there" }) |candidate| if (asciiEq(word, candidate)) return true;
+    return false;
+}
+
+fn ordinal(word: []const u8) ?usize {
+    for ([_][]const u8{ "first", "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth", "ninth", "tenth" }, 1..) |candidate, value| if (asciiEq(word, candidate)) return value;
+    return null;
+}
+
+fn ordinalAnchors(gpa: Allocator, tokens: []const Token, anchors: *std.ArrayList(ListAnchor)) bool {
+    if (ordinal(tokens[0].text) != 1) return false;
+    var expected: usize = 1;
+    for (tokens, 0..) |token, i| if (ordinal(token.text)) |value| {
+        if (value != expected) return false;
+        anchors.append(gpa, .{ .start_token = i }) catch return false;
+        expected += 1;
+    };
+    return expected >= 3;
+}
+
+fn reportedOrdinalPunctuation(gpa: Allocator, source: []const u8, tokens: []const Token, punctuation_ops: *std.ArrayList(Punctuation)) !bool {
+    var indexes: [10]usize = undefined;
+    var count: usize = 0;
+    var expected: usize = 1;
+    for (tokens, 0..) |token, i| if (ordinal(token.text)) |value| {
+        if (value != expected) return false;
+        indexes[count] = i;
+        count += 1;
+        expected += 1;
+    };
+    if (count < 3 or !reportingListContext(source, tokens, indexes[0])) return false;
+    for (indexes[1..count]) |next| {
+        const previous = next - 1;
+        if (!hasFixedTrailingPunctuation(source, tokens[previous])) try punctuation_ops.append(gpa, .{ .after_token = previous, .mark = .comma });
+    }
+    return true;
+}
+
+fn numberWord(word: []const u8) ?usize {
+    for ([_][]const u8{ "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten" }, 2..) |candidate, value| if (asciiEq(word, candidate)) return value;
+    return null;
+}
+
+fn countedListNoun(word: []const u8) bool {
+    for ([_][]const u8{ "items", "things", "fruits", "projects", "tasks", "points", "options", "steps", "reasons", "rules", "problems", "examples", "files", "changes", "questions", "ideas" }) |candidate| if (asciiEq(word, candidate)) return true;
+    return false;
+}
+
+fn countedListStart(tokens: []const Token, noun: usize) usize {
+    const direct = noun + 1;
+    if (direct + 3 <= tokens.len and asciiEq(tokens[direct].text, "in") and asciiEq(tokens[direct + 1].text, "my") and asciiEq(tokens[direct + 2].text, "life")) return direct + 3;
+    return direct;
+}
+
+/// Deterministic local cleanup with explicit protections. The returned slice is allocator-owned.
+pub fn clean(gpa: Allocator, transcript: []const u8, glossary: []const []const u8) Error![]u8 {
+    const tokens = tokenize(gpa, transcript) catch |err| switch (err) {
+        error.TranscriptTooLarge => return gpa.dupe(u8, transcript),
+        else => return err,
+    };
+    defer gpa.free(tokens);
+    if (tokens.len == 0) return gpa.dupe(u8, transcript);
+    if (hasDecorationOnlyChunk(transcript, tokens)) return gpa.dupe(u8, transcript);
+    var deleted = try gpa.alloc(bool, tokens.len);
+    defer gpa.free(deleted);
+    @memset(deleted, false);
+    const protected = try protectionMap(gpa, transcript, tokens, glossary);
+    defer gpa.free(protected);
+    const spelling = try gpa.alloc(usize, tokens.len);
+    defer gpa.free(spelling);
+    for (spelling, 0..) |*index, i| index.* = i;
+    for (tokens, 0..) |t, i| {
+        if (!protected[i] and filler(t.text)) deleted[i] = true;
+    }
+    // Keep source-run membership stable as repeated copies are deleted.
+    const omitted_fillers = try gpa.dupe(bool, deleted);
+    defer gpa.free(omitted_fillers);
+    // Collapse ordinary-word stutters, excluding common meaningful repeats.
+    // Retain the last copy's punctuation and the first copy's spelling.
+    // Deepgram can insert a comma or capitalize a repeated word. A comma is
+    // allowed here, but sentence boundaries, line breaks and literals are not.
+    for (tokens[0 .. tokens.len - 1], 0..) |t, i| {
+        if (deleted[i]) continue;
+        const next_index = nextContextToken(transcript, tokens, omitted_fillers, i) orelse continue;
+        const next = tokens[next_index];
+        const context_start = if (t.text.len == 1) repetitionContextStart(transcript, tokens, omitted_fillers, i) else i;
+        if (!protected[i] and !protected[next_index] and
+            stutterWord(t.text) and stutterWord(next.text) and asciiEq(t.text, next.text) and
+            !spelledLetterContext(transcript, tokens, omitted_fillers, context_start) and
+            tokenChunkStart(transcript, t) == t.start and
+            tokenChunkStart(transcript, next) == next.start)
+        {
+            deleted[i] = true;
+            spelling[next_index] = spelling[i];
+        }
+    }
+    // Compare surviving words after filler/stutter removal, but keep original
+    // token indexes so literal protections and source boundaries remain intact.
+    const phrase_indexes = try gpa.alloc(usize, tokens.len);
+    defer gpa.free(phrase_indexes);
+    // Exact adjacent phrase repetition (two or more words).
+    // Each run is compared to its retained first phrase so three or more
+    // copies collapse fully rather than leaving the final copy behind.
+    var n: usize = 8;
+    while (n >= 2) : (n -= 1) {
+        var count: usize = 0;
+        for (deleted, 0..) |is_deleted, index| {
+            if (is_deleted) continue;
+            phrase_indexes[count] = index;
+            count += 1;
+        }
+        const indexes = phrase_indexes[0..count];
+        var base: usize = 0;
+        while (base + n * 2 <= indexes.len) {
+            // Uniform word runs belong to the guarded single-word pass.
+            // Do not bypass its protections by grouping four copies as two
+            // identical two-word phrases (e.g. "no no no no").
+            var uniform = true;
+            for (indexes[base + 1 .. base + n]) |index| uniform = uniform and asciiEq(tokens[indexes[base]].text, tokens[index].text);
+            if (uniform) {
+                base += 1;
+                continue;
+            }
+            var candidate = base + n;
+            if (!cleanRangesEqual(transcript, tokens, deleted, protected, indexes, base, candidate, n)) {
+                base += 1;
+                continue;
+            }
+            while (candidate + n <= indexes.len and cleanRangesEqual(transcript, tokens, deleted, protected, indexes, base, candidate, n)) : (candidate += n) {
+                for (indexes[candidate .. candidate + n]) |index| deleted[index] = true;
+            }
+            base = candidate;
+        }
+    }
+    // "Actually" is accepted only between locally provable same-category
+    // scalars; semantic discourse uses remain untouched.
+    const cues = [_][]const []const u8{ &.{"actually"}, &.{"correction"}, &.{ "scratch", "that" }, &.{ "make", "that" } };
+    for (cues) |cue| {
+        var i: usize = 1;
+        while (i + cue.len < tokens.len) : (i += 1) {
+            const category = scalarCategory(tokens[i - 1].text);
+            var match = !protected[i - 1] and category != null and !backtrackNegated(tokens, i - 1);
+            for (cue, 0..) |word, j| match = match and !protected[i + j] and asciiEq(tokens[i + j].text, word);
+            const replacement = i + cue.len;
+            match = match and !protected[replacement] and sameScalar(tokens[i - 1].text, tokens[replacement].text, category);
+            if (match) {
+                for (i - 1..replacement) |j| deleted[j] = true;
+            }
+        }
+    }
+    var survivors: usize = 0;
+    for (deleted) |is_deleted| survivors += @intFromBool(!is_deleted);
+    if (survivors == 0) return gpa.dupe(u8, transcript);
+    return renderClean(gpa, transcript, tokens, deleted, spelling);
+}
+
+const ending_question_words = [_][]const u8{ "what", "what's", "when", "when's", "where", "where's", "which", "who", "who's", "whom", "whose", "why", "why's", "how", "how's" };
+const ending_auxiliaries = [_][]const u8{ "am", "is", "are", "was", "were", "do", "does", "did", "have", "has", "had", "can", "could", "will", "would", "shall", "should", "may", "might", "must" };
+const ending_pronoun_subjects = [_][]const u8{ "i", "you", "we", "he", "she", "they", "it", "there", "this", "that", "these", "those", "anyone", "anybody", "someone", "somebody", "everyone", "everybody", "nobody" };
+// Bare "do" is also imperative. Exclude object/demonstrative readings such
+// as "do it/this/that"; these subjects alone are not a general grammar proof.
+const do_question_subjects = [_][]const u8{ "i", "you", "we", "he", "she", "they" };
+const ending_reporting_verbs = [_][]const u8{ "said", "asked", "replied", "answered", "wondered", "inquired", "repeated", "added", "continued" };
+const ending_max_words = 32;
+
+fn anyWord(word: []const u8, candidates: []const []const u8) bool {
+    for (candidates) |candidate| if (endingWordEqual(word, candidate)) return true;
+    return false;
+}
+
+// Compare without rewriting source bytes: curly and straight apostrophes
+// have the same grammatical meaning, but the user's spelling stays intact.
+fn endingWordEqual(word: []const u8, candidate: []const u8) bool {
+    var i: usize = 0;
+    for (candidate) |c| {
+        if (i == word.len) return false;
+        if (c == '\'' and std.mem.startsWith(u8, word[i..], "’")) {
+            i += "’".len;
+        } else {
+            if (std.ascii.toLower(word[i]) != c) return false;
+            i += 1;
+        }
+    }
+    return i == word.len;
+}
+
+fn endingWordByte(c: u8) bool {
+    return std.ascii.isAlphabetic(c) or c == '\'' or c >= 0x80;
+}
+
+fn properSubject(word: []const u8) bool {
+    return word.len > 1 and std.ascii.isUpper(word[0]) and !allUppercaseAscii(word);
+}
+
+fn endingSubject(word: []const u8) bool {
+    return anyWord(word, &ending_pronoun_subjects) or properSubject(word);
+}
+
+const QuestionEnding = struct { at: usize, replace: bool };
+
+/// Conservative English question-pattern repair for local Clean, not a parser
+/// or an intonation classifier. Replaces terminal commas/periods, or inserts
+/// '?' at an unpunctuated line/recording end. Never infers internal boundaries
+/// from capitalization alone. Source words and spacing remain unchanged.
+pub fn normalizeQuestionEndings(gpa: Allocator, transcript: []const u8) error{OutOfMemory}![]u8 {
+    var positions: std.ArrayList(QuestionEnding) = .empty;
+    defer positions.deinit(gpa);
+    var start: usize = 0;
+    var i: usize = 0;
+    while (i < transcript.len) {
+        const c = transcript[i];
+        if (c == '.' or c == '!' or c == '?') {
+            var j = i + 1;
+            while (j < transcript.len and isSentenceCloser(transcript[j])) j += 1;
+            if (j >= transcript.len or std.ascii.isWhitespace(transcript[j])) {
+                considerEnding(transcript, start, j, &positions, gpa) catch return error.OutOfMemory;
+                start = j;
+                i = j;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        if (c == '\n') {
+            considerEnding(transcript, start, i, &positions, gpa) catch return error.OutOfMemory;
+            start = i + 1;
+            i += 1;
+            continue;
+        }
+        i += 1;
+    }
+    considerEnding(transcript, start, transcript.len, &positions, gpa) catch return error.OutOfMemory;
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    var cursor: usize = 0;
+    for (positions.items) |ending| {
+        try out.appendSlice(gpa, transcript[cursor..ending.at]);
+        try out.append(gpa, '?');
+        cursor = ending.at + @intFromBool(ending.replace);
+    }
+    try out.appendSlice(gpa, transcript[cursor..]);
+    return out.toOwnedSlice(gpa);
+}
+
+/// Local Clean only: repair recognized questions first, then add a period to
+/// a recognized final declarative clause. This is deliberately not a parser;
+/// unknown/fragments/technical text are left alone. Never inserts boundaries
+/// inside an unpunctuated sentence or adds periods to every line.
+pub fn normalizeLocalEndings(gpa: Allocator, transcript: []const u8) error{OutOfMemory}![]u8 {
+    const questions = try normalizeQuestionEndings(gpa, transcript);
+    errdefer gpa.free(questions);
+    const at = finalStatementEnd(questions) orelse return questions;
+    const out = try gpa.alloc(u8, questions.len + 1);
+    @memcpy(out[0..at], questions[0..at]);
+    out[at] = '.';
+    @memcpy(out[at + 1 ..], questions[at..]);
+    gpa.free(questions);
+    return out;
+}
+
+fn finalStatementEnd(text: []const u8) ?usize {
+    var end = text.len;
+    while (end > 0 and std.ascii.isWhitespace(text[end - 1])) end -= 1;
+    if (end == 0 or !std.ascii.isAlphanumeric(text[end - 1])) return null;
+    var line_start = if (std.mem.lastIndexOfScalar(u8, text[0..end], '\n')) |at| at + 1 else 0;
+    while (line_start < end and std.ascii.isWhitespace(text[line_start])) line_start += 1;
+    if (line_start == end or !std.ascii.isAlphabetic(text[line_start])) return null;
+    var start: usize = line_start;
+    for (text[line_start..end], line_start..) |c, i| {
+        if (c == '\n' or ((c == '.' or c == '?' or c == '!') and
+            i + 1 < end and std.ascii.isWhitespace(text[i + 1]))) start = i + 1;
+    }
+    while (start < end and std.ascii.isWhitespace(text[start])) start += 1;
+    const sentence = text[start..end];
+    // No markup, URLs, addresses, code, quoted literals or list-item prefixes.
+    if (sentence.len == 0 or !std.ascii.isAlphabetic(sentence[0])) return null;
+    for (sentence) |c| {
+        if (std.mem.indexOfScalar(u8, "`\"/\\@_:=<>|{}[]()#*+;", c) != null) return null;
+    }
+    if (std.mem.indexOf(u8, sentence, "“") != null or std.mem.indexOf(u8, sentence, "”") != null or
+        std.mem.indexOf(u8, sentence, "..") != null) return null;
+    var words: [ending_max_words][]const u8 = undefined;
+    const count = sentenceWords(sentence, &words);
+    if (count < 2) return null;
+    // Classify the bounded opening, but inspect the actual tail rather than
+    // mistaking the final word of a truncated prefix for the recording end.
+    var tail_end = sentence.len;
+    while (tail_end > 0 and !endingWordByte(sentence[tail_end - 1])) tail_end -= 1;
+    var tail_start = tail_end;
+    while (tail_start > 0 and endingWordByte(sentence[tail_start - 1])) tail_start -= 1;
+    const last = sentence[tail_start..tail_end];
+    const body = questionBody(words[0..count]);
+    if (body.len > 0 and body.len != count and
+        (endingQuestionAuxiliary(body[0]) or anyWord(body[0], &ending_question_words))) return null;
+    if (anyWord(last, &.{ "a", "an", "the", "to", "of", "for", "with", "without", "at", "by", "from", "in", "on", "and", "or", "but", "because", "if", "when", "while", "although", "what", "which", "who", "where", "how", "why", "not", "been", "being", "have", "has", "had", "am", "is", "are", "was", "were", "can", "could", "will", "would", "should", "must" })) return null;
+    return if (declarativeOpening(words[0..count])) end else null;
+}
+
+fn declarativePredicate(words: []const []const u8) bool {
+    if (words.len == 0) return false;
+    if (words.len == 1) return anyWord(words[0], &.{ "works", "worked", "failed", "passed", "finished", "stopped", "arrived", "agree", "agreed" });
+    return anyWord(words[0], &.{ "am", "is", "are", "was", "were", "have", "has", "had", "need", "needs", "want", "wants", "think", "thinks", "mean", "means", "know", "knows", "like", "likes", "prefer", "prefers", "work", "works", "worked", "recorded", "missed", "said", "noticed", "found", "finished", "tested", "checked", "sent", "received", "understand", "understands", "agree", "agrees", "feel", "feels", "see", "sees", "went", "ran", "forgot", "used", "added" });
+}
+
+fn declarativeOpening(words: []const []const u8) bool {
+    const subjects = [_][]const u8{ "i", "you", "we", "he", "she", "they", "it", "this", "that", "these", "those", "there" };
+    // A narrow free-relative pattern, rather than guessing all wh-clauses.
+    if (words.len >= 5 and asciiEq(words[0], "what") and anyWord(words[1], &subjects) and
+        anyWord(words[2], &.{ "need", "needs", "want", "wants" }) and
+        anyWord(words[3], &.{ "is", "was" })) return true;
+    if (anyWord(words[0], &.{ "i'm", "you're", "we're", "they're", "he's", "she's", "it's", "that's", "there's", "i've", "we've", "they've", "you've" })) return true;
+    if (anyWord(words[0], &subjects) and declarativePredicate(words[1..])) return true;
+    // Simple determiner + noun + predicate. Do not scan through relative or
+    // subordinate clauses looking for a verb.
+    if (words.len >= 3 and anyWord(words[0], &.{ "the", "my", "your", "our", "his", "her", "their", "this", "that", "these", "those" }) and
+        !anyWord(words[1], &.{ "who", "which", "that" })) return declarativePredicate(words[2..]);
+    return false;
+}
+
+fn isSentenceCloser(c: u8) bool {
+    return c == '"' or c == '\'' or c == ')' or c == ']' or c == '}';
+}
+
+fn isSentenceOpener(c: u8) bool {
+    return c == '"' or c == '\'' or c == '(' or c == '[' or c == '{';
+}
+
+/// `end` is exclusive. Whitespace is preserved, and leading quoted/bracketed
+/// content is deliberately excluded rather than guessing whether it is literal.
+fn considerEnding(transcript: []const u8, start: usize, end: usize, positions: *std.ArrayList(QuestionEnding), gpa: Allocator) !void {
+    var s = start;
+    var e = end;
+    while (s < e and std.ascii.isWhitespace(transcript[s])) s += 1;
+    while (e > s and std.ascii.isWhitespace(transcript[e - 1])) e -= 1;
+    if (e <= s) return;
+    if (isSentenceOpener(transcript[s]) or std.mem.startsWith(u8, transcript[s..e], "“") or
+        std.mem.startsWith(u8, transcript[s..e], "‘")) return;
+    const terminal = transcript[e - 1];
+    const replace = terminal == ',' or terminal == '.';
+    // Only ASCII alphanumeric final bytes are safe insertion sites in this
+    // English-only pass. Do not append after quotes, brackets, dashes or ':' .
+    if (!replace and !std.ascii.isAlphanumeric(terminal)) return;
+    if (terminal == '.' and e >= s + 2 and transcript[e - 2] == '.') return;
+    if (reportingAttribution(transcript[s..e])) return;
+    var words: [ending_max_words][]const u8 = undefined;
+    const count = sentenceWords(transcript[s..e], &words);
+    const body = questionBody(words[0..count]);
+    // Direct auxiliary inversion can be recognized from an opening prefix.
+    // Long wh/free-relative and conditional-compatible openings still need
+    // more structure than this bounded pass can establish: abstain there.
+    if (count == ending_max_words and (body.len == 0 or !endingQuestionAuxiliary(body[0]) or
+        anyWord(body[0], &.{ "had", "were", "should" }))) return;
+    if (!interrogativeOpening(body)) return;
+    try positions.append(gpa, .{ .at = if (replace) e - 1 else e, .replace = replace });
+}
+
+fn sentenceWords(text: []const u8, out: *[ending_max_words][]const u8) usize {
+    var count: usize = 0;
+    var i: usize = 0;
+    while (i < text.len and count < ending_max_words) {
+        if (!endingWordByte(text[i])) {
+            i += 1;
+            continue;
+        }
+        const begin = i;
+        while (i < text.len and endingWordByte(text[i])) i += 1;
+        out[count] = text[begin..i];
+        count += 1;
+    }
+    return count;
+}
+
+// Strip only bounded discourse markers for classification, never source text.
+// Do not skip arbitrary words/letters: "Or D is ready" may be a statement.
+fn questionBody(words: []const []const u8) []const []const u8 {
+    var i: usize = 0;
+    var connectors: usize = 0;
+    while (i < words.len and i < 4) {
+        if (anyWord(words[i], &.{ "mm", "hmm", "um", "uh" })) {
+            i += 1;
+        } else if (connectors == 0 and anyWord(words[i], &.{ "and", "or", "but", "so" })) {
+            connectors += 1;
+            i += 1;
+        } else if (i + 1 < words.len and asciiEq(words[i], "i") and asciiEq(words[i + 1], "mean")) {
+            i += 2;
+        } else break;
+    }
+    return words[i..];
+}
+
+fn endingQuestionAuxiliary(word: []const u8) bool {
+    return anyWord(word, &ending_auxiliaries) or anyWord(word, &.{ "isn't", "aren't", "wasn't", "weren't", "don't", "doesn't", "didn't", "hasn't", "haven't", "hadn't", "can't", "couldn't", "won't", "wouldn't", "shouldn't", "mustn't" });
+}
+
+fn invertedSubject(words: []const []const u8) bool {
+    if (words.len < 2) return false; // subject plus predicate/complement
+    if (endingSubject(words[0])) return true;
+    return words.len >= 3 and anyWord(words[0], &.{ "the", "a", "an", "my", "your", "our", "his", "her", "their", "its" });
+}
+
+fn interrogativeOpening(words: []const []const u8) bool {
+    if (words.len < 2) return false;
+    const first = words[0];
+    const second = words[1];
+    // A second copula often signals a free-relative subject: "what is
+    // missing IS this". Do/have can instead be main verbs ("what did you do").
+    // Prefer false negatives to altering statements.
+    for (words[2..]) |word| if (anyWord(word, &.{ "am", "is", "are", "was", "were" })) {
+        // The one inversion verb in "what time IS it" is handled below.
+        if (endingQuestionAuxiliary(second) or
+            anyWord(first, &.{ "what's", "who's", "where's", "when's", "why's", "how's" })) return false;
+    };
+    if (anyWord(first, &ending_question_words)) {
+        // Short subject questions need no auxiliary. Keep the initial lexicon
+        // intentionally narrow; extra clauses such as "what happened was ..."
+        // must not be treated as direct questions.
+        if (anyWord(first, &.{ "what", "who" }) and anyWord(second, &.{ "happened", "called" })) {
+            return words.len == 2 or (words.len == 3 and anyWord(words[2], &.{ "today", "yesterday", "here", "there" }));
+        }
+        // Contracted openers ("what's", "where's", ...) embed the auxiliary;
+        // there is no separate inversion word to find.
+        if (std.mem.indexOfScalar(u8, first, '\'') != null or std.mem.indexOf(u8, first, "’") != null) return true;
+        if (anyWord(second, &ending_pronoun_subjects) or properSubject(second)) return false;
+        if (asciiEq(second, "to")) return false; // "how to ..." heading
+        if (asciiEq(second, "about") or asciiEq(second, "if")) return words.len >= 3;
+        if (endingQuestionAuxiliary(second)) return words.len >= 3;
+        // Bounded wh-phrase + inversion; never scan across an arbitrary
+        // subject clause ("what I need is this").
+        if (!anyWord(second, &.{ "time", "day", "year", "number", "color", "colour", "long", "far", "old", "often", "many", "much" })) return false;
+        if (words.len >= 4 and anyWord(words[2], &ending_auxiliaries) and endingSubject(words[3])) return true;
+        return false;
+    }
+    if (endingQuestionAuxiliary(first)) {
+        if (!invertedSubject(words[1..])) return false;
+        // Inverted conditional statements share an auxiliary-first opening.
+        if (anyWord(first, &.{ "had", "were", "should" })) {
+            for (words[2..]) |word| if (anyWord(word, &.{ "would", "could", "please" })) return false;
+        }
+        if (asciiEq(first, "do") and !anyWord(second, &do_question_subjects)) {
+            if (words.len < 4 or !anyWord(words[3], &.{ "pass", "work", "run", "need", "require", "include", "support", "exist", "match" })) return false;
+        }
+        if (asciiEq(first, "have") and !anyWord(second, &do_question_subjects)) {
+            if (words.len < 4 or !anyWord(words[3], &.{ "finished", "passed", "failed", "started", "stopped", "arrived", "changed", "been" })) return false;
+        }
+        return true;
+    }
+    return false;
+}
+
+/// Guards "What is the question, he asked." attribution tails: a short
+/// comma-separated trailing clause containing a reporting verb.
+fn reportingAttribution(segment: []const u8) bool {
+    var last_comma: ?usize = null;
+    for (segment, 0..) |c, index| {
+        if (c == ',') last_comma = index;
+    }
+    const split = last_comma orelse return false;
+    var words: [ending_max_words][]const u8 = undefined;
+    const count = sentenceWords(segment[split + 1 ..], &words);
+    if (count == 0 or count > 4) return false;
+    for (words[0..count]) |word| if (anyWord(word, &ending_reporting_verbs)) return true;
+    return false;
+}
+
+/// Parse, validate and render v2. Malformed or unsafe plans are rejected so
+/// the pipeline owner can apply raw fallback and record a transformation failure.
+pub fn llmFromJson(gpa: Allocator, transcript: []const u8, glossary: []const []const u8, json: []const u8) Error![]u8 {
+    const parsed = std.json.parseFromSlice(LlmPlan, gpa, json, .{ .ignore_unknown_fields = false }) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidPlan,
+    };
+    defer parsed.deinit();
+    return llm(gpa, transcript, glossary, parsed.value);
+}
+
+pub fn llm(gpa: Allocator, transcript: []const u8, glossary: []const []const u8, plan: LlmPlan) Error![]u8 {
+    const tokens = try tokenize(gpa, transcript);
+    defer gpa.free(tokens);
+    if (tokens.len == 0 or tokens.len > max_tokens) return error.InvalidPlan;
+    const operation_count = plan.deletions.len + plan.corrections.len + plan.punctuation.len + plan.paragraph_breaks.len + plan.lists.len;
+    if (plan.version != 2 or plan.deletions.len != 0 or operation_count > max_operations or (operation_count > 0 and hasDecorationOnlyChunk(transcript, tokens))) return error.InvalidPlan;
+    const protected = try protectionMap(gpa, transcript, tokens, glossary);
+    defer gpa.free(protected);
+    var deleted = try gpa.alloc(bool, tokens.len);
+    defer gpa.free(deleted);
+    @memset(deleted, false);
+    var previous_end: usize = 0;
+    for (plan.deletions) |d| {
+        if (d.start_token >= d.end_token or d.end_token > tokens.len or d.start_token < previous_end or !sourceEq(tokens[d.start_token..d.end_token], d.source)) return error.InvalidPlan;
+        for (d.start_token..d.end_token) |i| if (protected[i] or hasDecorationInside(transcript, tokens, i)) return error.InvalidPlan;
+        switch (d.kind) {
+            .filler => if (d.end_token != d.start_token + 1 or d.proof_start_token != d.start_token or d.proof_end_token != d.end_token or d.category != null or !asciiEq(d.cue, tokens[d.start_token].text) or !filler(tokens[d.start_token].text)) return error.InvalidPlan,
+            .repetition => {
+                const len = d.end_token - d.start_token;
+                if (len < 2 or len > 8 or d.category != null or !asciiEq(d.cue, "adjacent") or d.proof_end_token != d.start_token or d.proof_end_token > tokens.len or d.proof_start_token > d.proof_end_token or d.proof_end_token - d.proof_start_token != len or !rangesEqual(tokens[d.proof_start_token..d.proof_end_token], tokens[d.start_token..d.end_token])) return error.InvalidPlan;
+                for (d.proof_start_token..d.proof_end_token) |i| if (deleted[i]) return error.InvalidPlan;
+            },
+            .backtrack => {
+                if (d.end_token <= d.start_token + 1 or d.proof_start_token != d.end_token or d.proof_end_token != d.proof_start_token + 1 or d.proof_end_token > tokens.len or d.category == null or scalarCategory(tokens[d.start_token].text) != d.category or !sameScalar(tokens[d.start_token].text, tokens[d.proof_start_token].text, d.category) or !validCue(tokens, d.start_token + 1, d.end_token, d.cue) or protected[d.proof_start_token] or backtrackNegated(tokens, d.start_token)) return error.InvalidPlan;
+            },
+        }
+        for (d.start_token..d.end_token) |i| deleted[i] = true;
+        previous_end = d.end_token;
+    }
+    for (plan.deletions) |d| switch (d.kind) {
+        .filler => {},
+        .repetition, .backtrack => for (d.proof_start_token..d.proof_end_token) |i| if (deleted[i]) return error.InvalidPlan,
+    };
+    var survivors: usize = 0;
+    for (deleted) |x| survivors += @intFromBool(!x);
+    if (survivors == 0) return error.InvalidPlan;
+    // Corrections remain intentionally narrow. Rendering support is compiled
+    // separately below; overlap with deletion is forbidden.
+    previous_end = 0;
+    for (plan.corrections) |c| {
+        if (c.start_token >= c.end_token or c.end_token > tokens.len or c.start_token < previous_end or !sourceEq(tokens[c.start_token..c.end_token], c.source) or !validReplacement(c.replacement)) return error.InvalidPlan;
+        for (c.start_token..c.end_token) |i| if (deleted[i] or tokens[i].protected or technical(tokens[i].text) or hasUnsafeDecoration(transcript, tokens, i) or (protected[i] and c.kind != .glossary) or (i + 1 < c.end_token and hasInternalDecoration(transcript, tokens[i], tokens[i + 1]))) return error.InvalidPlan;
+        const ok = switch (c.kind) {
+            .case => c.end_token == c.start_token + 1 and !allUppercaseAscii(tokens[c.start_token].text) and oneWord(c.replacement) and asciiEq(c.source, c.replacement),
+            .glossary => c.end_token - c.start_token <= 4 and glossaryCorrection(c.source, c.replacement, glossary),
+            .orthographic => c.end_token == c.start_token + 1 and oneWord(c.replacement) and orthographic(c.source, c.replacement),
+        };
+        if (!ok) return error.InvalidPlan;
+        previous_end = c.end_token;
+    }
+    // Pairwise correction/deletion overlap was checked above. Every other anchor
+    // must be sorted, in range, and point at a surviving source token.
+    var last: ?usize = null;
+    for (plan.punctuation) |p| {
+        if (p.after_token >= tokens.len or deleted[p.after_token] or tokens[p.after_token].protected or hasUnsafeDecoration(transcript, tokens, p.after_token) or punctuationSplitsClause(tokens, p.after_token) or (technical(tokens[p.after_token].text) and hasFixedTrailingPunctuation(transcript, tokens[p.after_token])) or (last != null and p.after_token <= last.?)) return error.InvalidPlan;
+        for (plan.corrections) |c| if (p.after_token >= c.start_token and p.after_token + 1 < c.end_token) return error.InvalidPlan;
+        last = p.after_token;
+    }
+    if (!strictAnchors(plan.paragraph_breaks, tokens.len, deleted, protected)) return error.InvalidPlan;
+    var list_end: usize = 0;
+    var item_total: usize = 0;
+    for (plan.lists) |list| {
+        item_total += list.items.len;
+        if (list.start_token >= list.end_token or list.end_token > tokens.len or list.start_token < list_end or list.items.len < 2 or item_total > max_list_items or list.items[0].start_token != list.start_token or !strictListItems(list.items, list.start_token, list.end_token, deleted, protected) or !validListEvidence(tokens, list) or protectedLayoutBoundary(list.start_token, deleted, protected) or reportingListContext(transcript, tokens, list.start_token) or (list.end_token < tokens.len and protectedLayoutBoundary(list.end_token, deleted, protected))) return error.InvalidPlan;
+        for (list.items) |item| if (hasLocalListMarker(transcript, tokens[item.start_token])) return error.InvalidPlan;
+        list_end = list.end_token;
+    }
+    for (plan.paragraph_breaks) |a| for (plan.corrections) |c| if (a > c.start_token and a < c.end_token) return error.InvalidPlan;
+    for (plan.lists) |list| {
+        for (list.items) |item| for (plan.corrections) |c| if (item.start_token > c.start_token and item.start_token < c.end_token) return error.InvalidPlan;
+        for (plan.corrections) |c| if (list.end_token > c.start_token and list.end_token < c.end_token) return error.InvalidPlan;
+    }
+
+    return renderLlm(gpa, transcript, tokens, deleted, plan);
+}
+
+fn punctuationSplitsClause(tokens: []const Token, after: usize) bool {
+    if (after + 1 >= tokens.len or !questionSubject(tokens[after + 1].text)) return false;
+    return asciiEq(tokens[after].text, "if") or questionAuxiliary(tokens[after].text);
+}
+
+pub fn tokenize(gpa: Allocator, text: []const u8) Error![]Token {
+    var out: std.ArrayList(Token) = .empty;
+    defer out.deinit(gpa);
+    var i: usize = 0;
+    var quote: u8 = 0;
+    var curly_quote: u8 = 0;
+    while (i < text.len) {
+        while (i < text.len and std.ascii.isWhitespace(text[i])) i += 1;
+        if (i == text.len) break;
+        const raw_start = i;
+        while (i < text.len and !std.ascii.isWhitespace(text[i])) i += 1;
+        var s = raw_start;
+        var e = i;
+        var protected = quote != 0 or curly_quote != 0;
+        var q = s;
+        while (q < e) : (q += 1) {
+            const c = text[q];
+            if (c == '`' or c == '"' or (c == '\'' and !(q > 0 and q + 1 < text.len and std.ascii.isAlphanumeric(text[q - 1]) and std.ascii.isAlphanumeric(text[q + 1])))) {
+                protected = true;
+                quote = if (quote == c) 0 else if (quote == 0) c else quote;
+            } else if (q + 2 < e and c == 0xe2 and text[q + 1] == 0x80 and text[q + 2] >= 0x98 and text[q + 2] <= 0x9d) {
+                // U+2019 inside a word is an apostrophe, not a quote boundary.
+                // Do not close an enclosing quotation or protect the rest of
+                // an otherwise unquoted sentence because of a contraction.
+                if (internalApostropheWidth(text, q) == 3) {
+                    q += 2;
+                    continue;
+                }
+                protected = true;
+                curly_quote = switch (text[q + 2]) {
+                    0x98 => 0x99,
+                    0x9c => 0x9d,
+                    0x99, 0x9d => 0,
+                    else => curly_quote,
+                };
+                q += 2;
+            }
+        }
+        while (s < e and edgeWidth(text[s..e], true) > 0) s += edgeWidth(text[s..e], true);
+        while (e > s and edgeWidth(text[s..e], false) > 0) e -= edgeWidth(text[s..e], false);
+        if (s < e) try out.append(gpa, .{ .text = text[s..e], .start = s, .end = e, .protected = protected });
+        if (out.items.len > max_tokens) return error.TranscriptTooLarge;
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+fn appendCleanToken(out: *std.ArrayList(u8), gpa: Allocator, source: []const u8, tokens: []const Token, index: usize, spelling: []const usize) !void {
+    const token = tokens[index];
+    try out.appendSlice(gpa, source[tokenChunkStart(source, token)..token.start]);
+    try out.appendSlice(gpa, tokens[spelling[index]].text);
+    try out.appendSlice(gpa, source[token.end..tokenChunkEnd(source, token)]);
+}
+
+fn renderClean(gpa: Allocator, source: []const u8, tokens: []const Token, deleted: []const bool, spelling: []const usize) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    var first: usize = 0;
+    while (deleted[first]) first += 1;
+    const first_start = tokenChunkStart(source, tokens[first]);
+    if (first == 0) try out.appendSlice(gpa, source[0..first_start]);
+    try appendCleanToken(&out, gpa, source, tokens, first, spelling);
+    var previous = first;
+    var i = first + 1;
+    while (i < tokens.len) : (i += 1) {
+        if (deleted[i]) continue;
+        var crossed_deletion = false;
+        for (previous + 1..i) |between| crossed_deletion = crossed_deletion or deleted[between];
+        const gap = source[tokenChunkEnd(source, tokens[previous])..tokenChunkStart(source, tokens[i])];
+        if (crossed_deletion) {
+            var newlines: usize = 0;
+            for (gap) |c| newlines += @intFromBool(c == '\n');
+            try out.appendSlice(gpa, if (newlines >= 2) "\n\n" else if (newlines == 1) "\n" else " ");
+        } else {
+            try out.appendSlice(gpa, gap);
+        }
+        try appendCleanToken(&out, gpa, source, tokens, i, spelling);
+        previous = i;
+    }
+    var deleted_after = false;
+    for (previous + 1..tokens.len) |after| deleted_after = deleted_after or deleted[after];
+    if (!deleted_after) try out.appendSlice(gpa, source[tokenChunkEnd(source, tokens[previous])..]);
+    return out.toOwnedSlice(gpa);
+}
+fn renderLlm(gpa: Allocator, source: []const u8, tokens: []const Token, deleted: []const bool, plan: LlmPlan) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    var ci: usize = 0;
+    var pi: usize = 0;
+    var previous: ?usize = null;
+    var i: usize = 0;
+    while (i < tokens.len) {
+        if (deleted[i]) {
+            i += 1;
+            continue;
+        }
+
+        const gap_start = if (previous) |token| tokenChunkEnd(source, tokens[token]) else 0;
+        const gap_end = tokenChunkStart(source, tokens[i]);
+        const search_start = if (previous) |token| token + 1 else 0;
+        var first_deleted: ?usize = null;
+        for (search_start..i) |between| if (deleted[between]) {
+            first_deleted = between;
+            break;
+        };
+        const breaks = layoutAt(plan, i);
+        if (breaks > 0) {
+            if (previous != null) try out.appendSlice(gpa, if (breaks == 2) "\n\n" else "\n");
+        } else if (first_deleted) |deleted_token| {
+            if (previous != null) try out.appendSlice(gpa, source[gap_start..tokenChunkStart(source, tokens[deleted_token])]);
+        } else {
+            try out.appendSlice(gpa, source[gap_start..gap_end]);
+        }
+        if (listItem(plan.lists, i)) |item| switch (item.kind) {
+            .bullet => try out.appendSlice(gpa, "- "),
+            .numbered => {
+                var buffer: [24]u8 = undefined;
+                const marker = std.fmt.bufPrint(&buffer, "{d}. ", .{item.number}) catch unreachable;
+                try out.appendSlice(gpa, marker);
+            },
+        };
+        var last = i;
+        const leading_start = tokenChunkStart(source, tokens[i]);
+        try out.appendSlice(gpa, source[leading_start..tokens[i].start]);
+        if (ci < plan.corrections.len and plan.corrections[ci].start_token == i) {
+            const c = plan.corrections[ci];
+            try out.appendSlice(gpa, c.replacement);
+            last = c.end_token - 1;
+            i = c.end_token;
+            ci += 1;
+        } else {
+            try out.appendSlice(gpa, tokens[i].text);
+            i += 1;
+        }
+        var mark: ?PunctuationMark = null;
+        if (pi < plan.punctuation.len and plan.punctuation[pi].after_token == last) {
+            mark = plan.punctuation[pi].mark;
+            pi += 1;
+        }
+        const end = tokenChunkEnd(source, tokens[last]);
+        try appendPunctuation(&out, gpa, source[tokens[last].end..end], mark);
+        previous = last;
+    }
+    if (ci != plan.corrections.len or pi != plan.punctuation.len) return error.InvalidPlan;
+    if (previous) |token| {
+        var deleted_after = false;
+        for (token + 1..tokens.len) |after| deleted_after = deleted_after or deleted[after];
+        if (!deleted_after) try out.appendSlice(gpa, source[tokenChunkEnd(source, tokens[token])..]);
+    }
+    return out.toOwnedSlice(gpa);
+}
+const ListItemInfo = struct { kind: ListKind, number: usize };
+fn listItem(lists: []const List, token: usize) ?ListItemInfo {
+    for (lists) |l| for (l.items, 0..) |item, i| if (item.start_token == token) return .{ .kind = l.kind, .number = i + 1 };
+    return null;
+}
+fn layoutAt(plan: LlmPlan, token: usize) u2 {
+    for (plan.paragraph_breaks) |x| if (x == token) return 2;
+    if (listItem(plan.lists, token) != null) return 1;
+    for (plan.lists) |l| if (l.end_token == token) return 1;
+    return 0;
+}
+fn appendPunctuation(out: *std.ArrayList(u8), gpa: Allocator, s: []const u8, mark: ?PunctuationMark) !void {
+    var put = false;
+    for (s) |c| {
+        if (mark != null and std.mem.indexOfScalar(u8, ".,?!:;", c) != null) {
+            if (!put) try out.append(gpa, punctuation(mark.?));
+            put = true;
+        } else try out.append(gpa, c);
+    }
+    if (mark != null and !put) try out.append(gpa, punctuation(mark.?));
+}
+fn punctuation(m: PunctuationMark) u8 {
+    return switch (m) {
+        .period => '.',
+        .comma => ',',
+        .question => '?',
+        .exclamation => '!',
+        .colon => ':',
+        .semicolon => ';',
+    };
+}
+fn tokenChunkStart(source: []const u8, t: Token) usize {
+    var s = t.start;
+    while (s > 0 and !std.ascii.isWhitespace(source[s - 1])) s -= 1;
+    return s;
+}
+fn tokenChunkEnd(source: []const u8, t: Token) usize {
+    var e = t.end;
+    while (e < source.len and !std.ascii.isWhitespace(source[e])) e += 1;
+    return e;
+}
+fn hasDecorationInside(source: []const u8, tokens: []const Token, i: usize) bool {
+    const s = tokenChunkStart(source, tokens[i]);
+    const e = tokenChunkEnd(source, tokens[i]);
+    for (source[s..tokens[i].start]) |c| if (!std.ascii.isWhitespace(c)) return true;
+    for (source[tokens[i].end..e]) |c| if (!std.ascii.isWhitespace(c)) return true;
+    return false;
+}
+fn hasUnsafeDecoration(source: []const u8, tokens: []const Token, i: usize) bool {
+    const s = tokenChunkStart(source, tokens[i]);
+    const e = tokenChunkEnd(source, tokens[i]);
+    for (source[s..tokens[i].start]) |c| if (!std.ascii.isWhitespace(c) and std.mem.indexOfScalar(u8, ".,?!:;", c) == null) return true;
+    for (source[tokens[i].end..e]) |c| if (!std.ascii.isWhitespace(c) and std.mem.indexOfScalar(u8, ".,?!:;", c) == null) return true;
+    return false;
+}
+fn hasFixedTrailingPunctuation(source: []const u8, token: Token) bool {
+    const end = tokenChunkEnd(source, token);
+    for (source[token.end..end]) |c| if (std.mem.indexOfScalar(u8, ".,?!:;", c) != null) return true;
+    return false;
+}
+fn hasDecorationOnlyChunk(source: []const u8, tokens: []const Token) bool {
+    var token_index: usize = 0;
+    var i: usize = 0;
+    while (i < source.len) {
+        while (i < source.len and std.ascii.isWhitespace(source[i])) i += 1;
+        if (i == source.len) break;
+        const start = i;
+        while (i < source.len and !std.ascii.isWhitespace(source[i])) i += 1;
+        while (token_index < tokens.len and tokens[token_index].end <= start) token_index += 1;
+        if (token_index == tokens.len or tokens[token_index].start >= i) return true;
+    }
+    return false;
+}
+fn hasLocalListMarker(source: []const u8, token: Token) bool {
+    const start = tokenChunkStart(source, token);
+    const end = tokenChunkEnd(source, token);
+    const chunk = source[start..end];
+    if (std.mem.eql(u8, chunk, "-") or std.mem.eql(u8, chunk, "*")) return true;
+    if (!scalarNumber(token.text)) return false;
+    const suffix = source[token.end..end];
+    return std.mem.eql(u8, suffix, ".") or std.mem.eql(u8, suffix, ")");
+}
+fn hasInternalDecoration(source: []const u8, a: Token, b: Token) bool {
+    for (source[a.end..b.start]) |c| if (!std.ascii.isWhitespace(c)) return true;
+    return false;
+}
+fn edgeWidth(s: []const u8, leading: bool) usize {
+    const c = if (leading) s[0] else s[s.len - 1];
+    if (std.mem.indexOfScalar(u8, ".,?!:;\"'()[]{}<>*`", c) != null) return 1;
+    if (s.len >= 3) {
+        const p = if (leading) 0 else s.len - 3;
+        if (s[p] == 0xe2 and s[p + 1] == 0x80 and s[p + 2] >= 0x98 and s[p + 2] <= 0x9d) return 3;
+    }
+    return 0;
+}
+fn filler(s: []const u8) bool {
+    if (allUppercaseAscii(s)) return false;
+    return asciiEq(s, "um") or asciiEq(s, "uh") or asciiEq(s, "er") or asciiEq(s, "erm");
+}
+fn allUppercaseAscii(s: []const u8) bool {
+    var letters: usize = 0;
+    for (s) |c| {
+        if (!std.ascii.isAlphabetic(c)) continue;
+        letters += 1;
+        if (!std.ascii.isUpper(c)) return false;
+    }
+    return letters > 0;
+}
+fn asciiEq(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |x, y| if (std.ascii.toLower(x) != std.ascii.toLower(y)) return false;
+    return true;
+}
+fn scalarNumber(s: []const u8) bool {
+    return validNumberCore(s);
+}
+fn scalarCategory(s: []const u8) ?ScalarCategory {
+    if (weekday(s)) return .weekday;
+    if (scalarNumber(s)) return .number;
+    if (quantityParts(s) != null) return .quantity;
+    return null;
+}
+fn weekday(s: []const u8) bool {
+    for ([_][]const u8{ "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday" }) |x| if (asciiEq(s, x)) return true;
+    return false;
+}
+fn sameScalar(a: []const u8, b: []const u8, cat: ?ScalarCategory) bool {
+    if (cat == null or scalarCategory(b) != cat) return false;
+    return switch (cat.?) {
+        .number, .weekday => true,
+        .quantity => quantityShape(a, b),
+    };
+}
+fn quantityShape(a: []const u8, b: []const u8) bool {
+    const ap = quantityParts(a) orelse return false;
+    const bp = quantityParts(b) orelse return false;
+    return asciiEq(ap.prefix, bp.prefix) and asciiEq(ap.suffix, bp.suffix);
+}
+const QuantityParts = struct { prefix: []const u8, suffix: []const u8 };
+fn quantityParts(s: []const u8) ?QuantityParts {
+    const prefixes = [_][]const u8{ "$", "£", "€" };
+    for (prefixes) |prefix| if (std.mem.startsWith(u8, s, prefix) and validNumberCore(s[prefix.len..])) return .{ .prefix = prefix, .suffix = "" };
+    const suffixes = [_][]const u8{ "%", "g", "kg", "mg", "lb", "lbs", "oz", "mm", "cm", "m", "km", "ml", "l", "ms", "s", "h", "hz", "khz", "mb", "gb", "tb" };
+    for (suffixes) |suffix| if (s.len > suffix.len and endsWithIgnoreCase(s, suffix) and validNumberCore(s[0 .. s.len - suffix.len])) return .{ .prefix = "", .suffix = s[s.len - suffix.len ..] };
+    return null;
+}
+fn validNumberCore(s: []const u8) bool {
+    if (s.len == 0) return false;
+    const dot = std.mem.indexOfScalar(u8, s, '.');
+    if (dot != null and std.mem.indexOfScalar(u8, s[dot.? + 1 ..], '.') != null) return false;
+    const integer = if (dot) |at| s[0..at] else s;
+    const fraction = if (dot) |at| s[at + 1 ..] else "";
+    if (integer.len == 0 or (dot != null and fraction.len == 0)) return false;
+    for (fraction) |c| if (!std.ascii.isDigit(c)) return false;
+    if (std.mem.indexOfScalar(u8, integer, ',')) |first_comma| {
+        if (first_comma == 0 or first_comma > 3) return false;
+        for (integer[0..first_comma]) |c| if (!std.ascii.isDigit(c)) return false;
+        var group = first_comma;
+        while (group < integer.len) : (group += 4) {
+            if (group + 4 > integer.len or integer[group] != ',') return false;
+            for (integer[group + 1 .. group + 4]) |c| if (!std.ascii.isDigit(c)) return false;
+        }
+        return true;
+    }
+    for (integer) |c| if (!std.ascii.isDigit(c)) return false;
+    return true;
+}
+fn endsWithIgnoreCase(s: []const u8, suffix: []const u8) bool {
+    return s.len >= suffix.len and asciiEq(s[s.len - suffix.len ..], suffix);
+}
+fn horizontalGap(gap: []const u8) bool {
+    if (gap.len == 0) return false;
+    for (gap) |c| if (c != ' ' and c != '\t') return false;
+    return true;
+}
+fn internalApostropheWidth(text: []const u8, index: usize) usize {
+    const width: usize = if (text[index] == '\'') 1 else if (std.mem.startsWith(u8, text[index..], "’")) 3 else return 0;
+    if (index == 0 or index + width >= text.len) return 0;
+    return if (std.ascii.isAlphanumeric(text[index - 1]) and std.ascii.isAlphanumeric(text[index + width])) width else 0;
+}
+
+fn proseWord(text: []const u8) bool {
+    if (text.len == 0) return false;
+    var i: usize = 0;
+    while (i < text.len) {
+        if (std.ascii.isAlphabetic(text[i])) {
+            i += 1;
+        } else {
+            const width = internalApostropheWidth(text, i);
+            if (width == 0) return false;
+            i += width;
+        }
+    }
+    return true;
+}
+// Context belongs to the whole source run even when an earlier copy was
+// protected rather than deleted. Otherwise later copies can bypass a guard.
+fn repetitionContextStart(source: []const u8, tokens: []const Token, omitted: []const bool, index: usize) usize {
+    var start = index;
+    while (previousContextToken(source, tokens, omitted, start)) |previous| {
+        if (!asciiEq(tokens[previous].text, tokens[index].text)) break;
+        start = previous;
+    }
+    return start;
+}
+
+fn repetitionContextEnd(source: []const u8, tokens: []const Token, omitted: []const bool, index: usize) usize {
+    var last = index;
+    while (nextContextToken(source, tokens, omitted, last)) |next| {
+        if (!asciiEq(tokens[next].text, tokens[index].text)) break;
+        last = next;
+    }
+    return last;
+}
+
+// Lowercase a/i can be articles/pronouns or literal letters. Preserve a run
+// adjacent to another letter or a digit token so spelling "g a a" or "a a 9"
+// is never mistaken for a prose stutter.
+fn spelledLetterContext(source: []const u8, tokens: []const Token, omitted: []const bool, index: usize) bool {
+    if (tokens[index].text.len != 1) return false;
+    const last = repetitionContextEnd(source, tokens, omitted, index);
+    if (previousContextToken(source, tokens, omitted, index)) |previous| {
+        if (letterOrDigits(tokens[previous].text)) return true;
+    }
+    const next = nextContextToken(source, tokens, omitted, last) orelse return false;
+    return letterOrDigits(tokens[next].text);
+}
+fn letterOrDigits(text: []const u8) bool {
+    return (text.len == 1 and std.ascii.isAlphabetic(text[0])) or (text.len > 0 and std.ascii.isDigit(text[0]));
+}
+fn commaOrSpaceGap(source: []const u8, left: Token, right: Token) bool {
+    const end = tokenChunkEnd(source, left);
+    const suffix = source[left.end..end];
+    return (suffix.len == 0 or std.mem.eql(u8, suffix, ",")) and horizontalGap(source[end..right.start]);
+}
+
+fn nextContextToken(source: []const u8, tokens: []const Token, deleted: []const bool, index: usize) ?usize {
+    var previous = index;
+    while (previous + 1 < tokens.len) {
+        const next = previous + 1;
+        if (!commaOrSpaceGap(source, tokens[previous], tokens[next])) return null;
+        if (!deleted[next]) return next;
+        previous = next;
+    }
+    return null;
+}
+
+// Context follows surviving words, but deletion must not erase evidence of
+// a sentence/line boundary. Each original gap is checked while skipping.
+fn previousContextToken(source: []const u8, tokens: []const Token, deleted: []const bool, index: usize) ?usize {
+    var previous = index;
+    while (previous > 0) {
+        previous -= 1;
+        if (!commaOrSpaceGap(source, tokens[previous], tokens[previous + 1])) return null;
+        if (!deleted[previous]) return previous;
+    }
+    return null;
+}
+
+fn stutterWord(text: []const u8) bool {
+    // This is an English prose heuristic, not inference of speaker intent.
+    // Keep digits, identifiers, acronyms, and spelled-out letter sequences.
+    if (!proseWord(text)) return false;
+    // "a a batteries" can be AA, not a repeated article. A neighboring
+    // third letter is not required for this ambiguity. Only the pronoun I
+    // remains eligible, subject to the spelling safeguard.
+    if (text.len == 1) return asciiEq(text, "i");
+    for (text[1..]) |c| if (std.ascii.isUpper(c)) return false;
+    // Object/possessive "her" and auxiliary/copular verbs can legitimately
+    // repeat with different roles: "her her book", "what it is is unclear",
+    // "I do do that", "they can can tomatoes". Without grammatical parsing,
+    // preserve these even when they could also be an accidental stutter.
+    for ([_][]const u8{
+        "her",   "am",   "are",   "is",     "was",  "were",  "be",  "been",  "being",
+        "have",  "has",  "had",   "do",     "does", "did",   "can", "could", "may",
+        "might", "must", "shall", "should", "will", "would",
+        // Conjunctions can themselves name operators without quotes:
+        // "both and and or operators". Keep this closed class ambiguous.
+        "and", "or",
+    }) |word| if (asciiEq(text, word)) return false;
+    // Explicit emphasis, grammatical, and numeric exceptions. No inference
+    // of unlisted intentional repetitions is attempted. Quotes and glossary
+    // spans are protected separately by the caller.
+    for ([_][]const u8{
+        "no",      "not",     "never",    "yes",      "very",     "really",  "so",      "too",       "more",     "less",
+        "much",    "quite",   "that",     "had",      "bye",      "go",      "hear",    "knock",     "bang",     "zero",
+        "oh",      "one",     "two",      "three",    "four",     "five",    "six",     "seven",     "eight",    "nine",
+        "ten",     "eleven",  "twelve",   "thirteen", "fourteen", "fifteen", "sixteen", "seventeen", "eighteen", "nineteen",
+        "twenty",  "thirty",  "forty",    "fifty",    "sixty",    "seventy", "eighty",  "ninety",    "hundred",  "thousand",
+        "million", "billion", "trillion",
+        // Quantifiers can intensify even before connectors: "many many of".
+        "many",     "few",      "fewer",   "fewest",  "little",    "most",     "least",
+        "some",    "any",     "all",      "both",     "each",     "every",   "either",  "neither",   "enough",   "several",
+    }) |word| if (asciiEq(text, word)) return false;
+    return true;
+}
+fn cleanRangesEqual(source: []const u8, tokens: []const Token, deleted: []const bool, protected: []const bool, indexes: []const usize, a: usize, b: usize, len: usize) bool {
+    // Check original gaps even around removed words. A removed filler/stutter
+    // may carry a comma, but never erase a sentence or line boundary.
+    for (indexes[a]..indexes[b + len - 1]) |i| {
+        if (deleted[i]) {
+            if (!commaOrSpaceGap(source, tokens[i], tokens[i + 1])) return false;
+        } else if (!horizontalGap(source[tokens[i].end..tokens[i + 1].start])) return false;
+    }
+    for (0..len) |j| {
+        const left = indexes[a + j];
+        const right = indexes[b + j];
+        if (deleted[left] or deleted[right] or protected[left] or protected[right] or hasDecorationInside(source, tokens, left) or hasDecorationInside(source, tokens, right) or !asciiEq(tokens[left].text, tokens[right].text)) return false;
+    }
+    return true;
+}
+fn technical(s: []const u8) bool {
+    return std.mem.indexOf(u8, s, "://") != null or std.mem.indexOfScalar(u8, s, '@') != null or std.mem.indexOfScalar(u8, s, '/') != null or std.mem.indexOfScalar(u8, s, '\\') != null or std.mem.indexOfScalar(u8, s, '_') != null;
+}
+fn inGlossary(s: []const u8, g: []const []const u8) bool {
+    for (g) |x| if (asciiEq(s, x)) return true;
+    return false;
+}
+fn sourceEq(ts: []const Token, s: []const u8) bool {
+    var p: usize = 0;
+    for (ts, 0..) |t, i| {
+        if (i > 0) {
+            if (p >= s.len or s[p] != ' ') return false;
+            p += 1;
+        }
+        if (p + t.text.len > s.len or !std.mem.eql(u8, s[p .. p + t.text.len], t.text)) return false;
+        p += t.text.len;
+    }
+    return p == s.len;
+}
+fn rangesEqual(a: []const Token, b: []const Token) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |x, y| if (!asciiEq(x.text, y.text)) return false;
+    return true;
+}
+fn compactEq(a: []const u8, b: []const u8) bool {
+    var i: usize = 0;
+    var j: usize = 0;
+    while (true) {
+        while (i < a.len and (a[i] == ' ' or a[i] == '-' or a[i] == '_')) i += 1;
+        while (j < b.len and (b[j] == ' ' or b[j] == '-' or b[j] == '_')) j += 1;
+        if (i == a.len or j == b.len) return i == a.len and j == b.len;
+        if (std.ascii.toLower(a[i]) != std.ascii.toLower(b[j])) return false;
+        i += 1;
+        j += 1;
+    }
+}
+fn validCue(t: []const Token, s: usize, e: usize, cue: []const u8) bool {
+    if (s >= e or !sourceEq(t[s..e], cue)) return false;
+    return asciiEq(cue, "actually") or asciiEq(cue, "correction") or asciiEq(cue, "scratch that") or asciiEq(cue, "make that");
+}
+fn backtrackNegated(tokens: []const Token, scalar: usize) bool {
+    const start = scalar -| 4;
+    for (tokens[start..scalar]) |token| if (isNegator(token.text)) return true;
+    return false;
+}
+fn isNegator(text: []const u8) bool {
+    for ([_][]const u8{ "no", "not", "never", "none", "without", "neither", "nor", "cannot" }) |word| if (asciiEq(text, word)) return true;
+    if (text.len >= 3 and std.ascii.toLower(text[text.len - 3]) == 'n' and text[text.len - 2] == '\'' and std.ascii.toLower(text[text.len - 1]) == 't') return true;
+    const curly_apostrophe = "’";
+    return text.len >= curly_apostrophe.len + 2 and
+        std.ascii.toLower(text[text.len - curly_apostrophe.len - 2]) == 'n' and
+        std.mem.eql(u8, text[text.len - curly_apostrophe.len - 1 .. text.len - 1], curly_apostrophe) and
+        std.ascii.toLower(text[text.len - 1]) == 't';
+}
+fn protectionMap(gpa: Allocator, source: []const u8, tokens: []const Token, glossary: []const []const u8) ![]bool {
+    var p = try gpa.alloc(bool, tokens.len);
+    @memset(p, false);
+    for (tokens, 0..) |t, i| {
+        // Fixed prose punctuation remains editable. Quotes, code marks,
+        // brackets, emphasis, and other technical decorations do not.
+        p[i] = t.protected or technical(t.text) or hasUnsafeDecoration(source, tokens, i);
+    }
+    for (glossary) |term| {
+        var n: usize = 1;
+        for (term) |c| n += @intFromBool(std.ascii.isWhitespace(c));
+        if (n > 4) continue;
+        var i: usize = 0;
+        while (i + n <= tokens.len) : (i += 1) {
+            if (sourceEqFold(tokens[i .. i + n], term)) for (i..i + n) |j| {
+                p[j] = true;
+            };
+        }
+    }
+    return p;
+}
+fn sourceEqFold(ts: []const Token, s: []const u8) bool {
+    var p: usize = 0;
+    for (ts, 0..) |t, i| {
+        if (i > 0) {
+            while (p < s.len and std.ascii.isWhitespace(s[p])) p += 1;
+        }
+        if (p + t.text.len > s.len or !asciiEq(s[p .. p + t.text.len], t.text)) return false;
+        p += t.text.len;
+    }
+    return p == s.len;
+}
+fn validReplacement(s: []const u8) bool {
+    if (s.len == 0 or s.len > 256 or !std.unicode.utf8ValidateSlice(s) or std.ascii.isWhitespace(s[0]) or std.ascii.isWhitespace(s[s.len - 1])) return false;
+    for (s) |c| if (std.ascii.isControl(c)) return false;
+    return true;
+}
+fn oneWord(s: []const u8) bool {
+    for (s) |c| if (std.ascii.isWhitespace(c)) return false;
+    return true;
+}
+fn glossaryCorrection(a: []const u8, b: []const u8, g: []const []const u8) bool {
+    var exact = false;
+    for (g) |x| {
+        if (std.mem.eql(u8, x, b)) exact = true;
+    }
+    return exact and compactEq(a, b);
+}
+fn orthographic(a: []const u8, b: []const u8) bool {
+    const Pair = struct { source: []const u8, replacement: []const u8 };
+    // Intentionally empty for the initial v2 contract. New pairs require an
+    // explicit deterministic fixture; edit distance alone is never authority.
+    const allowlist: []const Pair = &.{};
+    for (allowlist) |pair| if (asciiEq(a, pair.source) and std.mem.eql(u8, b, pair.replacement)) return true;
+    return false;
+}
+fn strictAnchors(v: []const usize, len: usize, deleted: []const bool, protected: []const bool) bool {
+    var p: usize = 0;
+    for (v) |x| {
+        if (x == 0 or x >= len or x <= p or protectedLayoutBoundary(x, deleted, protected)) return false;
+        p = x;
+    }
+    return true;
+}
+fn strictListItems(v: []const ListAnchor, start: usize, end: usize, deleted: []const bool, protected: []const bool) bool {
+    var p: ?usize = null;
+    for (v) |item| {
+        const x = item.start_token;
+        if (x < start or x >= end or protectedLayoutBoundary(x, deleted, protected) or (p != null and x <= p.?)) return false;
+        p = x;
+    }
+    return true;
+}
+
+fn validListEvidence(tokens: []const Token, list: List) bool {
+    var ordinal_expected: usize = 1;
+    var ordinal_proof = true;
+    for (list.items) |item| {
+        if (ordinal(tokens[item.start_token].text) != ordinal_expected) {
+            ordinal_proof = false;
+            break;
+        }
+        ordinal_expected += 1;
+    }
+    if (ordinal_proof) return true;
+
+    if (list.end_token != tokens.len) return false;
+    var count: ?usize = null;
+    var demonstrative = false;
+    var i: usize = 0;
+    while (i + 1 < list.start_token) : (i += 1) {
+        if (numberWord(tokens[i].text)) |candidate| {
+            if (countedListNoun(tokens[i + 1].text) and countedListStart(tokens, i + 1) == list.start_token) {
+                count = candidate;
+                break;
+            }
+        }
+        if (asciiEq(tokens[i].text, "these") and countedListNoun(tokens[i + 1].text) and countedListStart(tokens, i + 1) == list.start_token) {
+            demonstrative = true;
+            break;
+        }
+    }
+    const expected_count = count orelse if (demonstrative and list.items.len >= 3) list.items.len else return false;
+    if (list.items.len != expected_count) return false;
+    const remaining = list.end_token - list.start_token;
+    const has_and = remaining >= 3 and asciiEq(tokens[list.end_token - 2].text, "and");
+    const item_count = remaining - @intFromBool(has_and);
+    if (item_count == expected_count) {
+        for (list.items, 0..) |item, item_index| {
+            const expected = if (has_and and item_index == expected_count - 1) list.end_token - 2 else list.start_token + item_index;
+            if (item.start_token != expected) return false;
+        }
+        return true;
+    }
+    if (has_and or remaining != expected_count * 2) return false;
+    for (list.items, 0..) |item, item_index| {
+        const expected = list.start_token + item_index * 2;
+        if (item.start_token != expected or !asciiEq(tokens[item.start_token].text, tokens[list.start_token].text)) return false;
+    }
+    return true;
+}
+fn protectedLayoutBoundary(token: usize, deleted: []const bool, protected: []const bool) bool {
+    if (deleted[token] or protected[token]) return true;
+    var previous = token;
+    while (previous > 0) {
+        previous -= 1;
+        if (!deleted[previous]) return protected[previous];
+    }
+    return false;
+}
+
+fn reportingListContext(source: []const u8, tokens: []const Token, start: usize) bool {
+    if (start == 0) return false;
+    var i = start;
+    while (i > 0) {
+        i -= 1;
+        if (hasFixedTrailingPunctuation(source, tokens[i])) break;
+        for ([_][]const u8{ "say", "says", "said", "read", "reads", "quote", "quoted", "quotation" }) |word| if (asciiEq(tokens[i].text, word)) return true;
+    }
+    return false;
+}
+
+test "clean filler repetition scalar correction and protections" {
+    const a = std.testing.allocator;
+    const x = try clean(a, "um go to go to work", &.{});
+    defer a.free(x);
+    try std.testing.expectEqualStrings("go to work", x);
+    const y = try clean(a, "set 10 scratch that 12", &.{});
+    defer a.free(y);
+    try std.testing.expectEqualStrings("set 12", y);
+    const z = try clean(a, "say `um` and \"uh\" not 4", &.{});
+    defer a.free(z);
+    try std.testing.expectEqualStrings("say `um` and \"uh\" not 4", z);
+}
+test "single repeats and ambiguous actually survive" {
+    const a = std.testing.allocator;
+    const x = try clean(a, "no no I actually agree", &.{});
+    defer a.free(x);
+    try std.testing.expectEqualStrings("no no I actually agree", x);
+}
+test "invalid llm JSON surfaces InvalidPlan" {
+    try std.testing.expectError(error.InvalidPlan, llmFromJson(std.testing.allocator, "do not go", &.{}, "{}"));
+}
+
+fn expectClean(source: []const u8, expected: []const u8, glossary: []const []const u8) !void {
+    const out = try clean(std.testing.allocator, source, glossary);
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings(expected, out);
+}
+
+fn expectInvalidPlan(source: []const u8, glossary: []const []const u8, plan: LlmPlan) !void {
+    const json = try std.json.Stringify.valueAlloc(std.testing.allocator, plan, .{});
+    defer std.testing.allocator.free(json);
+    try std.testing.expectError(error.InvalidPlan, llmFromJson(std.testing.allocator, source, glossary, json));
+}
+
+test "clean removes only the four unambiguous fillers" {
+    try expectClean("Um, hello uh there er now erm done", "hello there now done", &.{});
+    try expectClean("UM UH ER ERM are uppercase technical acronyms", "UM UH ER ERM are uppercase technical acronyms", &.{});
+    try expectClean("go to ER now", "go to ER now", &.{});
+    try expectClean("well like so you know actually hello", "well like so you know actually hello", &.{});
+    try expectClean("keep  these\n\nparagraphs", "keep  these\n\nparagraphs", &.{});
+    try expectClean("hello\num\nworld", "hello\n\nworld", &.{});
+}
+
+test "clean protects quoted literal technical and glossary text" {
+    try expectClean("say 'um' “uh” `er` and don't erm", "say 'um' “uh” `er` and don't", &.{});
+    try expectClean("visit /tmp/um email um@example.com then um leave", "visit /tmp/um email um@example.com then leave", &.{});
+    try expectClean("say all say all um", "say all say all", &.{"say all"});
+}
+
+test "clean repeated contractions preserve quotes technical spans and glossary" {
+    try expectClean("we're we're ready", "we're ready", &.{});
+    try expectClean("don't don't do that", "don't do that", &.{});
+    try expectClean("we’re we’re ready", "we’re ready", &.{});
+    try expectClean("don’t don’t do that", "don’t do that", &.{});
+    try expectClean("We're we're ready", "We're ready", &.{});
+    try expectClean("we’re um we’re we’re ready", "we’re ready", &.{});
+    try expectClean("we’re ready left left", "we’re ready left", &.{});
+    const unchanged = [_][]const u8{
+        "\"we're we're\"",
+        "'we’re we’re ready'",
+        "‘we’re we’re ready’",
+        "“don’t don’t do that”",
+        "`we're we're`",
+        "we're_id we're_id",
+        "we’re_id we’re_id",
+        "foo''bar foo''bar",
+        "foo’’bar foo’’bar",
+        "WE'RE WE'RE",
+        "we'Re we'Re",
+        "we're\nwe're",
+    };
+    for (unchanged) |text| try expectClean(text, text, &.{});
+    try expectClean("we're we're ready", "we're we're ready", &.{"we're"});
+    try expectClean("we’re we’re ready", "we’re we’re ready", &.{"we’re"});
+    try expectClean("‘we’re we’re ready’ left left", "‘we’re we’re ready’ left", &.{});
+}
+
+test "clean repeated phrases never cross source line or sentence boundaries" {
+    const unchanged = [_][]const u8{
+        "use this\nuse this",  "use this\r\nuse this",    "use this\ruse this",
+        "use\nthis use\nthis", "use\r\nthis use\r\nthis", "use this. use this",
+        "use this; use this",  "use this: use this",      "use this! use this",
+        "use this? use this",  "use this\n\nuse this",
+    };
+    for (unchanged) |text| try expectClean(text, text, &.{});
+    try expectClean("use this use this\nuse this", "use this\nuse this", &.{});
+    try expectClean("use this\nuse this use this", "use this\nuse this", &.{});
+    try expectClean("use this\tuse this use this", "use this", &.{});
+}
+
+test "clean composes word filler and phrase repetition passes" {
+    const cases = [_][]const u8{
+        "use use this use use this", "use this use use this",
+        "use use this use this",     "use use this use use this use use this",
+        "use um this use uh this",   "use, use this use, use this",
+    };
+    for (cases) |text| try expectClean(text, "use this", &.{});
+    try expectClean("Use use this use use this", "Use this", &.{});
+    try expectClean("use use this\nuse use this", "use this\nuse this", &.{});
+    try expectClean("use use this um. use use this", "use this use this", &.{});
+    try expectClean("use use this use use this", "use use this use use this", &.{"use"});
+    try expectClean("\"use use this use use this\"", "\"use use this use use this\"", &.{});
+}
+
+test "clean repetition is exact adjacent and at least two tokens" {
+    try expectClean("we should go now go now please", "we should go now please", &.{});
+    try expectClean("go now go now go now please", "go now please", &.{});
+    try expectClean("very very good", "very very good", &.{});
+    try expectClean("go to, go to work", "go to, go to work", &.{});
+}
+
+test "clean collapses standalone repeats without needing sentence context" {
+    const cases = [_][2][]const u8{
+        .{ "left left", "left" },           .{ "right right", "right" },
+        .{ "Left left", "Left" },           .{ "left, left.", "left." },
+        .{ "left left left left", "left" }, .{ "right right!", "right!" },
+        .{ "left um left", "left" },        .{ "test test", "test" },
+    };
+    for (cases) |case| try expectClean(case[0], case[1], &.{});
+    try expectClean("left left", "left left", &.{"left"});
+    try expectClean("say \"left left\"", "say \"left left\"", &.{});
+    try expectClean("left. left", "left. left", &.{});
+    try expectClean("left\nleft", "left\nleft", &.{});
+}
+
+test "clean collapses common single word stutters and preserves final punctuation" {
+    try expectClean("I I use use this", "I use this", &.{});
+    try expectClean("please use use use this.", "please use this.", &.{});
+    try expectClean("in the the file and and in in here", "in the file and and in here", &.{});
+    try expectClean("please use\tuse this", "please use this", &.{});
+    try expectClean("I use, use this tool to work.", "I use this tool to work.", &.{});
+    try expectClean("Please use use use, use this.", "Please use this.", &.{});
+    try expectClean("I, I use, use this.", "I use this.", &.{});
+    try expectClean("I I, think this", "I, think this", &.{});
+    try expectClean("I use use, this", "I use, this", &.{});
+    try expectClean("Please use use use, this", "Please use, this", &.{});
+    try expectClean("The the tool", "The tool", &.{});
+}
+
+test "clean stutter context skips removed fillers without crossing sentence boundaries" {
+    try expectClean("I um use use this", "I use this", &.{});
+    try expectClean("please uh test test this", "please test this", &.{});
+    try expectClean("I um uh use use use this", "I use this", &.{});
+    try expectClean("I um use use uh this", "I use this", &.{});
+    try expectClean("please test test uh the change", "please test the change", &.{});
+    try expectClean("I use use, um this", "I use, this", &.{});
+    try expectClean("I use use um. this", "I use this", &.{});
+    try expectClean("Is um this uh expected expected to work", "Is this expected to work", &.{});
+    try expectClean("This is um the test test for cleanup", "This is the test for cleanup", &.{});
+    try expectClean("This is the um test test for cleanup", "This is the test for cleanup", &.{});
+    try expectClean("I. um use use this", "I. use this", &.{});
+    try expectClean("I um. use use this", "I use this", &.{});
+}
+
+test "clean joins repetitions exposed by filler deletion with source boundaries intact" {
+    try expectClean("I use um use this", "I use this", &.{});
+    try expectClean("please use um use uh use this", "please use this", &.{});
+    try expectClean("I use, um, use this", "I use this", &.{});
+    try expectClean("I use um. use this", "I use use this", &.{});
+    try expectClean("I use um\nuse this", "I use\nuse this", &.{});
+    try expectClean("Rose um rose rose to leave", "Rose to leave", &.{});
+    try expectClean("I use um Use use this", "I use this", &.{});
+    try expectClean("I use um use this", "I use use this", &.{"use"});
+    try expectClean("I watched the The Office finale", "I watched the Office finale", &.{});
+    try expectClean("I watched the um The Office finale", "I watched the Office finale", &.{});
+    try expectClean("I watched the The Office finale", "I watched the The Office finale", &.{"The Office"});
+    try expectClean("The um the tool", "The tool", &.{});
+}
+
+test "clean collapses every member of an eligible repeated word run" {
+    for (2..9) |copies| {
+        var source: std.ArrayList(u8) = .empty;
+        defer source.deinit(std.testing.allocator);
+        try source.appendSlice(std.testing.allocator, "please ");
+        for (0..copies) |_| try source.appendSlice(std.testing.allocator, "use ");
+        try source.appendSlice(std.testing.allocator, "this");
+        try expectClean(source.items, "please use this", &.{});
+    }
+    try expectClean("please use, use use, use this", "please use this", &.{});
+}
+
+test "clean collapses ordinary words beyond the original allowlist" {
+    try expectClean("Is this expected expected to work?", "Is this expected to work?", &.{});
+    try expectClean("This is the test test for clean mode.", "This is the test for clean mode.", &.{});
+    try expectClean("you you know", "you know", &.{});
+    try expectClean("Please test test test, test this.", "Please test this.", &.{});
+    try expectClean("this this thing needs changes; please remove remove the duplicates", "this thing needs changes; please remove the duplicates", &.{});
+    try expectClean("test test", "test test", &.{"test"});
+    try expectClean("say \"test test\" and `expected expected`", "say \"test test\" and `expected expected`", &.{});
+    const protected = [_][]const u8{
+        "2 2 times",      "two two times",  "one one zero zero",   "hundred hundred",
+        "very very good", "had had enough", "that that works",     "no no",
+        "bye bye",        "fooBar fooBar",  "HTTP HTTP",           "g g l l",
+        "A A",            "v2 v2",          "test_test test_test", "test. test",
+        "test\ntest",     "test; test",
+        "test… test",
+        "café café",
+    };
+    for (protected) |text| try expectClean(text, text, &.{});
+}
+
+test "clean uses explicit exceptions rather than object complement inference" {
+    const cases = [_][2][]const u8{
+        .{ "What makes you you?", "What makes you?" },
+        .{ "I consider work work", "I consider work" },
+        .{ "What really makes you you every day?", "What really makes you every day?" },
+        .{ "They considered work work and play play", "They considered work and play" },
+        .{ "I call a test test", "I call a test" },
+        .{ "We find work work even on weekends", "We find work even on weekends" },
+        .{ "They MADE you you", "They MADE you" },
+        .{ "Keep work work", "Keep work" },
+        .{ "I consider work, work", "I consider work" },
+    };
+    for (cases) |case| try expectClean(case[0], case[1], &.{});
+    try expectClean("you you know work work starts now", "you know work starts now", &.{});
+    try expectClean("Consider this. Please test test this", "Consider this. Please test this", &.{});
+    try expectClean("Consider this\nplease test test this", "Consider this\nplease test this", &.{});
+    try expectClean("I use use this and consider work work", "I use this and consider work", &.{});
+    try expectClean("Can you make make this?", "Can you make this?", &.{});
+}
+
+test "clean does not infer pronoun focus from nearby words" {
+    const cases = [_][2][]const u8{
+        .{ "You, you alone can fix this", "You alone can fix this" },
+        .{ "I I myself will do it", "I myself will do it" },
+        .{ "You you are the only one who can help", "You are the only one who can help" },
+        .{ "We we personally approved this", "We personally approved this" },
+        .{ "I I think this is only a test", "I think this is only a test" },
+        .{ "I I typed \"only\"", "I typed \"only\"" },
+    };
+    for (cases) |case| try expectClean(case[0], case[1], &.{});
+    try expectClean("I um I alone can do it", "I alone can do it", &.{});
+    try expectClean("you you know this", "you know this", &.{});
+    try expectClean("I I use this. You alone can fix that", "I use this. You alone can fix that", &.{});
+}
+
+test "clean preserves unquoted conjunction names and protected uniform runs" {
+    const unchanged = [_][]const u8{
+        "Explain both and and or operators",
+        "Explain both or or and operators",
+        "and and or operators",
+        "no no no no",
+        "a a a a batteries",
+        "and and and and or operators",
+        "very very very very good",
+    };
+    for (unchanged) |text| try expectClean(text, text, &.{});
+}
+
+test "clean normalizes unprotected homographs without semantic inference" {
+    const cases = [_][2][]const u8{
+        .{ "I fish fish that migrate", "I fish that migrate" },
+        .{ "I paint paint that dries quickly", "I paint that dries quickly" },
+        .{ "I hope hope is enough", "I hope is enough" },
+        .{ "I hope hope will prevail", "I hope will prevail" },
+        .{ "I use use to describe practical utility", "I use to describe practical utility" },
+        .{ "I spray spray to repel insects", "I spray to repel insects" },
+        .{ "I use use this way", "I use this way" },
+        .{ "I use use this year", "I use this year" },
+        .{ "I paint paint the old-fashioned way", "I paint the old-fashioned way" },
+        .{ "I paint paint the very unusual old-fashioned way", "I paint the very unusual old-fashioned way" },
+        .{ "I paint paint the \"old-fashioned\" way", "I paint the \"old-fashioned\" way" },
+        .{ "I use use this particular academic year", "I use this particular academic year" },
+        .{ "I spray spray a little while", "I spray a little while" },
+        .{ "I value value my parents taught me", "I value my parents taught me" },
+    };
+    for (cases) |case| try expectClean(case[0], case[1], &.{});
+    try expectClean("I value value my parents taught me", "I value value my parents taught me", &.{"value"});
+    try expectClean("I use use this tool", "I use this tool", &.{});
+    try expectClean("Is it expected expected to work", "Is it expected to work", &.{});
+}
+
+test "clean does not infer relative clause roles" {
+    const cases = [_][2][]const u8{
+        .{ "What happens happens for a reason", "What happens for a reason" },
+        .{ "Whatever happens happens for a reason", "Whatever happens for a reason" },
+        .{ "Whoever calls calls to ask for help", "Whoever calls to ask for help" },
+        .{ "What works works for everyone", "What works for everyone" },
+        .{ "Whatever remains remains in place", "Whatever remains in place" },
+    };
+    for (cases) |case| try expectClean(case[0], case[1], &.{});
+    try expectClean("What works works. I use use this", "What works. I use this", &.{});
+}
+
+test "clean uses glossary protection rather than guessing proper names" {
+    const cases = [_][2][]const u8{
+        .{ "Rose rose to leave", "Rose to leave" },
+        .{ "rose rose to leave", "rose to leave" },
+        .{ "Today Rose rose to leave", "Today Rose to leave" },
+        .{ "Mark mark the spot", "Mark the spot" },
+        .{ "Bora Bora is beautiful", "Bora is beautiful" },
+        .{ "Duran Duran are performing", "Duran are performing" },
+        .{ "Stop. Rose rose to leave", "Stop. Rose to leave" },
+        .{ "Use use this", "Use this" },
+        .{ "Rose rose rose to leave", "Rose to leave" },
+        .{ "I use Use for work", "I use for work" },
+        .{ "We listen to The The on repeat", "We listen to The on repeat" },
+        .{ "I use Use use this", "I use this" },
+    };
+    for (cases) |case| try expectClean(case[0], case[1], &.{});
+    try expectClean("Bora Bora is beautiful", "Bora Bora is beautiful", &.{"Bora Bora"});
+    try expectClean("I use use this", "I use this", &.{});
+    try expectClean("Please make make make this change", "Please make this change", &.{});
+}
+
+test "clean treats noun verb homographs and imperatives consistently" {
+    const cases = [_][2][]const u8{
+        .{ "The police police the area", "The police the area" },
+        .{ "Police police the area", "Police the area" },
+        .{ "The local police police the area", "The local police the area" },
+        .{ "The band band together", "The band together" },
+        .{ "The crowd crowd around the stage", "The crowd around the stage" },
+        .{ "Fish fish in shallow water", "Fish in shallow water" },
+        .{ "People people the planet", "People the planet" },
+        .{ "The fish fish in schools", "The fish in schools" },
+    };
+    for (cases) |case| try expectClean(case[0], case[1], &.{});
+    try expectClean("Make make make this change", "Make this change", &.{});
+    try expectClean("Please make make make this change", "Please make this change", &.{});
+    try expectClean("Please find find find the file", "Please find the file", &.{});
+    try expectClean("Please test test this change", "Please test this change", &.{});
+    try expectClean("This is the test test for clean mode", "This is the test for clean mode", &.{});
+    try expectClean("This is the test test test for clean mode", "This is the test for clean mode", &.{});
+}
+
+test "clean normalizes prepositions without guessing grammatical roles" {
+    const cases = [_][2][]const u8{
+        .{ "This is what I was looking for for years", "This is what I was looking for years" },
+        .{ "What did you put it in in the morning?", "What did you put it in the morning?" },
+        .{ "That is what I held on on Tuesday", "That is what I held on Tuesday" },
+        .{ "The person I spoke to to get help", "The person I spoke to get help" },
+        .{ "This is what I gave up up north", "This is what I gave up north" },
+        .{ "I was looking for, for years", "I was looking for years" },
+        .{ "Is this this person's book?", "Is this person's book?" },
+        .{ "Are these these people's belongings?", "Are these people's belongings?" },
+    };
+    for (cases) |case| try expectClean(case[0], case[1], &.{});
+    try expectClean("in in this room", "in this room", &.{});
+    try expectClean("We waited. In in this room", "We waited. In this room", &.{});
+    try expectClean("I I was looking for for years", "I was looking for years", &.{});
+}
+
+test "clean protects repeated letters beside other dictated letters and digits" {
+    const unchanged = [_][]const u8{
+        "spell a a b",      "spell g a a please", "spell g, a a please",
+        "a a 99",           "a a 2nd",            "i i 99",
+        "say g i i please",
+    };
+    for (unchanged) |text| try expectClean(text, text, &.{});
+    try expectClean("I I use this", "I use this", &.{});
+    try expectClean("I have a a problem", "I have a a problem", &.{});
+    try expectClean("use a a batteries", "use a a batteries", &.{});
+    try expectClean("I use a a batteries", "I use a a batteries", &.{});
+    try expectClean("insert a, a batteries", "insert a, a batteries", &.{});
+}
+
+test "clean normalizes unprotected pronouns regardless of clause position" {
+    const cases = [_][2][]const u8{
+        .{ "I told you you were wrong", "I told you were wrong" },
+        .{ "I assure you you can do it", "I assure you can do it" },
+        .{ "We warned you you would regret it", "We warned you would regret it" },
+        .{ "They convinced me me being there mattered", "They convinced me being there mattered" },
+        .{ "I told it it was wrong", "I told it was wrong" },
+        .{ "It is you you should ask", "It is you should ask" },
+        .{ "Are you you today?", "Are you today?" },
+        .{ "I told you, you were wrong", "I told you were wrong" },
+    };
+    for (cases) |case| try expectClean(case[0], case[1], &.{});
+    try expectClean("You you know", "You know", &.{});
+    try expectClean("I I I use this", "I use this", &.{});
+    try expectClean("um I I use this", "I use this", &.{});
+    try expectClean("Stop. You you know", "Stop. You know", &.{});
+    try expectClean("if you you know", "if you know", &.{});
+}
+
+test "clean protects listed emphasis words rather than inferring intent" {
+    const cases = [_][2][]const u8{
+        .{ "It happened long long ago", "It happened long ago" },
+        .{ "It lasted long long into the night", "It lasted long into the night" },
+        .{ "He traveled far far from home", "He traveled far from home" },
+        .{ "It lasted long long after midnight", "It lasted long after midnight" },
+        .{ "She stood close close by the door", "She stood close by the door" },
+        .{ "He went far far away", "He went far away" },
+        .{ "There were many many failures", "There were many many failures" },
+        .{ "Do you want coffee coffee, or a latte?", "Do you want coffee, or a latte?" },
+        .{ "Do you want coffee coffee and a croissant?", "Do you want coffee and a croissant?" },
+        .{ "I want coffee coffee this time", "I want coffee this time" },
+        .{ "She prefers tea tea or hot chocolate", "She prefers tea or hot chocolate" },
+        .{ "There were many many of them", "There were many many of them" },
+        .{ "a tiny tiny particle", "a tiny particle" },
+        .{ "a large large building", "a large building" },
+        .{ "deep deep underground", "deep underground" },
+        .{ "better better results", "better results" },
+        .{ "It was enormous enormous", "It was enormous" },
+        .{ "a bright, bright light", "a bright light" },
+        .{ "a tiny tiny tiny particle", "a tiny particle" },
+        .{ "long long. Another sentence", "long. Another sentence" },
+        .{ "use use", "use" },
+    };
+    for (cases) |case| try expectClean(case[0], case[1], &.{});
+    try expectClean("I I saw a tiny tiny particle", "I saw a tiny particle", &.{});
+    try expectClean("please test test this. It is expected expected to work", "please test this. It is expected to work", &.{});
+}
+
+test "clean preserves grammatical duplicates without disabling unrelated stutter cleanup" {
+    const grammatical = [_][]const u8{
+        "I gave her her book",
+        "Give her her keys",
+        "What it is is unclear",
+        "What it was was unclear",
+        "I do do that",
+        "They can can tomatoes",
+        "Her her book", // case changes and commas do not prove a stutter
+        "I gave her, her book",
+        "She had had enough",
+        "I know that that works",
+    };
+    for (grammatical) |text| try expectClean(text, text, &.{});
+    try expectClean("I I gave her her book. This is the test test of this feature", "I gave her her book. This is the test of this feature", &.{});
+}
+
+test "clean preserves ambiguous single repeats and boundaries" {
+    const unchanged = [_][]const u8{
+        "no no not not very very really really",
+        "she had had enough and said that that works",
+        "1 1 two two AB12 AB12 USE USE",
+        "use; use this",
+        "use: use this",
+        "use. use this",
+        "use\nuse this",
+        "USE, USE this",
+        "say `use use` and \"use use\"",
+        "use /tmp/use /tmp/use",
+        "use (use) this",
+    };
+    for (unchanged) |text| try expectClean(text, text, &.{});
+    try expectClean("use use this", "use use this", &.{"use"});
+    try expectClean("use use this", "use use this", &.{"use this"});
+}
+
+test "full dictation removes plain and comma separated stutters" {
+    try expectClean(
+        "I I use use this tool to work I use, use this tool to work. I use, use this tool to work I use use this tool to work",
+        "I use this tool to work I use this tool to work. I use this tool to work",
+        &.{},
+    );
+}
+
+test "clean combines stutters fillers and phrases without changing numbers" {
+    const source = "um I I use use the configuration and we should we should set 2 actually 3";
+    const expected = "I use the configuration and we should set 3";
+    try expectClean(source, expected, &.{});
+    try expectClean(expected, expected, &.{});
+    try expectClean("please use use these 2 files and one folder", "please use these 2 files and one folder", &.{});
+    try expectClean("use use", "use", &.{});
+    try expectClean("use", "use", &.{});
+    try expectClean("", "", &.{});
+}
+
+test "clean accepts only locally provable scalar backtracks" {
+    try expectClean("meet Tuesday actually Wednesday", "meet Wednesday", &.{});
+    try expectClean("meet Tuesday, actually Wednesday", "meet Wednesday", &.{});
+    try expectClean("set $10 make that $12", "set $12", &.{});
+    try expectClean("use 10kg correction 12lb", "use 10kg correction 12lb", &.{});
+    try expectClean("version 1.2.3 actually 1.2.4", "version 1.2.3 actually 1.2.4", &.{});
+    try expectClean("build AB12 actually AB13", "build AB12 actually AB13", &.{});
+    try expectClean("use 1..2 actually 1..3", "use 1..2 actually 1..3", &.{});
+    try expectClean("it is actually useful and no no", "it is actually useful and no no", &.{});
+    try expectClean("do not use 10 actually words", "do not use 10 actually words", &.{});
+    try expectClean("do not set 10 actually 12", "do not set 10 actually 12", &.{});
+    try expectClean("never Tuesday actually Wednesday", "never Tuesday actually Wednesday", &.{});
+    try expectClean("It is not 10, actually 12", "It is not 10, actually 12", &.{});
+    try expectClean("It ISN’T 10 actually 12", "It ISN’T 10 actually 12", &.{});
+    try expectClean("without 10 actually 12", "without 10 actually 12", &.{});
+    try expectClean("You cannot pay 10 actually 12", "You cannot pay 10 actually 12", &.{});
+}
+
+test "llm compiles corrections punctuation paragraphs and numbered lists" {
+    const source = "hello world first tea second coffee end";
+    const corrections = [_]Correction{.{ .start_token = 0, .end_token = 1, .source = "hello", .replacement = "Hello", .kind = .case }};
+    const punctuation_marks = [_]Punctuation{.{ .after_token = 1, .mark = .period }};
+    const paragraphs = [_]usize{2};
+    const items = [_]ListAnchor{ .{ .start_token = 2 }, .{ .start_token = 4 } };
+    const lists = [_]List{.{ .start_token = 2, .end_token = 6, .items = &items, .kind = .numbered }};
+    const out = try llm(std.testing.allocator, source, &.{}, .{
+        .version = 2,
+        .deletions = &.{},
+        .corrections = &corrections,
+        .punctuation = &punctuation_marks,
+        .paragraph_breaks = &paragraphs,
+        .lists = &lists,
+    });
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings("Hello world.\n\n1. first tea\n2. second coffee\nend", out);
+}
+
+test "llm never infers punctuation from a case correction" {
+    const source = "This fixture is synthetic it contains no user data";
+    const corrections = [_]Correction{.{ .start_token = 4, .end_token = 5, .source = "it", .replacement = "It", .kind = .case }};
+    const punctuation_marks = [_]Punctuation{.{ .after_token = 8, .mark = .period }};
+    const out = try llm(std.testing.allocator, source, &.{}, .{
+        .version = 2,
+        .deletions = &.{},
+        .corrections = &corrections,
+        .punctuation = &punctuation_marks,
+        .paragraph_breaks = &.{},
+        .lists = &.{},
+    });
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings("This fixture is synthetic It contains no user data.", out);
+}
+
+test "llm renders discourse-marker conditional punctuation exactly as planned" {
+    const source = "okay if i have good salary in germany can i avail wbs in germany";
+    const corrections = [_]Correction{
+        .{ .start_token = 0, .end_token = 1, .source = "okay", .replacement = "Okay", .kind = .case },
+        .{ .start_token = 2, .end_token = 3, .source = "i", .replacement = "I", .kind = .case },
+        .{ .start_token = 7, .end_token = 8, .source = "germany", .replacement = "Germany", .kind = .case },
+        .{ .start_token = 9, .end_token = 10, .source = "i", .replacement = "I", .kind = .case },
+        .{ .start_token = 11, .end_token = 12, .source = "wbs", .replacement = "WBS", .kind = .case },
+        .{ .start_token = 13, .end_token = 14, .source = "germany", .replacement = "Germany", .kind = .case },
+    };
+    const punctuation_marks = [_]Punctuation{
+        .{ .after_token = 0, .mark = .comma },
+        .{ .after_token = 7, .mark = .comma },
+        .{ .after_token = 13, .mark = .question },
+    };
+    const out = try llm(std.testing.allocator, source, &.{}, .{
+        .version = 2,
+        .deletions = &.{},
+        .corrections = &corrections,
+        .punctuation = &punctuation_marks,
+        .paragraph_breaks = &.{},
+        .lists = &.{},
+    });
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings("Okay, if I have good salary in Germany, can I avail WBS in Germany?", out);
+}
+
+test "llm rejects lists introduced as reported or quoted content" {
+    const source = "The button says quotation marks start first second third quotation mark end";
+    const items = [_]ListAnchor{ .{ .start_token = 6 }, .{ .start_token = 7 }, .{ .start_token = 8 } };
+    const lists = [_]List{.{ .start_token = 6, .end_token = 9, .items = &items, .kind = .bullet }};
+    try expectInvalidPlan(source, &.{}, .{ .version = 2, .deletions = &.{}, .corrections = &.{}, .punctuation = &.{}, .paragraph_breaks = &.{}, .lists = &lists });
+}
+
+test "llm rejects a conjunction as a counted list item" {
+    const source = "Can you bring me these four items apple banana and pears";
+    const items = [_]ListAnchor{ .{ .start_token = 7 }, .{ .start_token = 8 }, .{ .start_token = 9 }, .{ .start_token = 10 } };
+    const lists = [_]List{.{ .start_token = 7, .end_token = 11, .items = &items, .kind = .bullet }};
+    try expectInvalidPlan(source, &.{}, .{ .version = 2, .deletions = &.{}, .corrections = &.{}, .punctuation = &.{}, .paragraph_breaks = &.{}, .lists = &lists });
+}
+
+test "llm accepts a counted list after an explicit bridge" {
+    const source = "I have three rules in my life commitment focus and passion";
+    const punctuation_marks = [_]Punctuation{ .{ .after_token = 6, .mark = .colon }, .{ .after_token = 10, .mark = .period } };
+    const items = [_]ListAnchor{ .{ .start_token = 7 }, .{ .start_token = 8 }, .{ .start_token = 9 } };
+    const lists = [_]List{.{ .start_token = 7, .end_token = 11, .items = &items, .kind = .bullet }};
+    const out = try llm(std.testing.allocator, source, &.{}, .{ .version = 2, .deletions = &.{}, .corrections = &.{}, .punctuation = &punctuation_marks, .paragraph_breaks = &.{}, .lists = &lists });
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings("I have three rules in my life:\n- commitment\n- focus\n- and passion.", out);
+}
+
+test "llm accepts a demonstrative list without a spoken count" {
+    const source = "Can you bring me these things apple banana and pears";
+    const punctuation_marks = [_]Punctuation{ .{ .after_token = 5, .mark = .colon }, .{ .after_token = 9, .mark = .question } };
+    const items = [_]ListAnchor{ .{ .start_token = 6 }, .{ .start_token = 7 }, .{ .start_token = 8 } };
+    const lists = [_]List{.{ .start_token = 6, .end_token = 10, .items = &items, .kind = .bullet }};
+    const out = try llm(std.testing.allocator, source, &.{}, .{ .version = 2, .deletions = &.{}, .corrections = &.{}, .punctuation = &punctuation_marks, .paragraph_breaks = &.{}, .lists = &lists });
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings("Can you bring me these things:\n- apple\n- banana\n- and pears?", out);
+
+    const bridged_source = "I have these rules in my life commitment focus and passion";
+    const bridged_punctuation = [_]Punctuation{ .{ .after_token = 6, .mark = .colon }, .{ .after_token = 10, .mark = .period } };
+    const bridged_items = [_]ListAnchor{ .{ .start_token = 7 }, .{ .start_token = 8 }, .{ .start_token = 9 } };
+    const bridged_lists = [_]List{.{ .start_token = 7, .end_token = 11, .items = &bridged_items, .kind = .bullet }};
+    const bridged = try llm(std.testing.allocator, bridged_source, &.{}, .{ .version = 2, .deletions = &.{}, .corrections = &.{}, .punctuation = &bridged_punctuation, .paragraph_breaks = &.{}, .lists = &bridged_lists });
+    defer std.testing.allocator.free(bridged);
+    try std.testing.expectEqualStrings("I have these rules in my life:\n- commitment\n- focus\n- and passion.", bridged);
+}
+
+test "llm accepts counted repeated-label multi-token items" {
+    const source = "We have four problems problem one problem two problem three problem four";
+    const punctuation_marks = [_]Punctuation{ .{ .after_token = 3, .mark = .colon }, .{ .after_token = 11, .mark = .period } };
+    const items = [_]ListAnchor{ .{ .start_token = 4 }, .{ .start_token = 6 }, .{ .start_token = 8 }, .{ .start_token = 10 } };
+    const lists = [_]List{.{ .start_token = 4, .end_token = 12, .items = &items, .kind = .bullet }};
+    const out = try llm(std.testing.allocator, source, &.{}, .{ .version = 2, .deletions = &.{}, .corrections = &.{}, .punctuation = &punctuation_marks, .paragraph_breaks = &.{}, .lists = &lists });
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings("We have four problems:\n- problem one\n- problem two\n- problem three\n- problem four.", out);
+}
+
+test "llm rejects punctuation that splits a conditional question" {
+    const source = "If I have income can I qualify";
+    const after_if = [_]Punctuation{.{ .after_token = 0, .mark = .period }};
+    try expectInvalidPlan(source, &.{}, .{ .version = 2, .deletions = &.{}, .corrections = &.{}, .punctuation = &after_if, .paragraph_breaks = &.{}, .lists = &.{} });
+    const after_auxiliary = [_]Punctuation{.{ .after_token = 4, .mark = .period }};
+    try expectInvalidPlan(source, &.{}, .{ .version = 2, .deletions = &.{}, .corrections = &.{}, .punctuation = &after_auxiliary, .paragraph_breaks = &.{}, .lists = &.{} });
+}
+
+test "llm rejects provider deletion plans" {
+    const deletion = [_]Deletion{.{ .start_token = 0, .end_token = 1, .source = "um", .kind = .filler, .proof_start_token = 0, .proof_end_token = 1, .cue = "um", .category = null }};
+    const items = [_]ListAnchor{ .{ .start_token = 1 }, .{ .start_token = 3 } };
+    const lists = [_]List{.{ .start_token = 1, .end_token = 5, .items = &items, .kind = .bullet }};
+    try expectInvalidPlan("um first tea second coffee end", &.{}, .{
+        .version = 2,
+        .deletions = &deletion,
+        .corrections = &.{},
+        .punctuation = &.{},
+        .paragraph_breaks = &.{},
+        .lists = &lists,
+    });
+}
+
+test "llm rejects cleanup deletions and validates glossary proofs" {
+    const repetition = [_]Deletion{.{ .start_token = 2, .end_token = 4, .source = "go now", .kind = .repetition, .proof_start_token = 0, .proof_end_token = 2, .cue = "adjacent", .category = null }};
+    try expectInvalidPlan("go now go now please", &.{}, .{ .version = 2, .deletions = &repetition, .corrections = &.{}, .punctuation = &.{}, .paragraph_breaks = &.{}, .lists = &.{} });
+
+    const backtrack = [_]Deletion{.{ .start_token = 1, .end_token = 3, .source = "Tuesday actually", .kind = .backtrack, .proof_start_token = 3, .proof_end_token = 4, .cue = "actually", .category = .weekday }};
+    try expectInvalidPlan("meet Tuesday actually Wednesday", &.{}, .{ .version = 2, .deletions = &backtrack, .corrections = &.{}, .punctuation = &.{}, .paragraph_breaks = &.{}, .lists = &.{} });
+
+    const correction = [_]Correction{.{ .start_token = 0, .end_token = 1, .source = "sayall", .replacement = "SayAll", .kind = .glossary }};
+    const corrected = try llm(std.testing.allocator, "sayall works", &.{"SayAll"}, .{ .version = 2, .deletions = &.{}, .corrections = &correction, .punctuation = &.{}, .paragraph_breaks = &.{}, .lists = &.{} });
+    defer std.testing.allocator.free(corrected);
+    try std.testing.expectEqualStrings("SayAll works", corrected);
+}
+
+test "llm empty plan preserves source slices and protected anchors reject" {
+    const empty: LlmPlan = .{ .version = 2, .deletions = &.{}, .corrections = &.{}, .punctuation = &.{}, .paragraph_breaks = &.{}, .lists = &.{} };
+    const exact_source = "He\tsaid  \" hello \"\n\nnext";
+    const exact = try llm(std.testing.allocator, exact_source, &.{}, empty);
+    defer std.testing.allocator.free(exact);
+    try std.testing.expectEqualStrings(exact_source, exact);
+    const decoration_source = "keep ()\t exact";
+    const decorated = try llm(std.testing.allocator, decoration_source, &.{}, empty);
+    defer std.testing.allocator.free(decorated);
+    try std.testing.expectEqualStrings(decoration_source, decorated);
+    const case = [_]Correction{.{ .start_token = 0, .end_token = 1, .source = "hello", .replacement = "Hello", .kind = .case }};
+    const period = [_]Punctuation{.{ .after_token = 1, .mark = .period }};
+    const sliced = try llm(std.testing.allocator, "hello\tworld  tail\n", &.{}, .{ .version = 2, .deletions = &.{}, .corrections = &case, .punctuation = &period, .paragraph_breaks = &.{}, .lists = &.{} });
+    defer std.testing.allocator.free(sliced);
+    try std.testing.expectEqualStrings("Hello\tworld.  tail\n", sliced);
+    try expectClean("He said \" hello \"", "He said \" hello \"", &.{});
+
+    const quoted_punctuation = [_]Punctuation{.{ .after_token = 1, .mark = .question }};
+    try expectInvalidPlan("\"do not.\"", &.{}, .{ .version = 2, .deletions = &.{}, .corrections = &.{}, .punctuation = &quoted_punctuation, .paragraph_breaks = &.{}, .lists = &.{} });
+
+    const items = [_]ListAnchor{ .{ .start_token = 0 }, .{ .start_token = 2 } };
+    const numbered = [_]List{.{ .start_token = 0, .end_token = 4, .items = &items, .kind = .numbered }};
+    try expectInvalidPlan("1. tea 2. coffee", &.{}, .{ .version = 2, .deletions = &.{}, .corrections = &.{}, .punctuation = &.{}, .paragraph_breaks = &.{}, .lists = &numbered });
+
+    const technical_punctuation = [_]Punctuation{.{ .after_token = 1, .mark = .period }};
+    const technical_output = try llm(std.testing.allocator, "visit https://example.com now", &.{}, .{ .version = 2, .deletions = &.{}, .corrections = &.{}, .punctuation = &technical_punctuation, .paragraph_breaks = &.{}, .lists = &.{} });
+    defer std.testing.allocator.free(technical_output);
+    try std.testing.expectEqualStrings("visit https://example.com. now", technical_output);
+    const technical_comma = [_]Punctuation{.{ .after_token = 1, .mark = .comma }};
+    const comma_output = try llm(std.testing.allocator, "visit https://example.com then continue", &.{}, .{ .version = 2, .deletions = &.{}, .corrections = &.{}, .punctuation = &technical_comma, .paragraph_breaks = &.{}, .lists = &.{} });
+    defer std.testing.allocator.free(comma_output);
+    try std.testing.expectEqualStrings("visit https://example.com, then continue", comma_output);
+    const terminal_technical_punctuation = [_]Punctuation{.{ .after_token = 1, .mark = .period }};
+    const terminal_output = try llm(std.testing.allocator, "email user@example.com", &.{}, .{ .version = 2, .deletions = &.{}, .corrections = &.{}, .punctuation = &terminal_technical_punctuation, .paragraph_breaks = &.{}, .lists = &.{} });
+    defer std.testing.allocator.free(terminal_output);
+    try std.testing.expectEqualStrings("email user@example.com.", terminal_output);
+    try expectInvalidPlan("visit https://example.com/search?", &.{}, .{ .version = 2, .deletions = &.{}, .corrections = &.{}, .punctuation = &terminal_technical_punctuation, .paragraph_breaks = &.{}, .lists = &.{} });
+    try expectInvalidPlan("open /tmp/file;", &.{}, .{ .version = 2, .deletions = &.{}, .corrections = &.{}, .punctuation = &terminal_technical_punctuation, .paragraph_breaks = &.{}, .lists = &.{} });
+    const technical_paragraph = [_]usize{1};
+    try expectInvalidPlan("visit user@example.com now", &.{}, .{ .version = 2, .deletions = &.{}, .corrections = &.{}, .punctuation = &.{}, .paragraph_breaks = &technical_paragraph, .lists = &.{} });
+    const after_technical_paragraph = [_]usize{2};
+    try expectInvalidPlan("visit https://example.com now", &.{}, .{ .version = 2, .deletions = &.{}, .corrections = &.{}, .punctuation = &.{}, .paragraph_breaks = &after_technical_paragraph, .lists = &.{} });
+    const protected_items = [_]ListAnchor{ .{ .start_token = 0 }, .{ .start_token = 2 } };
+    const protected_list = [_]List{.{ .start_token = 0, .end_token = 4, .items = &protected_items, .kind = .bullet }};
+    try expectInvalidPlan("/tmp/file item second item", &.{}, .{ .version = 2, .deletions = &.{}, .corrections = &.{}, .punctuation = &.{}, .paragraph_breaks = &.{}, .lists = &protected_list });
+    const emphasized_punctuation = [_]Punctuation{.{ .after_token = 0, .mark = .exclamation }};
+    try expectInvalidPlan("*important* note", &.{}, .{ .version = 2, .deletions = &.{}, .corrections = &.{}, .punctuation = &emphasized_punctuation, .paragraph_breaks = &.{}, .lists = &.{} });
+    const decoration_layout = [_]usize{1};
+    try expectInvalidPlan("keep () exact", &.{}, .{ .version = 2, .deletions = &.{}, .corrections = &.{}, .punctuation = &.{}, .paragraph_breaks = &decoration_layout, .lists = &.{} });
+    const after_glossary_paragraph = [_]usize{2};
+    try expectInvalidPlan("Say All next", &.{"Say All"}, .{ .version = 2, .deletions = &.{}, .corrections = &.{}, .punctuation = &.{}, .paragraph_breaks = &after_glossary_paragraph, .lists = &.{} });
+}
+
+test "llm rejects overlaps changed proofs injection and all deletion" {
+    const overlap = [_]Deletion{
+        .{ .start_token = 0, .end_token = 1, .source = "um", .kind = .filler, .proof_start_token = 0, .proof_end_token = 1, .cue = "um", .category = null },
+        .{ .start_token = 0, .end_token = 1, .source = "um", .kind = .filler, .proof_start_token = 0, .proof_end_token = 1, .cue = "um", .category = null },
+    };
+    try expectInvalidPlan("um stay", &.{}, .{ .version = 2, .deletions = &overlap, .corrections = &.{}, .punctuation = &.{}, .paragraph_breaks = &.{}, .lists = &.{} });
+
+    const injection = [_]Correction{.{ .start_token = 4, .end_token = 5, .source = "two", .replacement = "four", .kind = .orthographic }};
+    try expectInvalidPlan("what is two plus two", &.{}, .{ .version = 2, .deletions = &.{}, .corrections = &injection, .punctuation = &.{}, .paragraph_breaks = &.{}, .lists = &.{} });
+
+    const negation_change = [_]Correction{.{ .start_token = 0, .end_token = 1, .source = "not", .replacement = "now", .kind = .orthographic }};
+    try expectInvalidPlan("not ready", &.{}, .{ .version = 2, .deletions = &.{}, .corrections = &negation_change, .punctuation = &.{}, .paragraph_breaks = &.{}, .lists = &.{} });
+    const homophone_change = [_]Correction{.{ .start_token = 0, .end_token = 1, .source = "two", .replacement = "too", .kind = .orthographic }};
+    try expectInvalidPlan("two items", &.{}, .{ .version = 2, .deletions = &.{}, .corrections = &homophone_change, .punctuation = &.{}, .paragraph_breaks = &.{}, .lists = &.{} });
+
+    const all = [_]Deletion{.{ .start_token = 0, .end_token = 1, .source = "um", .kind = .filler, .proof_start_token = 0, .proof_end_token = 1, .cue = "um", .category = null }};
+    try expectInvalidPlan("um", &.{}, .{ .version = 2, .deletions = &all, .corrections = &.{}, .punctuation = &.{}, .paragraph_breaks = &.{}, .lists = &.{} });
+
+    const nested = [_]Deletion{
+        .{ .start_token = 0, .end_token = 2, .source = "10 actually", .kind = .backtrack, .proof_start_token = 2, .proof_end_token = 3, .cue = "actually", .category = .number },
+        .{ .start_token = 2, .end_token = 4, .source = "12 actually", .kind = .backtrack, .proof_start_token = 4, .proof_end_token = 5, .cue = "actually", .category = .number },
+    };
+    try expectInvalidPlan("10 actually 12 actually 13", &.{}, .{ .version = 2, .deletions = &nested, .corrections = &.{}, .punctuation = &.{}, .paragraph_breaks = &.{}, .lists = &.{} });
+
+    const uppercase_filler = [_]Deletion{.{ .start_token = 0, .end_token = 1, .source = "ER", .kind = .filler, .proof_start_token = 0, .proof_end_token = 1, .cue = "ER", .category = null }};
+    try expectInvalidPlan("ER diagram", &.{}, .{ .version = 2, .deletions = &uppercase_filler, .corrections = &.{}, .punctuation = &.{}, .paragraph_breaks = &.{}, .lists = &.{} });
+    const exact_uppercase_filler = [_]Deletion{.{ .start_token = 2, .end_token = 3, .source = "ER", .kind = .filler, .proof_start_token = 2, .proof_end_token = 3, .cue = "ER", .category = null }};
+    try expectInvalidPlan("go to ER now", &.{}, .{ .version = 2, .deletions = &exact_uppercase_filler, .corrections = &.{}, .punctuation = &.{}, .paragraph_breaks = &.{}, .lists = &.{} });
+    const negated_backtrack = [_]Deletion{.{ .start_token = 2, .end_token = 4, .source = "10 actually", .kind = .backtrack, .proof_start_token = 4, .proof_end_token = 5, .cue = "actually", .category = .number }};
+    try expectInvalidPlan("do not 10 actually 12", &.{}, .{ .version = 2, .deletions = &negated_backtrack, .corrections = &.{}, .punctuation = &.{}, .paragraph_breaks = &.{}, .lists = &.{} });
+    const exact_negated_backtrack = [_]Deletion{.{ .start_token = 3, .end_token = 5, .source = "10 actually", .kind = .backtrack, .proof_start_token = 5, .proof_end_token = 6, .cue = "actually", .category = .number }};
+    try expectInvalidPlan("It is not 10, actually 12", &.{}, .{ .version = 2, .deletions = &exact_negated_backtrack, .corrections = &.{}, .punctuation = &.{}, .paragraph_breaks = &.{}, .lists = &.{} });
+    const uppercase_contraction_backtrack = [_]Deletion{.{ .start_token = 2, .end_token = 4, .source = "10 actually", .kind = .backtrack, .proof_start_token = 4, .proof_end_token = 5, .cue = "actually", .category = .number }};
+    try expectInvalidPlan("It ISN’T 10 actually 12", &.{}, .{ .version = 2, .deletions = &uppercase_contraction_backtrack, .corrections = &.{}, .punctuation = &.{}, .paragraph_breaks = &.{}, .lists = &.{} });
+    const without_backtrack = [_]Deletion{.{ .start_token = 1, .end_token = 3, .source = "10 actually", .kind = .backtrack, .proof_start_token = 3, .proof_end_token = 4, .cue = "actually", .category = .number }};
+    try expectInvalidPlan("without 10 actually 12", &.{}, .{ .version = 2, .deletions = &without_backtrack, .corrections = &.{}, .punctuation = &.{}, .paragraph_breaks = &.{}, .lists = &.{} });
+    const cannot_backtrack = [_]Deletion{.{ .start_token = 3, .end_token = 5, .source = "10 actually", .kind = .backtrack, .proof_start_token = 5, .proof_end_token = 6, .cue = "actually", .category = .number }};
+    try expectInvalidPlan("You cannot pay 10 actually 12", &.{}, .{ .version = 2, .deletions = &cannot_backtrack, .corrections = &.{}, .punctuation = &.{}, .paragraph_breaks = &.{}, .lists = &.{} });
+    const exact_orthographic_change = [_]Correction{.{ .start_token = 0, .end_token = 1, .source = "never", .replacement = "newer", .kind = .orthographic }};
+    try expectInvalidPlan("never change this", &.{}, .{ .version = 2, .deletions = &.{}, .corrections = &exact_orthographic_change, .punctuation = &.{}, .paragraph_breaks = &.{}, .lists = &.{} });
+
+    for ([_]struct { source: []const u8, replacement: []const u8 }{
+        .{ .source = "US", .replacement = "us" },
+        .{ .source = "HTTP", .replacement = "http" },
+        .{ .source = "ER", .replacement = "er" },
+    }) |case| {
+        const uppercase_case = [_]Correction{.{ .start_token = 2, .end_token = 3, .source = case.source, .replacement = case.replacement, .kind = .case }};
+        const source = try std.fmt.allocPrint(std.testing.allocator, "Ship to {s}", .{case.source});
+        defer std.testing.allocator.free(source);
+        try expectInvalidPlan(source, &.{}, .{ .version = 2, .deletions = &.{}, .corrections = &uppercase_case, .punctuation = &.{}, .paragraph_breaks = &.{}, .lists = &.{} });
+    }
+}
+
+fn expectEnding(input: []const u8, expected: []const u8) !void {
+    const out = try normalizeQuestionEndings(std.testing.allocator, input);
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings(expected, out);
+    const again = try normalizeQuestionEndings(std.testing.allocator, out);
+    defer std.testing.allocator.free(again);
+    try std.testing.expectEqualStrings(out, again);
+}
+
+test "question endings convert terminal commas and periods of direct questions" {
+    try expectEnding("what is the question,", "what is the question?");
+    try expectEnding("What is the question.", "What is the question?");
+    try expectEnding("What's the time.", "What's the time?");
+    try expectEnding("What time is it.", "What time is it?");
+    try expectEnding("Could you send the file, please.", "Could you send the file, please?");
+    try expectEnding("Do you know the time.", "Do you know the time?");
+    try expectEnding("Is Deepgram down.", "Is Deepgram down?");
+    try expectEnding("How about lunch.", "How about lunch?");
+    try expectEnding("What if we skip the tests.", "What if we skip the tests?");
+    try expectEnding("What is this. That is fine.", "What is this? That is fine.");
+    try expectEnding("What is the question,\nWhy does it matter.\n", "What is the question?\nWhy does it matter?\n");
+    try expectEnding("\"What is this,\"", "\"What is this,\"");
+    try expectEnding("What is the question, and why does it matter.", "What is the question, and why does it matter?");
+}
+
+test "question endings leave statements attributions and headings untouched" {
+    try expectEnding("This is a statement.", "This is a statement.");
+    try expectEnding("What is the question?", "What is the question?");
+    try expectEnding("What is this!", "What is this!");
+    try expectEnding("What is this...", "What is this...");
+    try expectEnding("I asked what the time is.", "I asked what the time is.");
+    try expectEnding("What I need is a pen and a paper.", "What I need is a pen and a paper.");
+    try expectEnding("What is the question, he asked.", "What is the question, he asked.");
+    try expectEnding("How to install the app.", "How to install the app.");
+    try expectEnding("Do the dishes.", "Do the dishes.");
+    try expectEnding("Do John's task first.", "Do John's task first.");
+    try expectEnding("Do it.", "Do it.");
+    try expectEnding("Could you tell me what she said.", "Could you tell me what she said?");
+    try expectEnding("What is the question", "What is the question?");
+    try expectEnding("", "");
+    try expectEnding("The answer is 3.14, exactly.", "The answer is 3.14, exactly.");
+}
+
+test "local question structures do not depend on model terminal punctuation" {
+    const questions = [_][]const u8{
+        "What is your name",           "What's your name",
+        "What’s your name",
+        "What happened",               "Mm, what happened",
+        "Who called",                  "Who called yesterday",
+        "What did you do",             "What do you think",
+        "Um, could you send the file", "How long is it",
+        "What time is it",             "Did it work",
+        "How’s it going",
+        "What's this",
+    };
+    for (questions) |question| {
+        const expected = try std.fmt.allocPrint(std.testing.allocator, "{s}?", .{question});
+        defer std.testing.allocator.free(expected);
+        for ([_][]const u8{ "", ".", ",", "?" }) |ending| {
+            const input = try std.fmt.allocPrint(std.testing.allocator, "{s}{s}", .{ question, ending });
+            defer std.testing.allocator.free(input);
+            try expectEnding(input, expected);
+        }
+    }
+    try expectEnding("What is your name  \nWho called\r\n", "What is your name?  \nWho called?\r\n");
+    try expectEnding("What happened. Who called", "What happened? Who called?");
+}
+
+test "local question repair preserves statements ambiguous fragments and literal quotations" {
+    const unchanged = [_][]const u8{
+        "What I need is this",                        "What I need is this.",                                        "What she wants is that.",
+        "What John needs is this.",                   "What happened was unexpected.",                               "Who called is irrelevant.",
+        "What's missing is this.",
+        "What’s missing is this.",
+        "What is missing is this.",                   "You called",                                                  "Your name",
+        "What",                                       "Who",                                                         "Do this",
+        "Do that",                                    "Do it now",                                                   "Have someone call me.",
+        "I wonder who called.",                       "Tell me what happened.",                                      "Mm, what I need is this.",
+        "What is the question, she asked yesterday.", "What is the question about the upcoming release, she asked.", "\"What is your name\"",
+        "“What is your name.”",
+        "(What is your name.)",                       "What is your name!",                                          "What is your name...",
+        "What is your name:",                         "What is your name What happened?",                            "How to change your name",
+        "What is",                                    "Could you",                                                   "What about",
+        "What if",                                    "Mm,",                                                         "What is this this this this this this this this this this this this this this this this this this this this this this this this this this this this this this this.",
+    };
+    for (unchanged) |input| try expectEnding(input, input);
+}
+
+fn questionEndingAllocationCase(gpa: Allocator) !void {
+    const out = try normalizeQuestionEndings(gpa, "What is your name\nWho called.");
+    defer gpa.free(out);
+    try std.testing.expectEqualStrings("What is your name?\nWho called?", out);
+}
+
+test "local question repair handles allocation failures" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, questionEndingAllocationCase, .{});
+}
+
+fn expectLocalEnding(input: []const u8, expected: []const u8) !void {
+    const out = try normalizeLocalEndings(std.testing.allocator, input);
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings(expected, out);
+    const again = try normalizeLocalEndings(std.testing.allocator, out);
+    defer std.testing.allocator.free(again);
+    try std.testing.expectEqualStrings(out, again);
+}
+
+test "local Clean adds final periods to recognized declarative clauses" {
+    const statements = [_][]const u8{
+        "It missed the sentence boundary because I recorded it as two separate recordings",
+        "I recorded this in two separate recordings",
+        "What I need is this",
+        "This is working",
+        "It works",
+        "The model works",
+        "The build passed",
+        "My name is Alice",
+        "I have finished testing",
+        "I'm ready",
+        "I’m ready",
+        "This is version 2.0",
+        "I have 3 files",
+        "That is fine",
+    };
+    for (statements) |input| {
+        const expected = try std.fmt.allocPrint(std.testing.allocator, "{s}.", .{input});
+        defer std.testing.allocator.free(expected);
+        try expectLocalEnding(input, expected);
+    }
+    try expectLocalEnding("  I am ready  \r\n", "  I am ready.  \r\n");
+    try expectLocalEnding("That is fine. I am ready", "That is fine. I am ready.");
+    try expectLocalEnding("Notes\nI am ready", "Notes\nI am ready.");
+    try expectLocalEnding("Who called? It works", "Who called? It works.");
+    try expectLocalEnding("I am ready\nI have finished", "I am ready\nI have finished.");
+    try expectLocalEnding("I have been", "I have been");
+}
+
+test "local final punctuation retains questions fragments and existing punctuation" {
+    for ([_][]const u8{ "Who called", "What's your name", "What’s your name", "Mm, what happened", "What is your name" }) |input| {
+        const expected = try std.fmt.allocPrint(std.testing.allocator, "{s}?", .{input});
+        defer std.testing.allocator.free(expected);
+        try expectLocalEnding(input, expected);
+    }
+    const unchanged = [_][]const u8{
+        "",                      " \n",                       "Alice",               "two separate recordings",      "the sentence boundary",
+        "Meeting notes",         "You called",                "I am",                "I have",                       "I want to",
+        "I am ready because",    "I have a",                  "That's what",         "How to install",               "Who arrived",
+        "Do it",                 "This is working.",          "This is working!",    "This is working?",             "This is working...",
+        "This is working,",      "This is working:",          "This is working;",
+        "This is working —",
+        "\"I am ready\"",
+        "“I am ready”",
+        "I said \"I am ready\"", "(I am ready)",              "I said 'I am ready'", "My email is user@example.com", "This is https://example.com",
+        "My file is /tmp/test",  "This is `some_code`",       "This is key=value",   "- I am ready",                 "1. I am ready",
+        "# I am ready",          "I have finished [testing]",
+    };
+    for (unchanged) |input| try expectLocalEnding(input, input);
+}
+
+fn localEndingAllocationCase(gpa: Allocator) !void {
+    const out = try normalizeLocalEndings(gpa, "Who called. I am ready");
+    defer gpa.free(out);
+    try std.testing.expectEqualStrings("Who called? I am ready.", out);
+}
+
+test "local final punctuation handles allocation failures" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, localEndingAllocationCase, .{});
+}
+
+test "local question regression matrix covers auxiliary inversion and discourse prefixes" {
+    const questions = [_][]const u8{
+        "Is this working",           "Is it ready",                                                                      "Is there anything remaining",
+        "Is the model working",      "Is my recording saved",                                                            "Is the local model ready",
+        "Is this where the file is", "Is this what you meant",                                                           "Are we ready",
+        "Are the tests passing",     "Am I correct",                                                                     "Was it successful",
+        "Were you recording",        "Do you agree",                                                                     "Do the tests pass",
+        "Does the model work",       "Did it finish",                                                                    "Have you finished",
+        "Have the tests finished",   "Has it stopped",                                                                   "Had you seen this before",
+        "Can you hear me",           "Could we release this",                                                            "Will it work",
+        "Would you recommend this",  "Shall we continue",                                                                "Should we release this",
+        "May I proceed",             "Might it fail",                                                                    "Must we wait",
+        "Isn't this ready",
+        "Isn’t this ready",
+        "Aren't we done",            "Doesn't it work",                                                                  "Don't you agree",
+        "Didn’t it finish",
+        "Haven't you finished",      "Can't we proceed",
+        "Won’t it work",
+        "Why isn't it ready",        "What do you think about licensing issues now",                                     "Or is there anything remaining",
+        "And is the model ready",    "But are we finished",                                                              "So can we proceed",
+        "Um, is this working",       "Or, um, is it ready",                                                              "I mean is this working",
+        "Or I mean is it ready",     "Or is there something remaining and what do you think about licensing issues now",
+    };
+    for (questions) |input| {
+        const expected = try std.fmt.allocPrint(std.testing.allocator, "{s}?", .{input});
+        defer std.testing.allocator.free(expected);
+        for ([_][]const u8{ "", ".", ",", "?" }) |ending| {
+            const punctuated = try std.fmt.allocPrint(std.testing.allocator, "{s}{s}", .{ input, ending });
+            defer std.testing.allocator.free(punctuated);
+            try expectLocalEnding(punctuated, expected);
+        }
+    }
+    try expectLocalEnding("Is it ready. Are we done. Can we proceed", "Is it ready? Are we done? Can we proceed?");
+}
+
+test "auxiliary question expansion does not turn statement lookalikes into questions" {
+    const unchanged = [_][]const u8{
+        "It is working.",                       "This is where the file is.",        "I wonder if it is ready.",
+        "Whether it is ready remains unclear.", "What is missing is this.",          "And it is ready.",
+        "Or D is ready.",                       "Or d is there something remaining", "Do the dishes.",
+        "Do the tests again.",                  "Have the team test this.",          "Have someone call me.",
+        "Had I known I would have waited.",     "Were I ready I would leave.",       "Should you need help please call me.",
+        "Is",                                   "Is the model",                      "Or is",
+        "Or",                                   "Can you",                           "Is it ready!",
+    };
+    for (unchanged) |input| try expectLocalEnding(input, input);
+}
+
+test "long statements use actual recording tail instead of truncated prefix" {
+    const statement = "I mean questions can start with is as well and other letters or words as well maybe we can make we should make this work more rigorously and add some questions which start with is in different words in our testing as well";
+    const expected = try std.fmt.allocPrint(std.testing.allocator, "{s}.", .{statement});
+    defer std.testing.allocator.free(expected);
+    try expectLocalEnding(statement, expected);
+    const long_question = "Is this model still working correctly when we dictate a much longer question that contains more than thirty two words and several additional phrases about our recording settings and the way we want the final punctuation to appear";
+    const question_expected = try std.fmt.allocPrint(std.testing.allocator, "{s}?", .{long_question});
+    defer std.testing.allocator.free(question_expected);
+    try expectLocalEnding(long_question, question_expected);
+    for ([_][]const u8{ " and", " because", " to", " if", " but" }) |tail| {
+        const incomplete = try std.fmt.allocPrint(std.testing.allocator, "{s}{s}", .{ statement, tail });
+        defer std.testing.allocator.free(incomplete);
+        try expectLocalEnding(incomplete, incomplete);
+    }
+}
+
+test "clean and llm bounds fail back raw" {
+    var large: std.ArrayList(u8) = .empty;
+    defer large.deinit(std.testing.allocator);
+    for (0..max_tokens + 1) |i| {
+        if (i > 0) try large.append(std.testing.allocator, ' ');
+        try large.appendSlice(std.testing.allocator, "um");
+    }
+    try expectClean(large.items, large.items, &.{});
+
+    var punctuation_marks: [max_operations + 1]Punctuation = undefined;
+    for (&punctuation_marks) |*mark| mark.* = .{ .after_token = 0, .mark = .period };
+    try expectInvalidPlan("keep this", &.{}, .{ .version = 2, .deletions = &.{}, .corrections = &.{}, .punctuation = &punctuation_marks, .paragraph_breaks = &.{}, .lists = &.{} });
+
+    const overflow = [_]Deletion{.{ .start_token = 2, .end_token = 4, .source = "go now", .kind = .repetition, .proof_start_token = std.math.maxInt(usize), .proof_end_token = 2, .cue = "adjacent", .category = null }};
+    try expectInvalidPlan("go now go now", &.{}, .{ .version = 2, .deletions = &overflow, .corrections = &.{}, .punctuation = &.{}, .paragraph_breaks = &.{}, .lists = &.{} });
+}

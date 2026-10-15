@@ -1,0 +1,19 @@
+[package]
+name = "sayall-hud"
+version = "0.4.0"
+edition = "2024"
+license = "MIT"
+
+[dependencies]
+ashpd = { version = "=0.13.13", default-features = false, features = ["async-io", "global_shortcuts"] }
+async-channel = "2"
+async-io = "2"
+futures-lite = "2"
+gtk = { package = "gtk4", version = "0.10" }
+gtk4-layer-shell = "0.7"
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+cairo = { package = "cairo-rs", version = "0.21", features = ["png"] }

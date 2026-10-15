@@ -1,0 +1,194 @@
+const std = @import("std");
+const Io = std.Io;
+const Allocator = std.mem.Allocator;
+const protocol = @import("protocol.zig");
+const paths = @import("paths.zig");
+const platform = @import("platform.zig");
+
+pub const max_command_len = protocol.max_frame_len;
+
+/// Binds the unix socket, removing any stale socket file first.
+pub fn listen(io: Io, endpoint: paths.Endpoint) !Io.net.Server {
+    try endpoint.validateParent(io);
+    // Legacy releases created sockets using the process umask. Accept an
+    // existing socket of any mode for replacement; parent/sticky-directory
+    // rules and unlink permissions still protect against cross-user removal.
+    endpoint.validateStaleSocket(io) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
+    Io.Dir.deleteFileAbsolute(io, endpoint.path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
+    const addr = try Io.net.UnixAddress.init(endpoint.path);
+    var server = try addr.listen(io, .{});
+    errdefer server.deinit(io);
+    errdefer Io.Dir.deleteFileAbsolute(io, endpoint.path) catch {};
+    try platform.makeSocketPrivate(endpoint.path);
+    try endpoint.validateSocket(io);
+    return server;
+}
+
+/// Sends a one-line command to the daemon and returns the reply (trimmed).
+/// Caller owns the returned slice.
+pub fn sendCommand(gpa: Allocator, io: Io, endpoint: paths.Endpoint, command: []const u8) ![]u8 {
+    try validateCommandLength(command);
+    try endpoint.validateParent(io);
+    try endpoint.validateSocket(io);
+    const addr = try Io.net.UnixAddress.init(endpoint.path);
+    var stream = try addr.connect(io);
+    defer stream.close(io);
+
+    var wbuf: [256]u8 = undefined;
+    var writer = stream.writer(io, &wbuf);
+    try writer.interface.writeAll(command);
+    try writer.interface.writeByte('\n');
+    try writer.interface.flush();
+
+    return readReply(gpa, io, stream);
+}
+
+/// Reads one bounded newline-terminated reply from an already-connected stream.
+pub fn readReply(gpa: Allocator, io: Io, stream: Io.net.Stream) ![]u8 {
+    const storage = try gpa.alloc(u8, max_command_len);
+    defer gpa.free(storage);
+    var reader = stream.reader(io, storage);
+    const frame = reader.interface.takeDelimiterInclusive('\n') catch |err| switch (err) {
+        error.EndOfStream => return error.UnterminatedResponse,
+        error.StreamTooLong => return error.ResponseTooLong,
+        else => return err,
+    };
+    if (frame.len == 0) return error.EmptyResponse;
+    const line = frame[0 .. frame.len - 1];
+    return gpa.dupe(u8, std.mem.trimEnd(u8, line, "\r"));
+}
+
+test "listen creates a private socket and rejects a non-socket endpoint" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    var nonce: u64 = undefined;
+    try std.Io.randomSecure(std.testing.io, std.mem.asBytes(&nonce));
+    const name = try std.fmt.allocPrint(std.testing.allocator, "sayall-ipc-test-{x}", .{nonce});
+    defer std.testing.allocator.free(name);
+    const tmp = try Io.Dir.openDirAbsolute(std.testing.io, "/tmp", .{ .iterate = true });
+    defer tmp.close(std.testing.io);
+    try tmp.createDir(std.testing.io, name, .fromMode(0o700));
+    defer tmp.deleteTree(std.testing.io, name) catch {};
+    const parent = try std.fmt.allocPrint(std.testing.allocator, "/tmp/{s}", .{name});
+    defer std.testing.allocator.free(parent);
+    const socket_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/sayall.sock", .{parent});
+    defer std.testing.allocator.free(socket_path);
+    const endpoint: paths.Endpoint = .{
+        .path = socket_path,
+        .parent = parent,
+        .parent_security = .private,
+    };
+
+    {
+        var server = try listen(std.testing.io, endpoint);
+        defer server.deinit(std.testing.io);
+        try endpoint.validateSocket(std.testing.io);
+        const socket_stat = try Io.Dir.cwd().statFile(std.testing.io, socket_path, .{});
+        try std.testing.expectEqual(@as(u32, 0o600), socket_stat.permissions.toMode() & 0o777);
+    }
+    try setMode(socket_path, 0o755);
+    {
+        var server = try listen(std.testing.io, endpoint);
+        defer server.deinit(std.testing.io);
+        defer Io.Dir.deleteFileAbsolute(std.testing.io, socket_path) catch {};
+        try endpoint.validateSocket(std.testing.io);
+    }
+    try Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = socket_path, .data = "not a socket" });
+    try std.testing.expectError(error.EndpointNotSocket, listen(std.testing.io, endpoint));
+    try setMode(parent, 0o755);
+    try std.testing.expectError(error.EndpointParentNotPrivate, listen(std.testing.io, endpoint));
+}
+
+/// Reads a single newline-terminated command from a client stream.
+/// Returns the command (without newline) pointing into `storage`, or null on EOF.
+pub fn readCommand(stream: Io.net.Stream, io: Io, storage: []u8) !?[]const u8 {
+    var reader = stream.reader(io, storage);
+    const frame = reader.interface.takeDelimiterInclusive('\n') catch |err| switch (err) {
+        error.EndOfStream => return error.UnterminatedCommand,
+        error.StreamTooLong => return error.CommandTooLong,
+        else => return err,
+    };
+    const raw = frame[0 .. frame.len - 1];
+    const command = std.mem.trimEnd(u8, raw, "\r");
+    try validateCommandLength(command);
+    return command;
+}
+
+fn setMode(path: []const u8, mode: c_uint) !void {
+    var buffer: [std.Io.net.UnixAddress.max_len + 1]u8 = undefined;
+    if (path.len >= buffer.len) return error.NameTooLong;
+    @memcpy(buffer[0..path.len], path);
+    buffer[path.len] = 0;
+    if (std.c.chmod(buffer[0..path.len :0].ptr, mode) != 0) return error.PermissionDenied;
+}
+
+/// The newline is part of the bounded NDJSON/plaintext wire frame.
+pub fn validateCommandLength(command: []const u8) !void {
+    if (command.len >= max_command_len) return error.CommandTooLong;
+}
+
+pub fn writeFrame(stream: Io.net.Stream, io: Io, frame: []const u8) !void {
+    var wbuf: [4096]u8 = undefined;
+    var writer = stream.writer(io, &wbuf);
+    try writer.interface.writeAll(frame);
+    try writer.interface.flush();
+}
+
+/// Writes a one-line reply to a client stream.
+pub fn writeReply(stream: Io.net.Stream, io: Io, reply: []const u8) !void {
+    try validateCommandLength(reply);
+    var wbuf: [256]u8 = undefined;
+    var writer = stream.writer(io, &wbuf);
+    try writer.interface.writeAll(reply);
+    try writer.interface.writeByte('\n');
+    try writer.interface.flush();
+}
+
+test "command limit reserves one byte for newline" {
+    var exact: [max_command_len - 1]u8 = undefined;
+    try validateCommandLength(&exact);
+    var overlong: [max_command_len]u8 = undefined;
+    try std.testing.expectError(error.CommandTooLong, validateCommandLength(&overlong));
+}
+
+test "reply reader enforces inclusive newline boundary on a connected socket" {
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
+
+    const Writer = struct {
+        fn run(fd: std.posix.fd_t, bytes: []const u8) void {
+            var written: usize = 0;
+            while (written < bytes.len) {
+                const count = std.c.write(fd, bytes[written..].ptr, bytes.len - written);
+                if (count <= 0) return;
+                written += @intCast(count);
+            }
+        }
+    };
+    inline for (.{ max_command_len - 1, max_command_len }) |payload_len| {
+        var descriptors: [2]std.posix.fd_t = undefined;
+        if (std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &descriptors) != 0) return error.SocketPairFailed;
+        const address: Io.net.IpAddress = .{ .ip4 = .unspecified(0) };
+        const reader_stream: Io.net.Stream = .{ .socket = .{ .handle = descriptors[0], .address = address } };
+        const writer_stream: Io.net.Stream = .{ .socket = .{ .handle = descriptors[1], .address = address } };
+        defer reader_stream.close(std.testing.io);
+        defer writer_stream.close(std.testing.io);
+        const frame = try std.testing.allocator.alloc(u8, payload_len + 1);
+        defer std.testing.allocator.free(frame);
+        @memset(frame[0..payload_len], 'a');
+        frame[payload_len] = '\n';
+        const thread = try std.Thread.spawn(.{}, Writer.run, .{ descriptors[1], frame });
+        defer thread.join();
+        if (payload_len == max_command_len - 1) {
+            const reply = try readReply(std.testing.allocator, std.testing.io, reader_stream);
+            defer std.testing.allocator.free(reply);
+            try std.testing.expectEqual(payload_len, reply.len);
+        } else {
+            try std.testing.expectError(error.ResponseTooLong, readReply(std.testing.allocator, std.testing.io, reader_stream));
+        }
+    }
+}

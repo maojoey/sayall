@@ -1,0 +1,16 @@
+.zig-cache/
+zig-out/
+zig-pkg/
+ui/linux/target/
+ui/macos/.build/
+dist/
+__pycache__/
+*.pyc
+
+.env
+.env.*
+*.pcm
+*.wav
+!tests/deepgram_benchmark/fixtures-v2/*.wav
+!tests/deepgram_benchmark/fixtures-v3/*.wav
+*.tmp

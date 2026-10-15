@@ -1,0 +1,13 @@
+[Unit]
+Description=SayAll recording HUD
+After=graphical-session.target pipewire.service sayall.service
+Conflicts=sayall.service
+PartOf=graphical-session.target
+
+[Service]
+ExecStart=/usr/bin/sayall-hud --autostart
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target
